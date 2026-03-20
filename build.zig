@@ -97,10 +97,10 @@ fn discoverOpenSSL(exe: *std.Build.Step.Compile, os: std.Target.Os.Tag) void {
         .linux => {
             // Standard distro paths (Debian/Ubuntu, Fedora/RHEL, Alpine, Arch)
             const search_paths = [_]struct { inc: []const u8, lib: []const u8 }{
-                .{ .inc = "/usr/include/openssl", .lib = "/usr/lib/x86_64-linux-gnu" },
-                .{ .inc = "/usr/include/openssl", .lib = "/usr/lib/aarch64-linux-gnu" },
-                .{ .inc = "/usr/include/openssl", .lib = "/usr/lib64" },
-                .{ .inc = "/usr/include/openssl", .lib = "/usr/lib" },
+                .{ .inc = "/usr/include", .lib = "/usr/lib/x86_64-linux-gnu" },
+                .{ .inc = "/usr/include", .lib = "/usr/lib/aarch64-linux-gnu" },
+                .{ .inc = "/usr/include", .lib = "/usr/lib64" },
+                .{ .inc = "/usr/include", .lib = "/usr/lib" },
             };
             for (search_paths) |p| {
                 if (std.fs.accessAbsolute(p.lib, .{})) |_| {
