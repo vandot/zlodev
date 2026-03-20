@@ -19,9 +19,6 @@ jobs:
           - os: ubuntu-24.04-arm
             artifact: zlodev-linux-arm64
             ext: tar.gz
-          - os: macos-13
-            artifact: zlodev-darwin-amd64
-            ext: tar.gz
           - os: macos-latest
             artifact: zlodev-darwin-arm64
             ext: tar.gz
