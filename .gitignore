@@ -1,0 +1,12 @@
+# Zig
+.zig-cache/
+zig-out/
+zig-cache/
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~

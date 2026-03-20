@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>zlodev — local HTTPS proxy with TUI</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <meta name="description" content="Local reverse proxy with TLS termination, custom DNS, and a terminal UI for inspecting HTTP traffic.">
+  <meta property="og:title" content="zlodev — local HTTPS proxy with TUI">
+  <meta property="og:description" content="HTTPS reverse proxy with auto-generated certs, custom DNS, and a terminal UI for inspecting, intercepting, and replaying HTTP traffic.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://zlodev.vandot.rs">
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --yellow: #d29922;
+      --red: #f85149;
+      --purple: #bc8cff;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* Nav */
+    nav {
+      padding: 16px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    nav .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    nav .logo {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text);
+      text-decoration: none;
+      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+    }
+    nav .links { display: flex; gap: 24px; }
+    nav .links a {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 14px;
+      transition: color 0.15s;
+    }
+    nav .links a:hover { color: var(--text); }
+
+    /* Hero */
+    .hero {
+      padding: 80px 0 64px;
+      text-align: center;
+    }
+    .hero h1 {
+      font-size: 48px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 16px;
+    }
+    .hero h1 span { color: var(--accent); }
+    .hero p {
+      font-size: 20px;
+      color: var(--text-muted);
+      max-width: 600px;
+      margin: 0 auto 40px;
+    }
+    .hero-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+    .btn {
+      display: inline-block;
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.15s;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: var(--bg);
+    }
+    .btn-primary:hover { filter: brightness(1.15); }
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { border-color: var(--text-muted); }
+
+    /* Install snippet */
+    .install-snippet {
+      margin: 48px auto 0;
+      max-width: 620px;
+    }
+    .install-snippet pre {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      font-size: 14px;
+      overflow-x: auto;
+      position: relative;
+      color: var(--text);
+    }
+    .install-snippet .prompt { color: var(--green); user-select: none; }
+    .install-snippet .comment { color: var(--text-muted); }
+    .copy-btn {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: var(--border);
+      border: none;
+      color: var(--text-muted);
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-family: inherit;
+      transition: all 0.15s;
+    }
+    .copy-btn:hover { color: var(--text); background: var(--text-muted); }
+
+    /* Terminal mockup */
+    .terminal {
+      margin: 64px auto;
+      max-width: 780px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .terminal-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      background: #1c2128;
+      border-bottom: 1px solid var(--border);
+    }
+    .terminal-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+    }
+    .terminal-dot.red { background: var(--red); }
+    .terminal-dot.yellow { background: var(--yellow); }
+    .terminal-dot.green { background: var(--green); }
+    .terminal-title {
+      flex: 1;
+      text-align: center;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .terminal-body {
+      padding: 16px;
+      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      overflow-x: auto;
+    }
+    .terminal-body .tui-title {
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 12px;
+      text-align: left;
+    }
+    .terminal-body .tui-info {
+      margin-bottom: 12px;
+      line-height: 1.6;
+      text-align: left;
+    }
+    .terminal-body .tui-info .label {
+      display: inline-block;
+      width: 72px;
+      color: var(--text-muted);
+    }
+    .terminal-body .tui-info .value { color: var(--text); }
+    .terminal-body .tui-info .value.running { color: var(--green); font-weight: 700; }
+    .terminal-body .tui-info .value.link { color: var(--accent); }
+    .terminal-body .tui-section-header {
+      color: var(--text-muted);
+      margin-bottom: 4px;
+      text-align: left;
+    }
+    .terminal-body .tui-section-header .autoscroll { color: var(--green); }
+    .terminal-body .tui-section-header .intercept { color: var(--yellow); }
+    .terminal-body .tui-col-header {
+      display: flex;
+      gap: 0;
+      padding: 2px 0;
+      color: var(--text-muted);
+      margin-bottom: 2px;
+      text-align: left;
+    }
+    .terminal-body .tui-row {
+      display: flex;
+      gap: 0;
+      padding: 2px 0;
+      text-align: left;
+    }
+    .terminal-body .tui-row.selected {
+      background: #1f6feb33;
+      border-radius: 3px;
+    }
+    .terminal-body .marker { width: 16px; color: var(--text); font-weight: 700; }
+    .terminal-body .method { width: 56px; font-weight: 700; }
+    .terminal-body .method.get { color: var(--green); }
+    .terminal-body .method.post { color: var(--yellow); }
+    .terminal-body .status { width: 56px; }
+    .terminal-body .status.s2 { color: var(--green); }
+    .terminal-body .status.s3 { color: var(--yellow); }
+    .terminal-body .status.s5 { color: var(--red); }
+    .terminal-body .time { width: 56px; color: var(--text-muted); }
+    .terminal-body .size { width: 64px; color: var(--text-muted); }
+    .terminal-body .path { flex: 1; color: var(--text); min-width: 0; padding-left: 8px; }
+
+    /* Features */
+    .features {
+      padding: 64px 0;
+    }
+    .features h2 {
+      font-size: 32px;
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 48px;
+    }
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 24px;
+    }
+    .feature {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+    }
+    .feature-icon {
+      font-size: 24px;
+      margin-bottom: 12px;
+      display: block;
+      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      color: var(--accent);
+    }
+    .feature h3 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .feature p {
+      font-size: 14px;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    /* Quick start */
+    .quickstart {
+      padding: 64px 0;
+    }
+    .quickstart h2 {
+      font-size: 32px;
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 48px;
+    }
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+      max-width: 620px;
+      margin: 0 auto;
+    }
+    .step {
+      display: flex;
+      gap: 20px;
+      align-items: flex-start;
+    }
+    .step-num {
+      flex-shrink: 0;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: var(--bg);
+      font-weight: 700;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .step-content { flex: 1; }
+    .step-content h3 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .step-content pre {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 16px;
+      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      font-size: 13px;
+      overflow-x: auto;
+    }
+    .step-content .prompt { color: var(--green); user-select: none; }
+    .step-content .comment { color: var(--text-muted); }
+
+    /* Details */
+    .details {
+      padding: 64px 0;
+    }
+    .details h2 {
+      font-size: 32px;
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 48px;
+    }
+    .details-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 24px;
+    }
+    .detail-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+    }
+    .detail-card h3 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .detail-card p {
+      font-size: 14px;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+    .detail-card code {
+      background: #1c2128;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 13px;
+      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      color: var(--text);
+    }
+
+    /* Footer */
+    footer {
+      padding: 32px 0;
+      border-top: 1px solid var(--border);
+      text-align: center;
+    }
+    footer p {
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+    footer a {
+      color: var(--text-muted);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+    footer a:hover { color: var(--text); }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+      .hero { padding: 48px 0 40px; }
+      .hero h1 { font-size: 32px; }
+      .hero p { font-size: 17px; }
+      .features-grid { grid-template-columns: 1fr; }
+      .details-grid { grid-template-columns: 1fr; }
+      .terminal-body { font-size: 11px; }
+      .terminal-body .method { width: 44px; }
+      .terminal-body .time { width: 48px; }
+      .terminal-body .size { width: 52px; }
+    }
+  </style>
+</head>
+<body>
+
+<nav>
+  <div class="container">
+    <a href="/" class="logo">zlodev</a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#quickstart">Quick start</a>
+      <a href="https://github.com/vandot/zlodev">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="container">
+    <h1><span>HTTPS</span> for localhost,<br>with eyes on every request.</h1>
+    <p>Local reverse proxy with TLS termination, custom DNS, and a terminal UI for inspecting, intercepting, and replaying HTTP traffic.</p>
+    <div class="hero-actions">
+      <a href="#quickstart" class="btn btn-primary">Get started</a>
+      <a href="https://github.com/vandot/zlodev" class="btn btn-secondary">View on GitHub</a>
+    </div>
+    <div class="install-snippet">
+      <pre><button class="copy-btn" onclick="copyInstall(this)">copy</button><span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh</pre>
+    </div>
+
+    <div class="terminal">
+      <div class="terminal-bar">
+        <div class="terminal-dot red"></div>
+        <div class="terminal-dot yellow"></div>
+        <div class="terminal-dot green"></div>
+        <div class="terminal-title">zlodev</div>
+        <div style="width: 52px"></div>
+      </div>
+      <div class="terminal-body">
+        <div class="tui-title">zlodev</div>
+        <div class="tui-info">
+          <div><span class="label">STATUS</span> <span class="value running">running</span></div>
+          <div><span class="label">DOMAIN</span> <span class="value">dev.lo</span></div>
+          <div><span class="label">PROXY</span> <span class="value">https &rarr; 127.0.0.1:3000</span></div>
+          <div><span class="label">CA</span> <span class="value link">http://dev.lo/ca</span></div>
+        </div>
+        <div class="tui-section-header">REQUESTS (7) <span class="autoscroll">autoscroll</span> <span class="intercept">intercept</span></div>
+        <div class="tui-col-header">
+          <span class="marker"></span>
+          <span class="method">METHOD</span>
+          <span class="status">STATUS</span>
+          <span class="time">TIME</span>
+          <span class="size">SIZE</span>
+          <span class="path">PATH</span>
+        </div>
+        <div class="tui-row">
+          <span class="marker"></span>
+          <span class="method get">GET</span>
+          <span class="status s3">301</span>
+          <span class="time">1ms</span>
+          <span class="size">0B</span>
+          <span class="path">/</span>
+        </div>
+        <div class="tui-row">
+          <span class="marker"></span>
+          <span class="method get">GET</span>
+          <span class="status s2">200</span>
+          <span class="time">3ms</span>
+          <span class="size">4.2KB</span>
+          <span class="path">/</span>
+        </div>
+        <div class="tui-row">
+          <span class="marker"></span>
+          <span class="method get">GET</span>
+          <span class="status s2">200</span>
+          <span class="time">5ms</span>
+          <span class="size">18KB</span>
+          <span class="path">/assets/style.css</span>
+        </div>
+        <div class="tui-row selected">
+          <span class="marker">&gt;</span>
+          <span class="method post">POST</span>
+          <span class="status s5">501</span>
+          <span class="time">1ms</span>
+          <span class="size">357B</span>
+          <span class="path">/api/auth/login</span>
+        </div>
+        <div class="tui-row">
+          <span class="marker"></span>
+          <span class="method get">GET</span>
+          <span class="status s2">200</span>
+          <span class="time">24ms</span>
+          <span class="size">1.1KB</span>
+          <span class="path">/api/user/profile</span>
+        </div>
+        <div class="tui-row">
+          <span class="marker"></span>
+          <span class="method get">GET</span>
+          <span class="status s3">304</span>
+          <span class="time">8ms</span>
+          <span class="size">0B</span>
+          <span class="path">/api/dashboard/stats</span>
+        </div>
+        <div class="tui-row">
+          <span class="marker"></span>
+          <span class="method get">GET</span>
+          <span class="status s2">200</span>
+          <span class="time">1ms</span>
+          <span class="size">766B</span>
+          <span class="path">/favicon.ico</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="features" id="features">
+  <div class="container">
+    <h2>Features</h2>
+    <div class="features-grid">
+      <div class="feature">
+        <span class="feature-icon">~&gt;</span>
+        <h3>HTTPS reverse proxy</h3>
+        <p>TLS termination with auto-generated CA and domain certificates. Your browser sees a trusted green lock.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">*.lo</span>
+        <h3>Custom DNS</h3>
+        <p>Resolves <code>*.lo</code> to localhost automatically. No <code>/etc/hosts</code> editing needed.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">&gt;_</span>
+        <h3>Terminal UI</h3>
+        <p>Live request list with method, path, status, timing, and body size. Detail view for headers and body.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">||</span>
+        <h3>Request interception</h3>
+        <p>Hold requests before they reach your server. Inspect, edit, accept, or drop them in real time.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">&lt;r&gt;</span>
+        <h3>Replay &amp; edit</h3>
+        <p>Re-send any captured request. Edit method, path, headers, and body before replaying.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">{ }</span>
+        <h3>HAR export</h3>
+        <p>Export captured traffic as HTTP Archive files for sharing, analysis, or import into other tools.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">curl</span>
+        <h3>Copy as curl</h3>
+        <p>Copy any request as a ready-to-run curl command with a single keystroke.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">ws://</span>
+        <h3>WebSocket passthrough</h3>
+        <p>Transparent proxying of WebSocket upgrades. HMR and live-reload just work.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">:0</span>
+        <h3>Port auto-detect</h3>
+        <p>Reads <code>.env</code> and framework configs to find your dev server port. Zero config for most setups.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="quickstart" id="quickstart">
+  <div class="container">
+    <h2>Quick start</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-content">
+          <h3>Install</h3>
+          <pre><span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh</pre>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-content">
+          <h3>Set up certificates and DNS</h3>
+          <pre><span class="prompt">$</span> zlodev install</pre>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-content">
+          <h3>Start your dev server</h3>
+          <pre><span class="prompt">$</span> npm run dev <span class="comment"># or whatever starts your app</span></pre>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <div class="step-content">
+          <h3>Start zlodev</h3>
+          <pre><span class="prompt">$</span> zlodev start</pre>
+        </div>
+      </div>
+    </div>
+    <p style="text-align:center; color: var(--text-muted); margin-top: 32px; font-size: 15px;">
+      Your app is now at <code style="background:#1c2128; padding:2px 6px; border-radius:3px; font-size:14px; color: var(--accent);">https://dev.lo</code>
+    </p>
+  </div>
+</section>
+
+<section class="details" id="how-it-works">
+  <div class="container">
+    <h2>How it works</h2>
+    <div class="details-grid">
+      <div class="detail-card">
+        <h3>DNS resolver</h3>
+        <p>A lightweight UDP server resolves <code>*.lo</code> queries to <code>127.0.0.1</code>. Registers via <code>/etc/resolver/</code> on macOS, <code>systemd-resolved</code> on Linux, and NRPT rules on Windows.</p>
+      </div>
+      <div class="detail-card">
+        <h3>Certificate authority</h3>
+        <p>On install, zlodev generates a local CA and domain certificate using OpenSSL. The CA is added to your system trust store, unique to your machine.</p>
+      </div>
+      <div class="detail-card">
+        <h3>TLS proxy</h3>
+        <p>An HTTPS reverse proxy on port 443 terminates TLS, forwards plain HTTP to your dev server, and relays responses back over the encrypted connection.</p>
+      </div>
+      <div class="detail-card">
+        <h3>HTTP server</h3>
+        <p>A plain HTTP server on port 80 serves the CA certificate download page for mobile devices and redirects other traffic to HTTPS.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="details">
+  <div class="container">
+    <h2>Options</h2>
+    <div class="details-grid">
+      <div class="detail-card">
+        <h3>Local network / mDNS</h3>
+        <p>Use <code>-l</code> to bind to <code>.local</code> via mDNS. Access your dev server from mobile devices on the same network.</p>
+      </div>
+      <div class="detail-card">
+        <h3>Headless mode</h3>
+        <p>Run with <code>--no-tui</code> for script and CI usage. Logs go to stderr instead of the terminal UI.</p>
+      </div>
+      <div class="detail-card">
+        <h3>Max body control</h3>
+        <p>Set <code>--max-body=50M</code> to control how large a request body the proxy will accept. Supports K, M, G suffixes.</p>
+      </div>
+      <div class="detail-card">
+        <h3>Cross-platform</h3>
+        <p>Works on macOS, Linux, and Windows. Written in Zig with OpenSSL 3 for TLS. Single binary, no runtime dependencies.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p>
+      <a href="https://github.com/vandot/zlodev">GitHub</a>
+      &nbsp;&middot;&nbsp;
+      MIT License
+      &nbsp;&middot;&nbsp;
+      Built with <a href="https://ziglang.org">Zig</a>
+    </p>
+  </div>
+</footer>
+
+<script>
+function copyInstall(btn) {
+  var text = 'curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh';
+  navigator.clipboard.writeText(text).then(function() {
+    btn.textContent = 'copied!';
+    setTimeout(function() { btn.textContent = 'copy'; }, 2000);
+  });
+}
+</script>
+
+</body>
+</html>

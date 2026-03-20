@@ -1,0 +1,16 @@
+.{
+    .name = .zlodev,
+    .version = "0.1.0",
+    .dependencies = .{
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#41fff922316dcb8776332ec460e73eaf397d5033",
+            .hash = "vaxis-0.5.1-BWNV_JJOCQAtdJyLvrYCKbKIhX9q3liQkKMAzujWS4HJ",
+        },
+    },
+    .fingerprint = 0xcaceda0a3c621528,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
