@@ -48,21 +48,25 @@ pub fn build(b: *std.Build) void {
         discoverOpenSSL(exe, target.result.os.tag);
     }
 
+    // Link OpenSSL statically for release builds so the binary is self-contained,
+    // dynamically for debug builds to use the system-installed libraries.
+    const prefer_static = optimize != .Debug;
+
     if (target.result.os.tag == .windows) {
-        // Windows OpenSSL uses libssl.lib/libcrypto.lib naming (MSVC convention),
-        // which doesn't match Zig's linkSystemLibrary search pattern (ssl.lib).
-        // Add them as object files directly when an explicit lib path is given.
         if (openssl_lib) |lib| {
             exe.addObjectFile(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/libssl.lib", .{lib}) catch @panic("OOM") });
             exe.addObjectFile(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/libcrypto.lib", .{lib}) catch @panic("OOM") });
         } else {
-            exe.linkSystemLibrary("ssl");
-            exe.linkSystemLibrary("crypto");
+            exe.linkSystemLibrary2("ssl", .{ .preferred_link_mode = if (prefer_static) .static else .dynamic });
+            exe.linkSystemLibrary2("crypto", .{ .preferred_link_mode = if (prefer_static) .static else .dynamic });
         }
         exe.linkSystemLibrary("ws2_32");
     } else {
-        exe.linkSystemLibrary("ssl");
-        exe.linkSystemLibrary("crypto");
+        exe.linkSystemLibrary2("ssl", .{ .preferred_link_mode = if (prefer_static) .static else .dynamic });
+        exe.linkSystemLibrary2("crypto", .{ .preferred_link_mode = if (prefer_static) .static else .dynamic });
+        if (prefer_static) {
+            exe.linkSystemLibrary("z"); // libcrypto depends on zlib
+        }
     }
 
     b.installArtifact(exe);
