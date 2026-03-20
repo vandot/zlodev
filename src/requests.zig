@@ -3,6 +3,8 @@ const root = @import("root");
 
 pub const max_entries: usize = if (@hasDecl(root, "build_options"))
     root.build_options.max_entries
+else if (@import("builtin").is_test)
+    10
 else
     500;
 pub const max_header_len = 2048;
