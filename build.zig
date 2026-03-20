@@ -33,14 +33,6 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("vaxis", vaxis.module("vaxis"));
 
-    exe.linkSystemLibrary("ssl");
-    exe.linkSystemLibrary("crypto");
-
-    // Windows: link Winsock2 for networking
-    if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("ws2_32");
-    }
-
     // Apply explicit overrides if provided
     if (openssl_include) |inc| {
         exe.addIncludePath(.{ .cwd_relative = inc });
@@ -54,6 +46,23 @@ pub fn build(b: *std.Build) void {
     // for when pkg-config is unavailable or doesn't know about OpenSSL.
     if (openssl_include == null and openssl_lib == null) {
         discoverOpenSSL(exe, target.result.os.tag);
+    }
+
+    if (target.result.os.tag == .windows) {
+        // Windows OpenSSL uses libssl.lib/libcrypto.lib naming (MSVC convention),
+        // which doesn't match Zig's linkSystemLibrary search pattern (ssl.lib).
+        // Add them as object files directly when an explicit lib path is given.
+        if (openssl_lib) |lib| {
+            exe.addObjectFile(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/libssl.lib", .{lib}) catch @panic("OOM") });
+            exe.addObjectFile(.{ .cwd_relative = std.fmt.allocPrint(b.allocator, "{s}/libcrypto.lib", .{lib}) catch @panic("OOM") });
+        } else {
+            exe.linkSystemLibrary("ssl");
+            exe.linkSystemLibrary("crypto");
+        }
+        exe.linkSystemLibrary("ws2_32");
+    } else {
+        exe.linkSystemLibrary("ssl");
+        exe.linkSystemLibrary("crypto");
     }
 
     b.installArtifact(exe);
