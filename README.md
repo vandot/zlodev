@@ -15,14 +15,24 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 - **HAR export** — export captured traffic as HTTP Archive files
 - **Search/filter** — filter requests by path
 - **WebSocket passthrough** — transparent proxying of WebSocket upgrades
-- **Cross-platform** — macOS, Linux, and Windows
+- **Cross-platform** — macOS and Linux
 
-## Requirements
+## Install
 
-- [Zig](https://ziglang.org/download/) 0.15.1
-- OpenSSL 3.x development libraries
+### Pre-built binary
 
-### Installing OpenSSL
+Pre-built binaries have no external dependencies — OpenSSL is statically linked.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh
+```
+
+### Build from source
+
+Building from source requires [Zig](https://ziglang.org/download/) 0.15.1 and OpenSSL 3.x development libraries.
+
+<details>
+<summary>Installing OpenSSL dev libraries</summary>
 
 **macOS** (Homebrew):
 ```sh
@@ -38,21 +48,7 @@ sudo apt-get install libssl-dev
 ```sh
 sudo dnf install openssl-devel
 ```
-
-**Windows** (Chocolatey):
-```sh
-choco install openssl
-```
-
-## Install
-
-### Pre-built binary
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh
-```
-
-### Build from source
+</details>
 
 ```sh
 git clone https://github.com/vandot/zlodev.git
@@ -177,7 +173,7 @@ zlodev start --no-tui
 
 ## How it works
 
-1. **DNS** — A lightweight DNS server resolves `*.lo` queries to `127.0.0.1`. On macOS it registers via `/etc/resolver/`, on Linux via `systemd-resolved`, on Windows via NRPT rules.
+1. **DNS** — A lightweight DNS server resolves `*.lo` queries to `127.0.0.1`. On macOS it registers via `/etc/resolver/`, on Linux via `systemd-resolved`.
 
 2. **Certificates** — On `install`, zlodev generates a local CA and domain certificate using OpenSSL, then adds the CA to your system trust store. The CA is unique to your machine.
 
