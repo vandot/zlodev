@@ -17,6 +17,8 @@ pub fn build(b: *std.Build) void {
     const crypto_lib = buildCrypto(b, boringssl, target, optimize);
     const ssl_lib = buildSSL(b, boringssl, target, optimize);
 
+    const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse (optimize != .Debug);
+
     const exe = b.addExecutable(.{
         .name = "zlodev",
         .root_module = b.createModule(.{
@@ -24,6 +26,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .strip = strip,
         }),
     });
 
