@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat.zig");
 
 var muted: bool = false;
 var log_file: ?std.fs.File = null;
@@ -14,9 +15,9 @@ pub fn unmute() void {
 
 fn getHomeDir() ?[]const u8 {
     if (builtin.os.tag == .windows) {
-        return std.posix.getenv("USERPROFILE") orelse std.posix.getenv("LOCALAPPDATA");
+        return compat.getenv("USERPROFILE") orelse compat.getenv("LOCALAPPDATA");
     }
-    return std.posix.getenv("HOME");
+    return compat.getenv("HOME");
 }
 
 pub fn initLogFile() void {

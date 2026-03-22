@@ -5,6 +5,7 @@ const log = @import("log.zig");
 const requests = @import("requests.zig");
 const intercept = @import("intercept.zig");
 const shutdown = @import("shutdown.zig");
+const compat = @import("compat.zig");
 
 const ssl_c = @cImport({
     @cInclude("openssl/ssl.h");
@@ -125,7 +126,7 @@ pub fn start(config: *const ProxyConfig) !void {
             continue;
         };
 
-        _ = ssl_c.SSL_set_fd(ssl, conn.stream.handle);
+        _ = ssl_c.SSL_set_fd(ssl, compat.socketToFd(conn.stream.handle));
 
         const conn_id = nextConnId();
         pool.spawn(handleConnection, .{
@@ -160,7 +161,7 @@ fn handleConnection(
     }
 
     // Set receive timeout on client socket
-    setSocketTimeout(stream.handle, ssl_c.SO_RCVTIMEO, 30);
+    setSocketTimeout(stream.handle, .recv, 30);
 
     // Keep-alive loop: process multiple requests on the same TLS connection
     var request_count: u32 = 0;
@@ -325,7 +326,7 @@ fn handleConnection(
         };
         posix.connect(upstream_sock, &upstream_addr.any, upstream_addr.getOsSockLen()) catch |e| {
             log.err("component=proxy conn={d} op=upstream_connect error={any}", .{ conn_id, e });
-            posix.close(upstream_sock);
+            compat.closeSocket(upstream_sock);
             if (was_intercepted) {
                 const dur = std.time.milliTimestamp() - start_time;
                 requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
@@ -333,12 +334,12 @@ fn handleConnection(
             sslSendError(ssl, 502, "Bad Gateway");
             if (keep_alive) continue else return;
         };
-        const upstream = std.net.Stream{ .handle = upstream_sock };
+        const upstream = compat.SocketStream{ .handle = upstream_sock };
         defer upstream.close();
 
         // Set timeouts on upstream socket
-        setSocketTimeout(upstream_sock, ssl_c.SO_RCVTIMEO, 30);
-        setSocketTimeout(upstream_sock, ssl_c.SO_SNDTIMEO, 30);
+        setSocketTimeout(upstream_sock, .recv, 30);
+        setSocketTimeout(upstream_sock, .send, 30);
 
         // If intercepted and edited, re-read the (possibly modified) entry data
         const fwd_entry = if (was_intercepted) requests.getByBackingIndex(intercept_backing_idx) else &entry;
@@ -522,7 +523,7 @@ fn handleConnection(
         if (must_close) return;
 
         // Shorter idle timeout for subsequent requests on this connection
-        setSocketTimeout(stream.handle, ssl_c.SO_RCVTIMEO, 15);
+        setSocketTimeout(stream.handle, .recv, 15);
     }
 }
 
@@ -552,21 +553,21 @@ pub fn replay(source: *const requests.Entry) void {
     };
     posix.connect(sock, &proxy_addr.any, proxy_addr.getOsSockLen()) catch |e| {
         log.err("component=proxy op=replay_connect error={any}", .{e});
-        posix.close(sock);
+        compat.closeSocket(sock);
         return;
     };
 
     // Set up TLS — SSL_set_fd uses BIO_NOCLOSE, so we must close sock ourselves.
     const ssl = ssl_c.SSL_new(ctx) orelse {
         log.err("component=proxy op=replay_ssl_new error=alloc_failed", .{});
-        posix.close(sock);
+        compat.closeSocket(sock);
         return;
     };
-    _ = ssl_c.SSL_set_fd(ssl, sock);
+    _ = ssl_c.SSL_set_fd(ssl, compat.socketToFd(sock));
     defer {
         _ = ssl_c.SSL_shutdown(ssl);
         ssl_c.SSL_free(ssl);
-        posix.close(sock);
+        compat.closeSocket(sock);
     }
 
     if (ssl_c.SSL_connect(ssl) != 1) {
@@ -680,7 +681,7 @@ const ChunkState = enum { size, size_ext, size_cr, data, data_cr, data_lf, trail
 
 fn forwardChunkedBody(
     ssl: *ssl_c.SSL,
-    upstream: std.net.Stream,
+    upstream: compat.SocketStream,
     initial: []const u8,
     resp_body: *[requests.max_body_len]u8,
     read_buf: *[16384]u8,
@@ -808,11 +809,11 @@ fn handleWebSocket(
     };
     posix.connect(upstream_sock, &upstream_addr.any, upstream_addr.getOsSockLen()) catch |e| {
         log.err("component=proxy op=websocket_connect error={any}", .{e});
-        posix.close(upstream_sock);
+        compat.closeSocket(upstream_sock);
         sslSendError(ssl, 502, "Bad Gateway");
         return;
     };
-    const upstream = std.net.Stream{ .handle = upstream_sock };
+    const upstream = compat.SocketStream{ .handle = upstream_sock };
     defer upstream.close();
 
     // Forward the original request as-is to upstream
@@ -853,8 +854,9 @@ fn handleWebSocket(
 
     // Bidirectional pipe: SSL client <-> upstream socket
     // Use poll to wait for data on either side
-    const client_fd = ssl_c.SSL_get_fd(ssl);
-    if (client_fd < 0) return;
+    const raw_fd = ssl_c.SSL_get_fd(ssl);
+    if (raw_fd < 0) return;
+    const client_fd = compat.fdToSocket(raw_fd);
 
     var pipe_buf: [8192]u8 = undefined;
     while (true) {
@@ -884,12 +886,23 @@ fn handleWebSocket(
     requests.unpin(ws_backing_idx);
 }
 
-fn setSocketTimeout(fd: posix.socket_t, opt: u32, seconds: u32) void {
+const SO_TIMEOUT = enum { recv, send };
+
+fn setSocketTimeout(fd: posix.socket_t, which: SO_TIMEOUT, seconds: u32) void {
     if (builtin.os.tag == .windows) {
         // Windows SO_RCVTIMEO/SO_SNDTIMEO takes DWORD milliseconds
-        const ms: c_ulong = @as(c_ulong, seconds) * 1000;
-        _ = ssl_c.setsockopt(fd, ssl_c.SOL_SOCKET, @intCast(opt), @ptrCast(&ms), @sizeOf(@TypeOf(ms)));
+        const opt: i32 = switch (which) {
+            .recv => 0x1006, // SO_RCVTIMEO
+            .send => 0x1005, // SO_SNDTIMEO
+        };
+        const ms: u32 = seconds * 1000;
+        const bytes = std.mem.toBytes(ms);
+        _ = std.os.windows.ws2_32.setsockopt(fd, std.os.windows.ws2_32.SOL.SOCKET, opt, @ptrCast(&bytes), @sizeOf(@TypeOf(ms)));
     } else {
+        const opt: u32 = switch (which) {
+            .recv => ssl_c.SO_RCVTIMEO,
+            .send => ssl_c.SO_SNDTIMEO,
+        };
         const tv = ssl_c.struct_timeval{ .tv_sec = @intCast(seconds), .tv_usec = 0 };
         _ = ssl_c.setsockopt(fd, ssl_c.SOL_SOCKET, @intCast(opt), &tv, @sizeOf(@TypeOf(tv)));
     }

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("log.zig");
 const sys = @import("sys.zig");
+const compat = @import("compat.zig");
 
 const c = @cImport({
     @cInclude("openssl/evp.h");
@@ -17,20 +18,20 @@ const c = @cImport({
 pub fn getBasePath(buf: []u8) ![]const u8 {
     switch (builtin.os.tag) {
         .macos => {
-            const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+            const home = compat.getenv("HOME") orelse return error.NoHomeDir;
             return std.fmt.bufPrint(buf, "{s}/Library/Application Support/zlodev", .{home});
         },
         .windows => {
-            const local_env = std.posix.getenv("LocalAppData") orelse return error.NoLocalAppData;
+            const local_env = compat.getenv("LocalAppData") orelse return error.NoLocalAppData;
             return std.fmt.bufPrint(buf, "{s}/zlodev", .{local_env});
         },
         else => {
             // Linux
-            const xdg = std.posix.getenv("XDG_DATA_HOME");
+            const xdg = compat.getenv("XDG_DATA_HOME");
             if (xdg) |data_home| {
                 return std.fmt.bufPrint(buf, "{s}/zlodev", .{data_home});
             }
-            const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+            const home = compat.getenv("HOME") orelse return error.NoHomeDir;
             return std.fmt.bufPrint(buf, "{s}/.local/share/zlodev", .{home});
         },
     }

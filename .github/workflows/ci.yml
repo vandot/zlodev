@@ -35,6 +35,34 @@ jobs:
       - name: Test requests
         run: zig test src/requests.zig
 
+  build-and-test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Build
+        run: zig build
+
+      - name: Test dns
+        run: zig test src/dns.zig
+
+      - name: Test requests + har
+        run: zig test src/har.zig
+
+      - name: Test proxy
+        run: zig test src/proxy.zig
+
+      - name: Test intercept
+        run: zig test src/intercept.zig
+
+      - name: Test requests
+        run: zig test src/requests.zig
+
   build-and-test-macos:
     runs-on: macos-latest
     steps:

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const log = @import("log.zig");
 const sys = @import("sys.zig");
+const compat = @import("compat.zig");
 const shutdown = @import("shutdown.zig");
 
 // DNS constants
@@ -152,11 +153,25 @@ fn buildResponse(
             rdlength = 4;
         },
         QTYPE_AAAA => {
-            log.info("component=dns type=AAAA domain={s}", .{name});
-            rtype = QTYPE_AAAA;
-            @memset(rdata[0..15], 0);
-            rdata[15] = 1;
-            rdlength = 16;
+            // Return empty response — proxy only listens on IPv4, so we must
+            // not advertise an IPv6 address or browsers will try ::1 first.
+            log.info("component=dns type=AAAA domain={s} rcode=NOERROR ancount=0", .{name});
+            var pos: usize = 0;
+            writeU16(buf, pos, header.id);
+            pos += 2;
+            writeU16(buf, pos, 0x8000); // QR=1, RCODE=0
+            pos += 2;
+            writeU16(buf, pos, 1); // QDCOUNT
+            pos += 2;
+            writeU16(buf, pos, 0); // ANCOUNT
+            pos += 2;
+            writeU16(buf, pos, 0); // NSCOUNT
+            pos += 2;
+            writeU16(buf, pos, 0); // ARCOUNT
+            pos += 2;
+            @memcpy(buf[pos..][0..question_len], request[question.name_start..][0..question_len]);
+            pos += question_len;
+            return pos;
         },
         else => {
             // Return empty response (no answer) for unsupported types
@@ -234,7 +249,7 @@ pub fn serve(ip: []const u8, port: u16, tld: []const u8) void {
         log.err("component=dns op=socket error={any}", .{e});
         return;
     };
-    defer posix.close(sock);
+    defer compat.closeSocket(sock);
 
     const addr = parseAddr(ip, port) catch |e| {
         log.err("component=dns op=addr_parse error={any}", .{e});
@@ -323,9 +338,9 @@ pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []c
         },
         .linux => {
             const network_text = if (port == 53)
-                try std.fmt.allocPrint(allocator, "[Match]\nName=zlodev0\n[Network]\nAddress={s}/32\nDomains= ~lo.\nDNS={s}\n", .{ ip, ip })
+                try std.fmt.allocPrint(allocator, "[Match]\nName=zlodev0\n[Network]\nAddress={s}/32\nDomains=~{s}\nDNS={s}\n", .{ ip, tld, ip })
             else
-                try std.fmt.allocPrint(allocator, "[Match]\nName=zlodev0\n[Network]\nAddress={s}/32\nDomains= ~lo.\nDNS={s}:{d}\n", .{ ip, ip, port });
+                try std.fmt.allocPrint(allocator, "[Match]\nName=zlodev0\n[Network]\nAddress={s}/32\nDomains=~{s}\nDNS={s}:{d}\n", .{ ip, tld, ip, port });
             defer allocator.free(network_text);
             const tmp_network = try sys.writeTmpFile(allocator, "dns_network", network_text);
             defer allocator.free(tmp_network);
@@ -336,6 +351,8 @@ pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []c
             defer allocator.free(tmp_netdev);
             try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_netdev, "/etc/systemd/network/zlodev0.netdev" });
             try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" });
+            // Restart systemd-resolved to pick up the new per-link DNS routing
+            try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" });
         },
         .windows => {
             const ps_cmd = try std.fmt.allocPrint(allocator, "Add-DnsClientNrptRule -Namespace '.{s}' -NameServers '{s}'", .{ tld, ip });
@@ -354,10 +371,11 @@ pub fn uninstall(allocator: std.mem.Allocator, tld: []const u8) !void {
             try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", path });
         },
         .linux => {
-            try sys.sudoCmd(allocator, &.{ "sudo", "rm", "/etc/systemd/network/zlodev0.network" });
-            try sys.sudoCmd(allocator, &.{ "sudo", "rm", "/etc/systemd/network/zlodev0.netdev" });
+            try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.network" });
+            try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.netdev" });
             try sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" });
             try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" });
+            try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" });
         },
         .windows => {
             const ps_cmd = try std.fmt.allocPrint(allocator, "Get-DnsClientNrptRule | Where {{ $_.Namespace -eq '.{s}' }} | Remove-DnsClientNrptRule -Force", .{tld});
@@ -503,7 +521,7 @@ test "buildResponse A record for matching domain" {
     try testing.expectEqual(@as(u8, 1), resp_buf[resp_len - 1]);
 }
 
-test "buildResponse AAAA record for matching domain" {
+test "buildResponse AAAA record for matching domain returns empty" {
     const data = buildTestQuery("dev.lo", QTYPE_AAAA);
     const header = parseHeader(&data);
     const question = parseQuestion(&data).?;
@@ -512,11 +530,8 @@ test "buildResponse AAAA record for matching domain" {
     try testing.expect(resp_len > 0);
 
     const resp_header = parseHeader(&resp_buf);
-    try testing.expectEqual(@as(u16, 1), resp_header.an_count);
-
-    // Last 16 bytes should be ::1
-    try testing.expectEqual(@as(u8, 0), resp_buf[resp_len - 16]);
-    try testing.expectEqual(@as(u8, 1), resp_buf[resp_len - 1]);
+    // AAAA returns empty response (no answer) to force IPv4
+    try testing.expectEqual(@as(u16, 0), resp_header.an_count);
 }
 
 test "buildResponse NXDOMAIN for non-matching domain" {

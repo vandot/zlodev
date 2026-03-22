@@ -19,6 +19,8 @@ jobs:
             artifact: zlodev-linux-arm64
           - target: aarch64-macos
             artifact: zlodev-darwin-arm64
+          - target: x86_64-windows
+            artifact: zlodev-windows-amd64
 
     runs-on: ubuntu-latest
 
@@ -38,13 +40,20 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dversion=${{ steps.version.outputs.VERSION }}
 
       - name: Package
-        run: tar -czf ${{ matrix.artifact }}.tar.gz -C zig-out/bin zlodev
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-windows" ]; then
+            zip ${{ matrix.artifact }}.zip zig-out/bin/zlodev.exe
+          else
+            tar -czf ${{ matrix.artifact }}.tar.gz -C zig-out/bin zlodev
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
 
   release:
     needs: build

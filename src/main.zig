@@ -21,7 +21,11 @@ const Command = enum {
 
 pub const panic = tui.panic;
 
+const compat = @import("compat.zig");
+
 pub fn main() !void {
+    compat.initNetworking();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -37,7 +41,11 @@ pub fn main() !void {
     var cert_only: bool = false;
     var max_body: usize = proxy.default_max_request_body;
 
-    var args = std.process.args();
+    var args = if (builtin.os.tag == .windows)
+        try std.process.argsWithAllocator(std.heap.page_allocator)
+    else
+        std.process.args();
+    defer if (builtin.os.tag == .windows) args.deinit();
     _ = args.skip(); // skip program name
 
     while (args.next()) |arg| {
@@ -240,9 +248,12 @@ fn doStartDns(tld: []const u8) !void {
             };
         },
         .linux => {
-            std.fs.accessAbsolute("/etc/systemd/resolved.conf.d/zlodev.conf", .{}) catch {
+            std.fs.accessAbsolute("/etc/systemd/network/zlodev0.network", .{}) catch {
                 std.debug.print("warning: DNS resolver not installed, run 'zlodev install -d' first\n", .{});
             };
+        },
+        .windows => {
+            std.debug.print("note: ensure DNS is installed ('zlodev install -d') and run in an elevated terminal\n", .{});
         },
         else => {},
     }
@@ -548,7 +559,7 @@ const hostname_max = if (builtin.os.tag == .windows) 256 else std.posix.HOST_NAM
 
 fn getHostname(buf: *[hostname_max]u8) []const u8 {
     if (builtin.os.tag == .windows) {
-        const name = std.posix.getenv("COMPUTERNAME") orelse return "localhost";
+        const name = compat.getenv("COMPUTERNAME") orelse return "localhost";
         const len = @min(name.len, buf.len);
         @memcpy(buf[0..len], name[0..len]);
         return buf[0..len];
@@ -559,7 +570,7 @@ fn getHostname(buf: *[hostname_max]u8) []const u8 {
 fn isPortListening(bind_addr: []const u8, port: u16) bool {
     const addr = std.net.Address.parseIp(bind_addr, port) catch return false;
     const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return false;
-    defer std.posix.close(sock);
+    defer compat.closeSocket(sock);
     std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch return false;
     return true;
 }

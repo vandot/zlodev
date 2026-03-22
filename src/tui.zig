@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const requests = @import("requests.zig");
 const intercept = @import("intercept.zig");
@@ -295,7 +296,19 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16) !void
     defer tty.deinit();
 
     var vx = try vaxis.init(alloc, .{});
-    defer vx.deinit(alloc, tty.writer());
+    defer {
+        vx.deinit(alloc, tty.writer());
+        tty.writer().flush() catch {};
+        if (builtin.os.tag == .windows) {
+            // vx.deinit sends escape sequences that trigger terminal responses.
+            // Wait briefly for responses to arrive, then flush the console input
+            // buffer before tty.deinit() re-enables ECHO_INPUT — otherwise the
+            // response bytes (e.g. "0n") get echoed to the terminal.
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+            const c = @cImport(@cInclude("windows.h"));
+            _ = c.FlushConsoleInputBuffer(c.GetStdHandle(c.STD_INPUT_HANDLE));
+        }
+    }
 
     var loop: vaxis.Loop(Event) = .{ .tty = &tty, .vaxis = &vx };
     try loop.init();
@@ -303,7 +316,11 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16) !void
     defer loop.stop();
 
     try vx.enterAltScreen(tty.writer());
-    try vx.queryTerminal(tty.writer(), 1 * std.time.ns_per_s);
+    // Skip terminal query on Windows — the response bytes leak through as
+    // spurious key events and as "0n" printed on exit.
+    if (builtin.os.tag != .windows) {
+        try vx.queryTerminal(tty.writer(), 1 * std.time.ns_per_s);
+    }
 
     var cursor: usize = 0;
     var scroll_offset: usize = 0;
@@ -313,6 +330,9 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16) !void
     var detail_scroll: usize = 0;
     var detail_index: usize = 0;
     var show_help: bool = false;
+    // On Windows, discard key events until after the first render — terminal
+    // init can produce spurious events from escape sequence responses.
+    var accepting_input: bool = (builtin.os.tag != .windows);
     var show_body: bool = false;
     var edit_state: EditState = .{};
     var search_mode: bool = false;
@@ -333,6 +353,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16) !void
             switch (event) {
                 .key_press => |key| {
                     if (key.matches('c', .{ .ctrl = true })) return;
+                    if (!accepting_input) continue;
 
                     // Search mode input handling
                     if (search_mode) {
@@ -673,6 +694,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16) !void
         }
 
         try vx.render(tty.writer());
+        accepting_input = true;
         std.Thread.sleep(50 * std.time.ns_per_ms);
     }
 }

@@ -90,6 +90,9 @@ fn handleRequest(stream: std.net.Stream, domain: []const u8, ca_pem_path: []cons
     var total: usize = 0;
     while (total < buf.len) {
         const n = stream.read(buf[total..]) catch |e| {
+            // On Windows, connection reset/aborted by client surfaces as
+            // error.Unexpected — treat it like a closed connection.
+            if (e == error.Unexpected or e == error.ConnectionResetByPeer) return;
             log.err("component=http op=read error={any}", .{e});
             return;
         };

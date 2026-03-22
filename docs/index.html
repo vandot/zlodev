@@ -240,6 +240,9 @@
       color: var(--text);
     }
     .install-snippet .prompt { color: var(--accent); user-select: none; margin-right: 8px; }
+    .install-note { margin: 12px 0 0; font-size: 0.85rem; color: var(--dim); }
+    .install-note a { color: var(--accent); text-decoration: none; }
+    .install-note a:hover { text-decoration: underline; }
     .copy-btn {
       position: absolute;
       top: 12px;
@@ -653,6 +656,7 @@
     </div>
     <div class="install-snippet reveal">
       <pre><button class="copy-btn" onclick="copyInstall(this)">copy</button><span class="prompt">$</span>curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh</pre>
+      <p class="install-note">On Windows, download the binary from <a href="https://github.com/vandot/zlodev/releases">GitHub Releases</a> and run in an elevated terminal.</p>
     </div>
 
     <div class="terminal reveal">
@@ -848,7 +852,7 @@
     <div class="details-grid">
       <div class="detail-card reveal">
         <h3>DNS resolver</h3>
-        <p>A lightweight UDP server resolves <code>*.lo</code> queries to <code>127.0.0.1</code>. Registers via <code>/etc/resolver/</code> on macOS and <code>systemd-resolved</code> on Linux.</p>
+        <p>A lightweight UDP server resolves <code>*.lo</code> queries to <code>127.0.0.1</code>. Registers via <code>/etc/resolver/</code> on macOS, <code>systemd-resolved</code> on Linux, and NRPT rules on Windows.</p>
       </div>
       <div class="detail-card reveal">
         <h3>Certificate authority</h3>
@@ -887,7 +891,7 @@
       </div>
       <div class="detail-card reveal">
         <h3>Cross-platform</h3>
-        <p>Works on macOS and Linux. Written in Zig with BoringSSL for TLS. Single binary, no runtime dependencies.</p>
+        <p>Works on macOS, Linux, and Windows. Written in Zig with BoringSSL for TLS. Single binary, no runtime dependencies.</p>
       </div>
     </div>
   </div>

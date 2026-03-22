@@ -40,6 +40,11 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkLibrary(ssl_lib);
     exe.root_module.addIncludePath(boringssl.path("include"));
 
+    // Link Winsock on Windows
+    if (target.result.os.tag == .windows) {
+        exe.root_module.linkSystemLibrary("ws2_32", .{});
+    }
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -52,11 +57,22 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 }
 
-const common_flags = &[_][]const u8{
-    "-DOPENSSL_NO_ASM",
-    "-DBORINGSSL_IMPLEMENTATION",
-    "-DOPENSSL_SMALL",
-};
+fn getCommonFlags(target: std.Build.ResolvedTarget) []const []const u8 {
+    if (target.result.os.tag == .windows) {
+        return &[_][]const u8{
+            "-DOPENSSL_NO_ASM",
+            "-DBORINGSSL_IMPLEMENTATION",
+            "-DOPENSSL_SMALL",
+            "-DWIN32_LEAN_AND_MEAN",
+            "-DNOMINMAX",
+        };
+    }
+    return &[_][]const u8{
+        "-DOPENSSL_NO_ASM",
+        "-DBORINGSSL_IMPLEMENTATION",
+        "-DOPENSSL_SMALL",
+    };
+}
 
 fn buildCrypto(
     b: *std.Build,
@@ -77,20 +93,20 @@ fn buildCrypto(
     mod.addCSourceFiles(.{
         .root = boringssl.path("crypto"),
         .files = crypto_sources,
-        .flags = common_flags,
+        .flags = getCommonFlags(target),
     });
 
     // FIPS module amalgamation (bcm.c #includes all fipsmodule/*.c files)
     mod.addCSourceFiles(.{
         .root = boringssl.path("crypto/fipsmodule"),
         .files = &.{ "bcm.c", "fips_shared_support.c" },
-        .flags = common_flags,
+        .flags = getCommonFlags(target),
     });
 
     // Pre-generated err_data.c (from BoringSSL's Go script, pinned to dependency version)
     mod.addCSourceFile(.{
         .file = b.path("src/boringssl_err_data.c"),
-        .flags = common_flags,
+        .flags = getCommonFlags(target),
     });
 
     return b.addLibrary(.{
@@ -118,7 +134,7 @@ fn buildSSL(
     mod.addCSourceFiles(.{
         .root = boringssl.path("ssl"),
         .files = ssl_sources,
-        .flags = common_flags,
+        .flags = getCommonFlags(target),
     });
 
     return b.addLibrary(.{

@@ -15,7 +15,7 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 - **HAR export** — export captured traffic as HTTP Archive files
 - **Search/filter** — filter requests by path
 - **WebSocket passthrough** — transparent proxying of WebSocket upgrades
-- **Cross-platform** — macOS and Linux
+- **Cross-platform** — macOS, Linux, and Windows
 
 ## Install
 
@@ -48,6 +48,8 @@ The binary is at `zig-out/bin/zlodev`.
 
 ## Quick start
 
+### macOS / Linux
+
 ```sh
 # 1. Install certificates and DNS resolver (one-time setup, requires sudo)
 zlodev install
@@ -60,6 +62,20 @@ zlodev start
 ```
 
 Your app is now available at `https://dev.lo`. The TUI shows live traffic.
+
+### Windows
+
+Run all commands in an **elevated terminal** (Run as Administrator).
+
+```powershell
+# 1. Install certificates and DNS resolver
+zlodev install
+
+# 2. Start your dev server, then start zlodev
+zlodev start
+```
+
+> **Note:** Disable "Use secure DNS" in your browser (Edge: Settings → Privacy → Security → toggle off "Use secure DNS") for DNS resolution to work.
 
 ## Usage
 
@@ -152,7 +168,7 @@ zlodev start --no-tui
 
 ## How it works
 
-1. **DNS** — A lightweight DNS server resolves `*.lo` queries to `127.0.0.1`. On macOS it registers via `/etc/resolver/`, on Linux via `systemd-resolved`.
+1. **DNS** — A lightweight DNS server resolves `*.lo` queries to `127.0.0.1`. On macOS it registers via `/etc/resolver/`, on Linux via `systemd-resolved`, on Windows via NRPT rules.
 
 2. **Certificates** — On `install`, zlodev generates a local CA and domain certificate, then adds the CA to your system trust store. The CA is unique to your machine.
 
@@ -170,6 +186,8 @@ Another process is using port 443. Check with:
 sudo lsof -i :443
 # Linux
 sudo ss -tlnp | grep :443
+# Windows (elevated terminal)
+netstat -an | findstr ":443"
 ```
 
 ### Certificate not trusted
@@ -187,12 +205,16 @@ Check if the DNS resolver is installed:
 cat /etc/resolver/lo
 # Linux
 resolvectl query dev.lo
+# Windows (elevated PowerShell)
+Resolve-DnsName dev.lo
 ```
 
 If missing, reinstall DNS:
 ```sh
 zlodev install -d
 ```
+
+On Windows, make sure "Use secure DNS" is disabled in your browser — Chromium browsers bypass the system DNS resolver when this is enabled.
 
 ### Mobile device can't connect
 

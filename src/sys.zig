@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 
 pub fn sudoCmd(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     var child = std.process.Child.init(argv, allocator);
@@ -19,7 +20,8 @@ pub fn dirExists(path: []const u8) bool {
 }
 
 pub fn writeTmpFile(allocator: std.mem.Allocator, name: []const u8, content: []const u8) ![]const u8 {
-    const path = try std.fmt.allocPrint(allocator, "/tmp/zlodev_{s}", .{name});
+    const tmp = compat.getTmpDir();
+    const path = try std.fmt.allocPrint(allocator, "{s}/zlodev_{s}", .{ tmp, name });
     errdefer allocator.free(path);
     const file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
