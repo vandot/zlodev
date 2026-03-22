@@ -42,6 +42,9 @@ pub fn main() !void {
     var max_body: usize = proxy.default_max_request_body;
     var routes: [proxy.max_routes]proxy.Route = undefined;
     var route_count: usize = 0;
+    defer for (routes[0..route_count]) |route| {
+        allocator.free(route.pattern);
+    };
 
     var args = if (builtin.os.tag == .windows)
         try std.process.argsWithAllocator(std.heap.page_allocator)
@@ -122,10 +125,6 @@ pub fn main() !void {
             return;
         }
     }
-
-    defer for (routes[0..route_count]) |route| {
-        allocator.free(route.pattern);
-    };
 
     const tld: []const u8 = if (local) "local" else "lo";
 
