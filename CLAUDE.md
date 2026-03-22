@@ -4,7 +4,7 @@
 
 zlodev is a local reverse proxy with TLS termination, custom DNS, and a terminal UI. It sits between the browser and a local dev server, providing HTTPS with auto-generated certificates at `https://dev.lo`, and a TUI for inspecting/intercepting/replaying HTTP traffic. The domain is hardcoded to `dev.lo` — no custom domains or TLDs.
 
-Written in Zig 0.15.1, links OpenSSL 3 for TLS and uses libvaxis for the terminal UI.
+Written in Zig 0.15.1, uses BoringSSL (compiled from source) for TLS and libvaxis for the terminal UI.
 
 ## Build & test
 
@@ -28,7 +28,7 @@ proxy.zig         HTTPS reverse proxy (TLS termination, upstream forwarding, rep
 tui.zig           Terminal UI (vaxis-based, list/detail/edit views)
 dns.zig           UDP DNS server (resolves *.lo → 127.0.0.1)
 http_server.zig   HTTP server on port 80 (CA cert download page, HTTPS redirect)
-cert.zig          Certificate generation and system trust store management (OpenSSL)
+cert.zig          Certificate generation and system trust store management (BoringSSL)
 requests.zig      Thread-safe ring buffer for captured request/response entries
 intercept.zig     Request interception slots (hold/accept/drop with thread sync)
 shutdown.zig      Global atomic shutdown flag + signal handlers (SIGINT/SIGTERM)
@@ -43,7 +43,7 @@ sys.zig           System command helpers (sudo, tmp files, dir checks)
 
 - **Thread model**: proxy uses a 64-thread pool (256KB stacks), HTTP server uses 8 threads, DNS is single-threaded. All loops use `poll()` with 1s timeout + `shutdown.isRunning()` check.
 - **Ring buffer**: `requests.zig` stores entries in a fixed-size ring (`max_entries`, default 500). Entries are ~69KB each (fixed-size arrays for headers/body). Pinned entries (intercepted, WebSocket) are skipped during overwrite.
-- **TLS**: OpenSSL 3 via `@cImport`. `SSL_set_fd` uses `BIO_NOCLOSE` — the caller must close the socket after `SSL_free`.
+- **TLS**: BoringSSL via `@cImport` (API-compatible with OpenSSL). `SSL_set_fd` uses `BIO_NOCLOSE` — the caller must close the socket after `SSL_free`.
 - **Entry lifecycle**: Normal requests use `push()`. Intercepted requests use `pushAndPin()` → `finishEntry()` (which unpins). The TUI can edit pinned entries in-place before accepting.
 - **Replay**: Connects to the proxy's own TLS endpoint (127.0.0.1:443) so the request goes through the full proxy path and gets captured naturally.
 - **Chunked encoding**: A state machine parser (`chunkedStep`) decodes chunks for body capture while forwarding raw chunked data to the client.
@@ -52,7 +52,7 @@ sys.zig           System command helpers (sudo, tmp files, dir checks)
 
 - Structured log format: `component=X op=Y field=value`
 - Error handling: functions return `!void` or `!T`, errors are logged with context before propagating
-- OpenSSL interop via `@cImport` — C types/functions accessed through `ssl_c.*` (proxy) or `c.*` (cert)
+- BoringSSL interop via `@cImport` — C types/functions accessed through `ssl_c.*` (proxy) or `c.*` (cert)
 - TUI renders at 50ms intervals via `std.Thread.sleep`, not event-driven
 - All string comparisons for HTTP headers use `startsWithIgnoreCase` (defined locally in proxy.zig and http_server.zig)
 

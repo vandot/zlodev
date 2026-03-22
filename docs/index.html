@@ -10,40 +10,88 @@
   <meta property="og:description" content="HTTPS reverse proxy with auto-generated certs, custom DNS, and a terminal UI for inspecting, intercepting, and replaying HTTP traffic.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://zlodev.vandot.rs">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #0d1117;
-      --surface: #161b22;
-      --border: #30363d;
-      --text: #e6edf3;
-      --text-muted: #8b949e;
-      --accent: #58a6ff;
-      --green: #3fb950;
-      --yellow: #d29922;
-      --red: #f85149;
-      --purple: #bc8cff;
+      --bg: #080c13;
+      --bg-warm: #0b1018;
+      --surface: #111821;
+      --surface-hover: #161e2a;
+      --border: #1e2a3a;
+      --border-light: #2a3a4e;
+      --text: #e2eaf3;
+      --text-muted: #6b7f99;
+      --text-dim: #3d4f66;
+      --accent: #4dacff;
+      --accent-glow: #4dacff40;
+      --accent-deep: #2563eb;
+      --green: #34d399;
+      --green-dim: #34d39930;
+      --yellow: #fbbf24;
+      --yellow-dim: #fbbf2430;
+      --red: #f87171;
+      --purple: #a78bfa;
+      --font-display: 'Syne', sans-serif;
+      --font-body: 'IBM Plex Sans', -apple-system, sans-serif;
+      --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
     }
 
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
+    html { scroll-behavior: smooth; }
+
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-family: var(--font-body);
       background: var(--bg);
       color: var(--text);
       line-height: 1.6;
       -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      overflow-x: hidden;
+    }
+
+    /* Noise texture overlay */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      pointer-events: none;
+      opacity: 0.025;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+      background-repeat: repeat;
+      background-size: 256px;
     }
 
     .container {
-      max-width: 960px;
+      max-width: 1000px;
       margin: 0 auto;
-      padding: 0 24px;
+      padding: 0 28px;
+    }
+
+    /* Reveal animations */
+    .reveal {
+      opacity: 0;
+      transform: translateY(24px);
+      transition: opacity 0.7s cubic-bezier(0.16, 1, 0.3, 1), transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .reveal.visible {
+      opacity: 1;
+      transform: translateY(0);
     }
 
     /* Nav */
     nav {
-      padding: 16px 0;
+      padding: 20px 0;
       border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      background: #080c13cc;
+      position: sticky;
+      top: 0;
+      z-index: 100;
     }
     nav .container {
       display: flex;
@@ -51,79 +99,147 @@
       justify-content: space-between;
     }
     nav .logo {
-      font-size: 20px;
+      font-family: var(--font-mono);
+      font-size: 18px;
       font-weight: 700;
       color: var(--text);
       text-decoration: none;
-      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      letter-spacing: -0.02em;
     }
-    nav .links { display: flex; gap: 24px; }
+    nav .logo::before {
+      content: '>';
+      color: var(--accent);
+      margin-right: 6px;
+      font-weight: 400;
+    }
+    nav .links { display: flex; gap: 28px; }
     nav .links a {
       color: var(--text-muted);
       text-decoration: none;
-      font-size: 14px;
-      transition: color 0.15s;
+      font-size: 13px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      transition: color 0.2s;
     }
     nav .links a:hover { color: var(--text); }
 
     /* Hero */
     .hero {
-      padding: 80px 0 64px;
+      padding: 100px 0 80px;
       text-align: center;
+      position: relative;
+    }
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: -120px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 800px;
+      height: 600px;
+      background: radial-gradient(ellipse at center, var(--accent-glow) 0%, transparent 70%);
+      pointer-events: none;
+      opacity: 0.4;
+    }
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 32px;
+      letter-spacing: 0.02em;
+    }
+    .hero-badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green-dim);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
     }
     .hero h1 {
-      font-size: 48px;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-      margin-bottom: 16px;
+      font-family: var(--font-body);
+      font-size: 52px;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+      margin-bottom: 20px;
+      position: relative;
     }
-    .hero h1 span { color: var(--accent); }
+    .hero h1 span {
+      color: var(--accent);
+      text-shadow: 0 0 40px var(--accent-glow);
+    }
     .hero p {
-      font-size: 20px;
+      font-size: 18px;
       color: var(--text-muted);
-      max-width: 600px;
-      margin: 0 auto 40px;
+      max-width: 540px;
+      margin: 0 auto 44px;
+      line-height: 1.7;
     }
     .hero-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
     .btn {
-      display: inline-block;
-      padding: 12px 24px;
-      border-radius: 8px;
-      font-size: 15px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 13px 28px;
+      border-radius: 10px;
+      font-family: var(--font-body);
+      font-size: 14px;
       font-weight: 600;
       text-decoration: none;
-      transition: all 0.15s;
+      transition: all 0.2s;
+      cursor: pointer;
     }
     .btn-primary {
       background: var(--accent);
       color: var(--bg);
+      box-shadow: 0 0 20px var(--accent-glow), inset 0 1px 0 #ffffff20;
     }
-    .btn-primary:hover { filter: brightness(1.15); }
+    .btn-primary:hover {
+      background: #6bbfff;
+      box-shadow: 0 0 32px var(--accent-glow), inset 0 1px 0 #ffffff20;
+      transform: translateY(-1px);
+    }
     .btn-secondary {
       background: var(--surface);
       color: var(--text);
       border: 1px solid var(--border);
     }
-    .btn-secondary:hover { border-color: var(--text-muted); }
+    .btn-secondary:hover {
+      border-color: var(--border-light);
+      background: var(--surface-hover);
+      transform: translateY(-1px);
+    }
 
     /* Install snippet */
     .install-snippet {
-      margin: 48px auto 0;
-      max-width: 620px;
+      margin: 52px auto 0;
+      max-width: 600px;
     }
     .install-snippet pre {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 10px;
       padding: 16px 20px;
-      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
-      font-size: 14px;
+      font-family: var(--font-mono);
+      font-size: 13px;
       overflow-x: auto;
       position: relative;
       color: var(--text);
     }
-    .install-snippet .prompt { color: var(--green); user-select: none; }
-    .install-snippet .comment { color: var(--text-muted); }
+    .install-snippet .prompt { color: var(--accent); user-select: none; margin-right: 8px; }
     .copy-btn {
       position: absolute;
       top: 12px;
@@ -131,30 +247,47 @@
       background: var(--border);
       border: none;
       color: var(--text-muted);
-      padding: 4px 10px;
-      border-radius: 4px;
+      padding: 4px 12px;
+      border-radius: 6px;
       cursor: pointer;
-      font-size: 12px;
-      font-family: inherit;
-      transition: all 0.15s;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      font-weight: 500;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      transition: all 0.2s;
     }
-    .copy-btn:hover { color: var(--text); background: var(--text-muted); }
+    .copy-btn:hover { color: var(--text); background: var(--border-light); }
 
     /* Terminal mockup */
     .terminal {
-      margin: 64px auto;
+      margin: 56px auto 0;
       max-width: 780px;
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: 12px;
       overflow: hidden;
+      box-shadow:
+        0 0 0 1px var(--border),
+        0 4px 24px #00000040,
+        0 12px 48px #00000030,
+        0 0 80px var(--accent-glow);
+      position: relative;
+    }
+    .terminal::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: 12px;
+      pointer-events: none;
+      background: linear-gradient(180deg, #ffffff03 0%, transparent 40%);
     }
     .terminal-bar {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 12px 16px;
-      background: #1c2128;
+      padding: 14px 18px;
+      background: #0d1219;
       border-bottom: 1px solid var(--border);
     }
     .terminal-dot {
@@ -168,14 +301,16 @@
     .terminal-title {
       flex: 1;
       text-align: center;
-      font-size: 13px;
-      color: var(--text-muted);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-dim);
+      letter-spacing: 0.03em;
     }
     .terminal-body {
-      padding: 16px;
-      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      padding: 18px;
+      font-family: var(--font-mono);
       font-size: 13px;
-      line-height: 1.5;
+      line-height: 1.55;
       overflow-x: auto;
     }
     .terminal-body .tui-title {
@@ -183,46 +318,58 @@
       color: var(--text);
       margin-bottom: 12px;
       text-align: left;
+      font-size: 14px;
+      letter-spacing: 0.02em;
     }
     .terminal-body .tui-info {
-      margin-bottom: 12px;
-      line-height: 1.6;
+      margin-bottom: 14px;
+      line-height: 1.7;
       text-align: left;
     }
     .terminal-body .tui-info .label {
       display: inline-block;
       width: 72px;
-      color: var(--text-muted);
+      color: var(--text-dim);
+      font-weight: 500;
     }
-    .terminal-body .tui-info .value { color: var(--text); }
+    .terminal-body .tui-info .value { color: var(--text-muted); }
     .terminal-body .tui-info .value.running { color: var(--green); font-weight: 700; }
     .terminal-body .tui-info .value.link { color: var(--accent); }
     .terminal-body .tui-section-header {
-      color: var(--text-muted);
-      margin-bottom: 4px;
+      color: var(--text-dim);
+      margin-bottom: 6px;
       text-align: left;
+      font-weight: 500;
     }
     .terminal-body .tui-section-header .autoscroll { color: var(--green); }
     .terminal-body .tui-section-header .intercept { color: var(--yellow); }
     .terminal-body .tui-col-header {
       display: flex;
       gap: 0;
-      padding: 2px 0;
-      color: var(--text-muted);
+      padding: 4px 0;
+      color: var(--text-dim);
       margin-bottom: 2px;
       text-align: left;
+      border-bottom: 1px solid #1a2233;
+      font-weight: 500;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
     }
     .terminal-body .tui-row {
       display: flex;
       gap: 0;
-      padding: 2px 0;
+      padding: 3px 0;
       text-align: left;
+      transition: background 0.15s;
     }
     .terminal-body .tui-row.selected {
-      background: #1f6feb33;
-      border-radius: 3px;
+      background: #1d4ed820;
+      border-radius: 4px;
+      margin: 0 -4px;
+      padding: 3px 4px;
     }
-    .terminal-body .marker { width: 16px; color: var(--text); font-weight: 700; }
+    .terminal-body .marker { width: 16px; color: var(--accent); font-weight: 700; }
     .terminal-body .method { width: 56px; font-weight: 700; }
     .terminal-body .method.get { color: var(--green); }
     .terminal-body .method.post { color: var(--yellow); }
@@ -230,64 +377,114 @@
     .terminal-body .status.s2 { color: var(--green); }
     .terminal-body .status.s3 { color: var(--yellow); }
     .terminal-body .status.s5 { color: var(--red); }
-    .terminal-body .time { width: 56px; color: var(--text-muted); }
-    .terminal-body .size { width: 64px; color: var(--text-muted); }
-    .terminal-body .path { flex: 1; color: var(--text); min-width: 0; padding-left: 8px; }
+    .terminal-body .time { width: 56px; color: var(--text-dim); }
+    .terminal-body .size { width: 64px; color: var(--text-dim); }
+    .terminal-body .path { flex: 1; color: var(--text-muted); min-width: 0; padding-left: 8px; }
+
+    /* Section divider */
+    .divider {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--border), transparent);
+      margin: 0;
+    }
 
     /* Features */
     .features {
-      padding: 64px 0;
+      padding: 96px 0;
     }
-    .features h2 {
-      font-size: 32px;
+    .section-label {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+      text-align: center;
+      margin-bottom: 12px;
+    }
+    .section-title {
+      font-family: var(--font-display);
+      font-size: 36px;
       font-weight: 700;
       text-align: center;
-      margin-bottom: 48px;
+      margin-bottom: 56px;
+      letter-spacing: -0.02em;
     }
     .features-grid {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
-      gap: 24px;
+      gap: 16px;
     }
     .feature {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 24px;
+      border-radius: 12px;
+      padding: 28px;
+      transition: all 0.25s;
+      position: relative;
+      overflow: hidden;
     }
+    .feature::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--border-light), transparent);
+      opacity: 0;
+      transition: opacity 0.25s;
+    }
+    .feature:hover {
+      border-color: var(--border-light);
+      background: var(--surface-hover);
+      transform: translateY(-2px);
+    }
+    .feature:hover::before { opacity: 1; }
     .feature-icon {
-      font-size: 24px;
-      margin-bottom: 12px;
-      display: block;
-      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      font-family: var(--font-mono);
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: #1a2436;
       color: var(--accent);
+      border: 1px solid var(--border);
     }
     .feature h3 {
-      font-size: 16px;
+      font-family: var(--font-body);
+      font-size: 15px;
       font-weight: 600;
       margin-bottom: 8px;
     }
     .feature p {
-      font-size: 14px;
+      font-size: 13px;
       color: var(--text-muted);
-      line-height: 1.5;
+      line-height: 1.6;
+    }
+    .feature code {
+      background: #1a2233;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 12px;
+      font-family: var(--font-mono);
+      color: var(--text);
     }
 
     /* Quick start */
     .quickstart {
-      padding: 64px 0;
-    }
-    .quickstart h2 {
-      font-size: 32px;
-      font-weight: 700;
-      text-align: center;
-      margin-bottom: 48px;
+      padding: 96px 0;
     }
     .steps {
       display: flex;
       flex-direction: column;
-      gap: 24px;
-      max-width: 620px;
+      gap: 20px;
+      max-width: 580px;
       margin: 0 auto;
     }
     .step {
@@ -299,101 +496,133 @@
       flex-shrink: 0;
       width: 32px;
       height: 32px;
-      border-radius: 50%;
-      background: var(--accent);
-      color: var(--bg);
+      border-radius: 8px;
+      background: #1a2436;
+      border: 1px solid var(--border);
+      color: var(--accent);
+      font-family: var(--font-mono);
       font-weight: 700;
-      font-size: 14px;
+      font-size: 13px;
       display: flex;
       align-items: center;
       justify-content: center;
     }
     .step-content { flex: 1; }
     .step-content h3 {
-      font-size: 16px;
+      font-size: 15px;
       font-weight: 600;
       margin-bottom: 8px;
     }
     .step-content pre {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: 8px;
       padding: 12px 16px;
-      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      font-family: var(--font-mono);
       font-size: 13px;
       overflow-x: auto;
     }
-    .step-content .prompt { color: var(--green); user-select: none; }
-    .step-content .comment { color: var(--text-muted); }
-
-    /* Details */
-    .details {
-      padding: 64px 0;
-    }
-    .details h2 {
-      font-size: 32px;
-      font-weight: 700;
+    .step-content .prompt { color: var(--accent); user-select: none; margin-right: 8px; }
+    .step-content .comment { color: var(--text-dim); }
+    .quickstart-result {
       text-align: center;
-      margin-bottom: 48px;
+      color: var(--text-muted);
+      margin-top: 40px;
+      font-size: 15px;
+    }
+    .quickstart-result code {
+      background: #1a2233;
+      padding: 3px 10px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-family: var(--font-mono);
+      color: var(--accent);
+      border: 1px solid var(--border);
+    }
+
+    /* Details / How it works */
+    .details {
+      padding: 96px 0;
     }
     .details-grid {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
-      gap: 24px;
+      gap: 16px;
     }
     .detail-card {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 24px;
+      border-radius: 12px;
+      padding: 28px;
+      transition: all 0.25s;
+    }
+    .detail-card:hover {
+      border-color: var(--border-light);
+      transform: translateY(-1px);
     }
     .detail-card h3 {
-      font-size: 16px;
+      font-size: 15px;
       font-weight: 600;
       margin-bottom: 8px;
     }
     .detail-card p {
-      font-size: 14px;
+      font-size: 13px;
       color: var(--text-muted);
-      line-height: 1.6;
+      line-height: 1.7;
     }
     .detail-card code {
-      background: #1c2128;
-      padding: 2px 6px;
+      background: #1a2233;
+      padding: 1px 5px;
       border-radius: 3px;
-      font-size: 13px;
-      font-family: "SF Mono", "Fira Code", "Fira Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      font-family: var(--font-mono);
       color: var(--text);
     }
 
     /* Footer */
     footer {
-      padding: 32px 0;
+      padding: 40px 0;
       border-top: 1px solid var(--border);
-      text-align: center;
     }
-    footer p {
-      font-size: 14px;
-      color: var(--text-muted);
+    footer .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    footer .footer-left {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+    footer .footer-links {
+      display: flex;
+      gap: 24px;
     }
     footer a {
       color: var(--text-muted);
       text-decoration: none;
-      transition: color 0.15s;
+      font-size: 13px;
+      transition: color 0.2s;
     }
     footer a:hover { color: var(--text); }
 
     /* Responsive */
     @media (max-width: 768px) {
-      .hero { padding: 48px 0 40px; }
-      .hero h1 { font-size: 32px; }
-      .hero p { font-size: 17px; }
+      .hero { padding: 64px 0 48px; }
+      .hero h1 { font-size: 36px; }
+      .hero p { font-size: 16px; }
       .features-grid { grid-template-columns: 1fr; }
       .details-grid { grid-template-columns: 1fr; }
       .terminal-body { font-size: 11px; }
       .terminal-body .method { width: 44px; }
       .terminal-body .time { width: 48px; }
       .terminal-body .size { width: 52px; }
+      .terminal-body .tui-col-header { font-size: 10px; }
+      .section-title { font-size: 28px; }
+      footer .container { flex-direction: column; gap: 16px; }
+    }
+    @media (min-width: 769px) and (max-width: 1024px) {
+      .features-grid { grid-template-columns: repeat(2, 1fr); }
     }
   </style>
 </head>
@@ -412,17 +641,21 @@
 
 <section class="hero">
   <div class="container">
-    <h1><span>HTTPS</span> for localhost,<br>with eyes on every request.</h1>
-    <p>Local reverse proxy with TLS termination, custom DNS, and a terminal UI for inspecting, intercepting, and replaying HTTP traffic.</p>
-    <div class="hero-actions">
+    <div class="hero-badge reveal">
+      <span class="dot"></span>
+      Built with Zig + BoringSSL
+    </div>
+    <h1 class="reveal"><span>HTTPS</span> for localhost,<br>with eyes on every request.</h1>
+    <p class="reveal">Local reverse proxy with TLS termination, custom DNS, and a terminal UI for inspecting, intercepting, and replaying HTTP traffic.</p>
+    <div class="hero-actions reveal">
       <a href="#quickstart" class="btn btn-primary">Get started</a>
       <a href="https://github.com/vandot/zlodev" class="btn btn-secondary">View on GitHub</a>
     </div>
-    <div class="install-snippet">
-      <pre><button class="copy-btn" onclick="copyInstall(this)">copy</button><span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh</pre>
+    <div class="install-snippet reveal">
+      <pre><button class="copy-btn" onclick="copyInstall(this)">copy</button><span class="prompt">$</span>curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh</pre>
     </div>
 
-    <div class="terminal">
+    <div class="terminal reveal">
       <div class="terminal-bar">
         <div class="terminal-dot red"></div>
         <div class="terminal-dot yellow"></div>
@@ -508,52 +741,55 @@
   </div>
 </section>
 
+<div class="divider"></div>
+
 <section class="features" id="features">
   <div class="container">
-    <h2>Features</h2>
+    <div class="section-label reveal">Capabilities</div>
+    <div class="section-title reveal">Everything you need for local dev</div>
     <div class="features-grid">
-      <div class="feature">
-        <span class="feature-icon">~&gt;</span>
+      <div class="feature reveal">
+        <div class="feature-icon">~&gt;</div>
         <h3>HTTPS reverse proxy</h3>
         <p>TLS termination with auto-generated CA and domain certificates. Your browser sees a trusted green lock.</p>
       </div>
-      <div class="feature">
-        <span class="feature-icon">*.lo</span>
+      <div class="feature reveal">
+        <div class="feature-icon">*.lo</div>
         <h3>Custom DNS</h3>
         <p>Resolves <code>*.lo</code> to localhost automatically. No <code>/etc/hosts</code> editing needed.</p>
       </div>
-      <div class="feature">
-        <span class="feature-icon">&gt;_</span>
+      <div class="feature reveal">
+        <div class="feature-icon">&gt;_</div>
         <h3>Terminal UI</h3>
         <p>Live request list with method, path, status, timing, and body size. Detail view for headers and body.</p>
       </div>
-      <div class="feature">
-        <span class="feature-icon">||</span>
+      <div class="feature reveal">
+        <div class="feature-icon">||</div>
         <h3>Request interception</h3>
         <p>Hold requests before they reach your server. Inspect, edit, accept, or drop them in real time.</p>
       </div>
-      <div class="feature">
-        <span class="feature-icon">&lt;r&gt;</span>
+      <div class="feature reveal">
+        <div class="feature-icon">&lt;r&gt;</div>
         <h3>Replay &amp; edit</h3>
         <p>Re-send any captured request. Edit method, path, headers, and body before replaying.</p>
       </div>
-      <div class="feature">
-        <span class="feature-icon">{ }</span>
+      <div class="feature reveal">
+        <div class="feature-icon">{ }</div>
         <h3>HAR export</h3>
         <p>Export captured traffic as HTTP Archive files for sharing, analysis, or import into other tools.</p>
       </div>
-      <div class="feature">
-        <span class="feature-icon">curl</span>
+      <div class="feature reveal">
+        <div class="feature-icon">curl</div>
         <h3>Copy as curl</h3>
         <p>Copy any request as a ready-to-run curl command with a single keystroke.</p>
       </div>
-      <div class="feature">
-        <span class="feature-icon">ws://</span>
+      <div class="feature reveal">
+        <div class="feature-icon">ws</div>
         <h3>WebSocket passthrough</h3>
         <p>Transparent proxying of WebSocket upgrades. HMR and live-reload just work.</p>
       </div>
-      <div class="feature">
-        <span class="feature-icon">:0</span>
+      <div class="feature reveal">
+        <div class="feature-icon">:0</div>
         <h3>Port auto-detect</h3>
         <p>Reads <code>.env</code> and framework configs to find your dev server port. Zero config for most setups.</p>
       </div>
@@ -561,62 +797,68 @@
   </div>
 </section>
 
+<div class="divider"></div>
+
 <section class="quickstart" id="quickstart">
   <div class="container">
-    <h2>Quick start</h2>
+    <div class="section-label reveal">Setup</div>
+    <div class="section-title reveal">Up and running in 60 seconds</div>
     <div class="steps">
-      <div class="step">
+      <div class="step reveal">
         <div class="step-num">1</div>
         <div class="step-content">
           <h3>Install</h3>
-          <pre><span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh</pre>
+          <pre><span class="prompt">$</span>curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh</pre>
         </div>
       </div>
-      <div class="step">
+      <div class="step reveal">
         <div class="step-num">2</div>
         <div class="step-content">
           <h3>Set up certificates and DNS</h3>
-          <pre><span class="prompt">$</span> zlodev install</pre>
+          <pre><span class="prompt">$</span>zlodev install</pre>
         </div>
       </div>
-      <div class="step">
+      <div class="step reveal">
         <div class="step-num">3</div>
         <div class="step-content">
           <h3>Start your dev server</h3>
-          <pre><span class="prompt">$</span> npm run dev <span class="comment"># or whatever starts your app</span></pre>
+          <pre><span class="prompt">$</span>npm run dev <span class="comment"># or whatever starts your app</span></pre>
         </div>
       </div>
-      <div class="step">
+      <div class="step reveal">
         <div class="step-num">4</div>
         <div class="step-content">
           <h3>Start zlodev</h3>
-          <pre><span class="prompt">$</span> zlodev start</pre>
+          <pre><span class="prompt">$</span>zlodev start</pre>
         </div>
       </div>
     </div>
-    <p style="text-align:center; color: var(--text-muted); margin-top: 32px; font-size: 15px;">
-      Your app is now at <code style="background:#1c2128; padding:2px 6px; border-radius:3px; font-size:14px; color: var(--accent);">https://dev.lo</code>
+    <p class="quickstart-result reveal">
+      Your app is now at <code>https://dev.lo</code>
     </p>
   </div>
 </section>
 
+<div class="divider"></div>
+
 <section class="details" id="how-it-works">
   <div class="container">
-    <h2>How it works</h2>
+    <div class="section-label reveal">Architecture</div>
+    <div class="section-title reveal">How it works</div>
     <div class="details-grid">
-      <div class="detail-card">
+      <div class="detail-card reveal">
         <h3>DNS resolver</h3>
         <p>A lightweight UDP server resolves <code>*.lo</code> queries to <code>127.0.0.1</code>. Registers via <code>/etc/resolver/</code> on macOS and <code>systemd-resolved</code> on Linux.</p>
       </div>
-      <div class="detail-card">
+      <div class="detail-card reveal">
         <h3>Certificate authority</h3>
-        <p>On install, zlodev generates a local CA and domain certificate using OpenSSL. The CA is added to your system trust store, unique to your machine.</p>
+        <p>On install, zlodev generates a local CA and domain certificate. The CA is added to your system trust store, unique to your machine.</p>
       </div>
-      <div class="detail-card">
+      <div class="detail-card reveal">
         <h3>TLS proxy</h3>
         <p>An HTTPS reverse proxy on port 443 terminates TLS, forwards plain HTTP to your dev server, and relays responses back over the encrypted connection.</p>
       </div>
-      <div class="detail-card">
+      <div class="detail-card reveal">
         <h3>HTTP server</h3>
         <p>A plain HTTP server on port 80 serves the CA certificate download page for mobile devices and redirects other traffic to HTTPS.</p>
       </div>
@@ -624,25 +866,28 @@
   </div>
 </section>
 
+<div class="divider"></div>
+
 <section class="details">
   <div class="container">
-    <h2>Options</h2>
+    <div class="section-label reveal">Configuration</div>
+    <div class="section-title reveal">Options</div>
     <div class="details-grid">
-      <div class="detail-card">
+      <div class="detail-card reveal">
         <h3>Local network / mDNS</h3>
         <p>Use <code>-l</code> to bind to <code>.local</code> via mDNS. Access your dev server from mobile devices on the same network.</p>
       </div>
-      <div class="detail-card">
+      <div class="detail-card reveal">
         <h3>Headless mode</h3>
         <p>Run with <code>--no-tui</code> for script and CI usage. Logs go to stderr instead of the terminal UI.</p>
       </div>
-      <div class="detail-card">
+      <div class="detail-card reveal">
         <h3>Max body control</h3>
         <p>Set <code>--max-body=50M</code> to control how large a request body the proxy will accept. Supports K, M, G suffixes.</p>
       </div>
-      <div class="detail-card">
+      <div class="detail-card reveal">
         <h3>Cross-platform</h3>
-        <p>Works on macOS and Linux. Written in Zig with OpenSSL 3 for TLS. Single binary, no runtime dependencies.</p>
+        <p>Works on macOS and Linux. Written in Zig with BoringSSL for TLS. Single binary, no runtime dependencies.</p>
       </div>
     </div>
   </div>
@@ -650,13 +895,12 @@
 
 <footer>
   <div class="container">
-    <p>
+    <div class="footer-left">zlodev</div>
+    <div class="footer-links">
       <a href="https://github.com/vandot/zlodev">GitHub</a>
-      &nbsp;&middot;&nbsp;
-      MIT License
-      &nbsp;&middot;&nbsp;
-      Built with <a href="https://ziglang.org">Zig</a>
-    </p>
+      <a href="https://github.com/vandot/zlodev/blob/main/LICENSE">MIT License</a>
+      <a href="https://ziglang.org">Built with Zig</a>
+    </div>
   </div>
 </footer>
 
@@ -668,6 +912,22 @@ function copyInstall(btn) {
     setTimeout(function() { btn.textContent = 'copy'; }, 2000);
   });
 }
+
+// Reveal on scroll
+var reveals = document.querySelectorAll('.reveal');
+var observer = new IntersectionObserver(function(entries) {
+  entries.forEach(function(entry, i) {
+    if (entry.isIntersecting) {
+      // Stagger siblings
+      var siblings = entry.target.parentElement.querySelectorAll('.reveal');
+      var idx = Array.prototype.indexOf.call(siblings, entry.target);
+      entry.target.style.transitionDelay = (idx * 0.06) + 's';
+      entry.target.classList.add('visible');
+      observer.unobserve(entry.target);
+    }
+  });
+}, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
+reveals.forEach(function(el) { observer.observe(el); });
 </script>
 
 </body>

@@ -13,17 +13,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - target: x86_64-linux
             artifact: zlodev-linux-amd64
-            ext: tar.gz
-          - os: ubuntu-24.04-arm
+          - target: aarch64-linux
             artifact: zlodev-linux-arm64
-            ext: tar.gz
-          - os: macos-latest
+          - target: aarch64-macos
             artifact: zlodev-darwin-arm64
-            ext: tar.gz
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -33,17 +30,12 @@ jobs:
         with:
           version: 0.15.1
 
-      - name: Install OpenSSL (Linux)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
-
       - name: Get version from tag
         id: version
-        shell: bash
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dversion=${{ steps.version.outputs.VERSION }}
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dversion=${{ steps.version.outputs.VERSION }}
 
       - name: Package
         run: tar -czf ${{ matrix.artifact }}.tar.gz -C zig-out/bin zlodev
@@ -52,7 +44,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.${{ matrix.ext }}
+          path: ${{ matrix.artifact }}.tar.gz
 
   release:
     needs: build

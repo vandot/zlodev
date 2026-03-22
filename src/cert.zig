@@ -84,8 +84,7 @@ fn generateRsaKey() !*c.EVP_PKEY {
 
     if (c.EVP_PKEY_keygen_init(ctx) != 1) return error.KeyGenFailed;
 
-    // EVP_PKEY_CTX_set_rsa_keygen_bits is a macro, use EVP_PKEY_CTX_ctrl directly
-    if (c.EVP_PKEY_CTX_ctrl(ctx, c.EVP_PKEY_RSA, c.EVP_PKEY_OP_KEYGEN, c.EVP_PKEY_CTRL_RSA_KEYGEN_BITS, 2048, null) != 1)
+    if (c.EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) != 1)
         return error.KeyGenFailed;
 
     var pkey: ?*c.EVP_PKEY = null;

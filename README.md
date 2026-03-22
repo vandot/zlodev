@@ -21,7 +21,7 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 
 ### Pre-built binary
 
-Pre-built binaries have no external dependencies — OpenSSL is statically linked.
+Pre-built binaries have no external dependencies — single binary, nothing to install.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh
@@ -29,26 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh
 
 ### Build from source
 
-Building from source requires [Zig](https://ziglang.org/download/) 0.15.1 and OpenSSL 3.x development libraries.
-
-<details>
-<summary>Installing OpenSSL dev libraries</summary>
-
-**macOS** (Homebrew):
-```sh
-brew install openssl@3
-```
-
-**Ubuntu/Debian**:
-```sh
-sudo apt-get install libssl-dev
-```
-
-**Fedora/RHEL**:
-```sh
-sudo dnf install openssl-devel
-```
-</details>
+Building from source requires [Zig](https://ziglang.org/download/) 0.15.1. No other dependencies — BoringSSL is compiled from source automatically.
 
 ```sh
 git clone https://github.com/vandot/zlodev.git
@@ -64,8 +45,6 @@ The binary is at `zig-out/bin/zlodev`.
 |--------|-------------|---------|
 | `-Dversion=STRING` | Version string | `dev` |
 | `-Dmax-entries=N` | Max request entries in ring buffer | `500` |
-| `-Dopenssl-include=PATH` | OpenSSL include path override | auto-detect |
-| `-Dopenssl-lib=PATH` | OpenSSL library path override | auto-detect |
 
 ## Quick start
 
@@ -175,7 +154,7 @@ zlodev start --no-tui
 
 1. **DNS** — A lightweight DNS server resolves `*.lo` queries to `127.0.0.1`. On macOS it registers via `/etc/resolver/`, on Linux via `systemd-resolved`.
 
-2. **Certificates** — On `install`, zlodev generates a local CA and domain certificate using OpenSSL, then adds the CA to your system trust store. The CA is unique to your machine.
+2. **Certificates** — On `install`, zlodev generates a local CA and domain certificate, then adds the CA to your system trust store. The CA is unique to your machine.
 
 3. **Proxy** — An HTTPS reverse proxy accepts connections on port 443, terminates TLS, and forwards plain HTTP to your dev server. Responses are relayed back over TLS.
 

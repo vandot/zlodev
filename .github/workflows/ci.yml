@@ -17,9 +17,6 @@ jobs:
         with:
           version: 0.15.1
 
-      - name: Install OpenSSL
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
-
       - name: Build
         run: zig build
 
