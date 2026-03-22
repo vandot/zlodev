@@ -865,7 +865,7 @@
       </div>
       <div class="detail-card reveal">
         <h3>TLS proxy</h3>
-        <p>An HTTPS reverse proxy on port 443 terminates TLS, forwards plain HTTP to your dev server, and relays responses back over the encrypted connection.</p>
+        <p>An HTTPS reverse proxy on port 443 terminates TLS, forwards plain HTTP to your dev server, and relays responses back over the encrypted connection. On Linux, file capabilities (<code>cap_net_bind_service</code>) allow binding to privileged ports without running as root.</p>
       </div>
       <div class="detail-card reveal">
         <h3>HTTP server</h3>

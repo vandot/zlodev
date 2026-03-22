@@ -40,6 +40,12 @@ zig build -Doptimize=ReleaseSafe
 
 The binary is at `zig-out/bin/zlodev`.
 
+On Linux, grant the binary permission to bind to privileged ports (80, 443) without root:
+
+```sh
+sudo setcap cap_net_bind_service=+eip zig-out/bin/zlodev
+```
+
 #### Build options
 
 | Option | Description | Default |
@@ -216,6 +222,16 @@ sudo ss -tlnp | grep :443
 # Windows (elevated terminal)
 netstat -an | findstr ":443"
 ```
+
+### Permission denied on ports 80/443 (Linux)
+
+On Linux, binding to ports below 1024 requires elevated privileges. Instead of running as root, zlodev uses Linux file capabilities. The install script sets this automatically, but if you built from source:
+
+```sh
+sudo setcap cap_net_bind_service=+eip $(which zlodev)
+```
+
+This grants only the specific capability to bind privileged ports — no other root access.
 
 ### Certificate not trusted
 
