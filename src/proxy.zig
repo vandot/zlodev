@@ -19,6 +19,14 @@ const ssl_c = @cImport({
 
 pub const default_max_request_body: usize = 10 * 1024 * 1024; // 10MB
 
+pub const Route = struct {
+    kind: enum { subdomain, path },
+    pattern: []const u8,
+    port: u16,
+};
+
+pub const max_routes = 16;
+
 pub const ProxyConfig = struct {
     target_host: []const u8,
     target_port: u16,
@@ -28,12 +36,68 @@ pub const ProxyConfig = struct {
     ca_path: [:0]const u8,
     server_ident: []const u8,
     max_request_body: usize = default_max_request_body,
+    routes: []const Route = &.{},
+    domain: []const u8 = "dev.lo",
 };
 
 var conn_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 fn nextConnId() u64 {
     return conn_counter.fetchAdd(1, .monotonic) + 1;
+}
+
+const RouteResult = struct {
+    port: u16,
+    index: u8, // 0xff = no route match
+};
+
+/// Resolve the upstream port for a request based on configured routes.
+/// Priority: 1) subdomain match on Host header, 2) longest path prefix, 3) default port.
+fn resolveRoute(config: *const ProxyConfig, host: []const u8, uri: []const u8) RouteResult {
+    // 1. Check subdomain routes: match "api" against Host "api.dev.lo"
+    var best_path_len: usize = 0;
+    var best_path_port: ?u16 = null;
+    var best_path_idx: u8 = 0xff;
+
+    for (config.routes, 0..) |route, i| {
+        switch (route.kind) {
+            .subdomain => {
+                // Host header may include port (e.g. "api.dev.lo:443")
+                const host_name = if (std.mem.indexOfScalar(u8, host, ':')) |colon| host[0..colon] else host;
+                // Check if host starts with "pattern." and the rest matches the domain
+                if (host_name.len > route.pattern.len + 1 + config.domain.len) {
+                    // Too long, skip
+                } else if (host_name.len == route.pattern.len + 1 + config.domain.len and
+                    std.mem.startsWith(u8, host_name, route.pattern) and
+                    host_name[route.pattern.len] == '.' and
+                    std.mem.eql(u8, host_name[route.pattern.len + 1 ..], config.domain))
+                {
+                    return .{ .port = route.port, .index = @intCast(i) };
+                }
+            },
+            .path => {
+                // Longest prefix match
+                if (std.mem.startsWith(u8, uri, route.pattern) and route.pattern.len > best_path_len) {
+                    // Ensure we match at a boundary: exact match, or next char is '/' or '?'
+                    if (uri.len == route.pattern.len or
+                        uri[route.pattern.len] == '/' or
+                        uri[route.pattern.len] == '?' or
+                        route.pattern[route.pattern.len - 1] == '/')
+                    {
+                        best_path_len = route.pattern.len;
+                        best_path_port = route.port;
+                        best_path_idx = @intCast(i);
+                    }
+                }
+            },
+        }
+    }
+
+    // 2. Return longest path match if found
+    if (best_path_port) |port| return .{ .port = port, .index = best_path_idx };
+
+    // 3. Default
+    return .{ .port = config.target_port, .index = 0xff };
 }
 
 pub fn start(config: *const ProxyConfig) !void {
@@ -203,8 +267,13 @@ fn handleConnection(
         const client_conn = getConnectionHeader(req_hdr_section);
         const keep_alive = if (client_conn == .close) false else if (client_conn == .keep_alive) true else is_http11;
 
+        // Extract Host header for route resolution
+        const host = getHeaderValue(req_hdr_section, "host:") orelse "";
+        const route_result = resolveRoute(config, host, uri);
+        const upstream_port = route_result.port;
+
         // Prepare request log entry
-        var entry = requests.Entry{ .timestamp = start_time };
+        var entry = requests.Entry{ .timestamp = start_time, .route_index = route_result.index };
         const m_len = @min(method.len, entry.method.len);
         @memcpy(entry.method[0..m_len], method[0..m_len]);
         entry.method_len = @intCast(m_len);
@@ -308,7 +377,7 @@ fn handleConnection(
         }
 
         // Connect to upstream (per-request — dev servers may not support keep-alive)
-        const upstream_addr = std.net.Address.parseIp(config.target_host, config.target_port) catch {
+        const upstream_addr = std.net.Address.parseIp(config.target_host, upstream_port) catch {
             if (was_intercepted) {
                 requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
             }
@@ -634,6 +703,16 @@ fn sslSendError(ssl: *ssl_c.SSL, status: u16, message: []const u8) void {
 }
 
 const ConnectionHeader = enum { keep_alive, close, none };
+
+fn getHeaderValue(headers: []const u8, comptime name: []const u8) ?[]const u8 {
+    var iter = std.mem.splitSequence(u8, headers, "\r\n");
+    while (iter.next()) |line| {
+        if (startsWithIgnoreCase(line, name)) {
+            return std.mem.trim(u8, line[name.len..], " \t");
+        }
+    }
+    return null;
+}
 
 fn getConnectionHeader(headers: []const u8) ConnectionHeader {
     var iter = std.mem.splitSequence(u8, headers, "\r\n");

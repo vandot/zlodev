@@ -40,6 +40,8 @@ pub fn main() !void {
     var dns_only: bool = false;
     var cert_only: bool = false;
     var max_body: usize = proxy.default_max_request_body;
+    var routes: [proxy.max_routes]proxy.Route = undefined;
+    var route_count: usize = 0;
 
     var args = if (builtin.os.tag == .windows)
         try std.process.argsWithAllocator(std.heap.page_allocator)
@@ -70,6 +72,36 @@ pub fn main() !void {
                 std.debug.print("invalid max-body value: {s}\n", .{val});
                 std.process.exit(1);
             };
+        } else if (flagValue(arg, null, "--route")) |val| {
+            if (route_count >= proxy.max_routes) {
+                std.debug.print("too many routes (max {d})\n", .{proxy.max_routes});
+                std.process.exit(1);
+            }
+            // Parse PATTERN=PORT — pattern is everything up to last '='
+            if (std.mem.lastIndexOfScalar(u8, val, '=')) |eq| {
+                const pattern = val[0..eq];
+                const port_str = val[eq + 1 ..];
+                const rport = std.fmt.parseInt(u16, port_str, 10) catch {
+                    std.debug.print("invalid route port: {s}\n", .{port_str});
+                    std.process.exit(1);
+                };
+                if (pattern.len == 0) {
+                    std.debug.print("empty route pattern in: {s}\n", .{val});
+                    std.process.exit(1);
+                }
+                routes[route_count] = .{
+                    .kind = if (pattern[0] == '/') .path else .subdomain,
+                    .pattern = allocator.dupe(u8, pattern) catch {
+                        std.debug.print("out of memory\n", .{});
+                        std.process.exit(1);
+                    },
+                    .port = rport,
+                };
+                route_count += 1;
+            } else {
+                std.debug.print("invalid route format, expected PATTERN=PORT: {s}\n", .{val});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, arg, "--no-tui")) {
             no_tui = true;
         } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--dns")) {
@@ -90,6 +122,10 @@ pub fn main() !void {
             return;
         }
     }
+
+    defer for (routes[0..route_count]) |route| {
+        allocator.free(route.pattern);
+    };
 
     const tld: []const u8 = if (local) "local" else "lo";
 
@@ -127,7 +163,7 @@ pub fn main() !void {
             if (dns_only) {
                 try doStartDns(tld);
             } else {
-                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, no_tui, max_body);
+                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, no_tui, max_body, routes[0..route_count]);
             }
         },
         .uninstall => {
@@ -271,6 +307,7 @@ fn doStart(
     bind_addr: []const u8,
     no_tui: bool,
     max_request_body: usize,
+    routes: []const proxy.Route,
 ) !void {
     // Check if another instance is already running
     if (isPortListening(bind_addr, 443)) {
@@ -361,6 +398,8 @@ fn doStart(
         .ca_path = ca_path_z,
         .server_ident = "zlodev",
         .max_request_body = max_request_body,
+        .routes = routes,
+        .domain = domain_owned,
     };
     const proxy_thread = try std.Thread.spawn(.{}, struct {
         fn run(cfg: *const proxy.ProxyConfig) void {
@@ -371,13 +410,17 @@ fn doStart(
     }.run, .{&config});
 
     if (no_tui) {
-        log.info("component=main op=running domain={s} target=127.0.0.1:{d}", .{ full_domain, target_port });
+        log.info("component=main op=running domain={s} target=127.0.0.1:{d} routes={d}", .{ full_domain, target_port, routes.len });
+        for (routes) |route| {
+            const kind_str: []const u8 = if (route.kind == .subdomain) "subdomain" else "path";
+            log.info("component=main route kind={s} pattern={s} port={d}", .{ kind_str, route.pattern, route.port });
+        }
         while (shutdown.isRunning()) {
             std.Thread.sleep(100 * std.time.ns_per_ms);
         }
     } else {
         // Run TUI on main thread (blocks until user quits)
-        tui.run(allocator, full_domain, target_port) catch |e| {
+        tui.run(allocator, full_domain, target_port, routes) catch |e| {
             log.unmute();
             log.err("component=tui op=start error={any}", .{e});
         };
@@ -443,12 +486,18 @@ fn printHelp() void {
         \\Options:
         \\  -p=PORT, --port=PORT       target port [auto-detect or 3000]
         \\  -b=ADDR, --bind=ADDR       listen address [default 0.0.0.0]
+        \\  --route=PATTERN=PORT       route by subdomain or path (repeatable)
         \\  --max-body=SIZE            max request body size [default 10M]
         \\  --no-tui                   disable TUI, log to stderr
         \\  -l, --local                use .local domain (mDNS)
         \\  -f, --force                force reinstall
         \\  -h, --help                 show help
         \\  -v, --version              show version
+        \\
+        \\Routes:
+        \\  --route=api=3001           subdomain: api.dev.lo -> :3001
+        \\  --route=/api=3001          path:      dev.lo/api/* -> :3001
+        \\  Priority: subdomain > longest path > default port
         \\
         \\SIZE accepts suffixes: K (KB), M (MB), G (GB). Example: --max-body=50M
         \\

@@ -38,6 +38,7 @@ pub const Entry = struct {
     resp_body_truncated: bool = false,
     state: EntryState = .normal,
     pinned: bool = false,
+    route_index: u8 = 0xff, // 0xff = no route match, otherwise index into routes
 
     pub fn getMethod(self: *const Entry) []const u8 {
         return self.method[0..self.method_len];

@@ -285,7 +285,7 @@ const EditState = struct {
     }
 };
 
-pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16) !void {
+pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, routes: []const proxy.Route) !void {
     const proxy_text = try std.fmt.allocPrint(alloc, "https -> 127.0.0.1:{d}", .{target_port});
     defer alloc.free(proxy_text);
     const ca_text = try std.fmt.allocPrint(alloc, "http://{s}/ca", .{domain});
@@ -656,7 +656,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16) !void
 
         switch (view) {
             .list => {
-                const header_rows = drawHeader(win, domain, proxy_text, ca_text, raw_count, autoscroll);
+                const header_rows = drawHeader(win, domain, proxy_text, ca_text, raw_count, autoscroll, routes);
                 const available_rows = if (win.height > header_rows + 2) win.height - header_rows - 2 else 1;
 
                 // Adjust scroll to keep cursor visible
@@ -699,7 +699,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16) !void
     }
 }
 
-fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_text: []const u8, req_count: usize, autoscroll: bool) u16 {
+fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_text: []const u8, req_count: usize, autoscroll: bool, routes: []const proxy.Route) u16 {
     const green: vaxis.Color = .{ .rgb = .{ 0x3f, 0xb9, 0x50 } };
     const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
     const white: vaxis.Color = .{ .rgb = .{ 0xe1, 0xe4, 0xe8 } };
@@ -721,6 +721,19 @@ fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_
     printAt(win, 2, row, "PROXY", .{ .fg = dim });
     printAt(win, 11, row, proxy_text, .{ .fg = white });
     row += 1;
+
+    // Show routes if configured
+    for (routes, 0..) |route, i| {
+        var route_buf: [128]u8 = undefined;
+        const route_text = switch (route.kind) {
+            .subdomain => std.fmt.bufPrint(&route_buf, "{s}.{s} -> 127.0.0.1:{d}", .{ route.pattern, domain, route.port }) catch "",
+            .path => std.fmt.bufPrint(&route_buf, "{s} -> 127.0.0.1:{d}", .{ route.pattern, route.port }) catch "",
+        };
+        const color = route_palette[i % route_palette.len];
+        printAt(win, 2, row, "ROUTE", .{ .fg = dim });
+        writeAscii(win, 11, row, route_text, .{ .fg = color });
+        row += 1;
+    }
 
     printAt(win, 2, row, "CA", .{ .fg = dim });
     printAt(win, 11, row, ca_text, .{ .fg = blue });
@@ -824,7 +837,6 @@ fn drawRequests(
 }
 
 fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Entry, selected: bool) void {
-    const white: vaxis.Color = .{ .rgb = .{ 0xe1, 0xe4, 0xe8 } };
     const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
     const bg: vaxis.Color = if (selected) .{ .rgb = .{ 0x1c, 0x2b, 0x3a } } else .default;
 
@@ -880,7 +892,8 @@ fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Entry, se
     const path = entry.getPath();
     const max_path = win.width -| 38;
     const display_path = if (path.len > max_path) path[0..max_path] else path;
-    writeAscii(win, 36, row, display_path, .{ .fg = white, .bg = bg });
+    const path_color = routeColor(entry.route_index);
+    writeAscii(win, 36, row, display_path, .{ .fg = path_color, .bg = bg });
 }
 
 fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const requests.Entry, index: usize, total_count: usize, autoscroll: bool, detail_scroll: *usize, show_help: bool, show_body: bool) void {
@@ -1331,6 +1344,26 @@ fn statusColor(status: u16) vaxis.Color {
     if (status >= 400 and status < 500) return .{ .rgb = .{ 0xd2, 0x9e, 0x22 } };
     if (status >= 500) return .{ .rgb = .{ 0xf8, 0x51, 0x49 } };
     return .{ .rgb = .{ 0x8b, 0x94, 0x9e } };
+}
+
+// Distinct colors for route-matched paths in the request list.
+// Index 0 is for the first --route, index 1 for the second, etc.
+// Default (unrouted) paths stay white.
+const route_palette = [_]vaxis.Color{
+    .{ .rgb = .{ 0xbc, 0x8c, 0xff } }, // purple
+    .{ .rgb = .{ 0x39, 0xd3, 0x53 } }, // green
+    .{ .rgb = .{ 0xf0, 0x88, 0x3e } }, // orange
+    .{ .rgb = .{ 0x58, 0xa6, 0xff } }, // blue
+    .{ .rgb = .{ 0xf4, 0x78, 0x67 } }, // coral
+    .{ .rgb = .{ 0x56, 0xd3, 0x64 } }, // lime
+    .{ .rgb = .{ 0xe2, 0xb7, 0x14 } }, // gold
+    .{ .rgb = .{ 0x6c, 0xb6, 0xff } }, // light blue
+};
+
+fn routeColor(route_index: u8) vaxis.Color {
+    const white: vaxis.Color = .{ .rgb = .{ 0xe1, 0xe4, 0xe8 } };
+    if (route_index == 0xff) return white;
+    return route_palette[route_index % route_palette.len];
 }
 
 /// Write ASCII text character-by-character using writeCell.

@@ -758,6 +758,11 @@
         <p>TLS termination with auto-generated CA and domain certificates. Your browser sees a trusted green lock.</p>
       </div>
       <div class="feature reveal">
+        <div class="feature-icon">/&rarr;</div>
+        <h3>Multi-app routing</h3>
+        <p>Route by subdomain (<code>api.dev.lo</code>) or path prefix (<code>/api</code>) to different backend ports. Color-coded in the TUI.</p>
+      </div>
+      <div class="feature reveal">
         <div class="feature-icon">*.lo</div>
         <h3>Custom DNS</h3>
         <p>Resolves <code>*.lo</code> to localhost automatically. No <code>/etc/hosts</code> editing needed.</p>
@@ -877,6 +882,10 @@
     <div class="section-label reveal">Configuration</div>
     <div class="section-title reveal">Options</div>
     <div class="details-grid">
+      <div class="detail-card reveal">
+        <h3>Multi-app routing</h3>
+        <p>Use <code>--route=api=3001</code> for subdomain routing (<code>api.dev.lo</code>) or <code>--route=/api=3001</code> for path routing. Mix both, add as many as you need. Each route gets a distinct color in the TUI.</p>
+      </div>
       <div class="detail-card reveal">
         <h3>Local network / mDNS</h3>
         <p>Use <code>-l</code> to bind to <code>.local</code> via mDNS. Access your dev server from mobile devices on the same network.</p>

@@ -7,6 +7,7 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 ## Features
 
 - **HTTPS reverse proxy** — TLS termination with auto-generated CA and domain certificates
+- **Multi-app routing** — route by subdomain (`api.dev.lo`) or path prefix (`/api`) to different ports
 - **Custom DNS** — resolves `*.lo` to localhost, no `/etc/hosts` editing
 - **Terminal UI** — live request list with method, path, status, timing, and body size
 - **Request interception** — hold, inspect, accept, or drop requests before they reach your server
@@ -97,6 +98,7 @@ zlodev start -d             start DNS server only (log mode)
 ```
 -p=PORT, --port=PORT       target port [auto-detect or 3000]
 -b=ADDR, --bind=ADDR       listen address [default 0.0.0.0]
+--route=PATTERN=PORT       route by subdomain or path (repeatable)
 --max-body=SIZE            max request body size [default 10M]
 --no-tui                   disable TUI, log to stderr
 -l, --local                use .local domain (mDNS)
@@ -106,6 +108,31 @@ zlodev start -d             start DNS server only (log mode)
 ```
 
 `SIZE` accepts suffixes: `K` (KB), `M` (MB), `G` (GB). Example: `--max-body=50M`
+
+### Routing
+
+Route requests to different backend ports by subdomain or path prefix:
+
+```sh
+# Subdomain routing — no "/" prefix
+zlodev start --route=api=3001 --route=dashboard=4200
+
+# api.dev.lo      → 127.0.0.1:3001
+# dashboard.dev.lo → 127.0.0.1:4200
+# dev.lo          → 127.0.0.1:3000 (default)
+
+# Path routing — "/" prefix
+zlodev start --route=/api=3001 --route=/admin=8080
+
+# dev.lo/api/*    → 127.0.0.1:3001
+# dev.lo/admin/*  → 127.0.0.1:8080
+# dev.lo/*        → 127.0.0.1:3000 (default)
+
+# Mix both
+zlodev start --route=api=3001 --route=/webhooks=8080
+```
+
+Priority: subdomain match > longest path prefix > default port.
 
 ### Port auto-detection
 
