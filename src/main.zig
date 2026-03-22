@@ -36,15 +36,19 @@ pub fn main() !void {
     var port_set = false;
     var target_port: u16 = 3000;
     var bind_addr: []const u8 = "0.0.0.0";
+    var bind_set = false;
     var no_tui: bool = false;
+    var no_tui_set = false;
     var dns_only: bool = false;
     var cert_only: bool = false;
     var max_body: usize = proxy.default_max_request_body;
+    var max_body_set = false;
     var routes: [proxy.max_routes]proxy.Route = undefined;
     var route_count: usize = 0;
     defer for (routes[0..route_count]) |route| {
         allocator.free(route.pattern);
     };
+    var config_path: ?[]const u8 = null;
 
     var args = if (builtin.os.tag == .windows)
         try std.process.argsWithAllocator(std.heap.page_allocator)
@@ -70,46 +74,23 @@ pub fn main() !void {
             port_set = true;
         } else if (flagValue(arg, "-b", "--bind")) |val| {
             bind_addr = val;
+            bind_set = true;
         } else if (flagValue(arg, null, "--max-body")) |val| {
             max_body = parseSize(val) orelse {
                 std.debug.print("invalid max-body value: {s}\n", .{val});
                 std.process.exit(1);
             };
+            max_body_set = true;
         } else if (flagValue(arg, null, "--route")) |val| {
-            if (route_count >= proxy.max_routes) {
-                std.debug.print("too many routes (max {d})\n", .{proxy.max_routes});
-                std.process.exit(1);
-            }
-            // Parse PATTERN=PORT — pattern is everything up to last '='
-            if (std.mem.lastIndexOfScalar(u8, val, '=')) |eq| {
-                const pattern = val[0..eq];
-                const port_str = val[eq + 1 ..];
-                const rport = std.fmt.parseInt(u16, port_str, 10) catch {
-                    std.debug.print("invalid route port: {s}\n", .{port_str});
-                    std.process.exit(1);
-                };
-                if (pattern.len == 0) {
-                    std.debug.print("empty route pattern in: {s}\n", .{val});
-                    std.process.exit(1);
-                }
-                routes[route_count] = .{
-                    .kind = if (pattern[0] == '/') .path else .subdomain,
-                    .pattern = allocator.dupe(u8, pattern) catch {
-                        std.debug.print("out of memory\n", .{});
-                        std.process.exit(1);
-                    },
-                    .port = rport,
-                };
-                route_count += 1;
-            } else {
-                std.debug.print("invalid route format, expected PATTERN=PORT: {s}\n", .{val});
-                std.process.exit(1);
-            }
+            addRoute(allocator, &routes, &route_count, val);
+        } else if (flagValue(arg, "-c", "--config")) |val| {
+            config_path = val;
         } else if (std.mem.eql(u8, arg, "--no-tui")) {
             no_tui = true;
-        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--dns")) {
+            no_tui_set = true;
+        } else if (std.mem.eql(u8, arg, "--dns")) {
             dns_only = true;
-        } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--cert")) {
+        } else if (std.mem.eql(u8, arg, "--cert")) {
             cert_only = true;
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
             force = true;
@@ -126,6 +107,39 @@ pub fn main() !void {
         }
     }
 
+    // Read config file for start command — config values are defaults, CLI args override
+    if (command == .start) {
+        const cfg_path = config_path orelse ".zlodev";
+        if (readConfigFile(allocator, cfg_path, &routes, &route_count)) |cfg| {
+            if (!port_set) if (cfg.port) |p| {
+                target_port = p;
+                port_set = true;
+            };
+            if (!bind_set) if (cfg.bind) |b| {
+                bind_addr = b;
+            };
+            if (!no_tui_set and cfg.no_tui) no_tui = true;
+            if (!max_body_set) if (cfg.max_body) |mb| {
+                max_body = mb;
+            };
+            if (cfg.local) local = true;
+            if (cfg.dns) dns_only = true;
+        } else |_| {
+            if (config_path != null) {
+                std.debug.print("config file not found: {s}\n", .{cfg_path});
+                std.process.exit(1);
+            }
+        }
+    }
+
+    // When using --dns with start, no other options apply
+    if (command == .start and dns_only) {
+        if (port_set or bind_set or no_tui_set or max_body_set or route_count > 0) {
+            std.debug.print("--dns cannot be combined with other start options\n", .{});
+            std.process.exit(1);
+        }
+    }
+
     const tld: []const u8 = if (local) "local" else "lo";
 
     // In local mode, use hostname.local for mDNS access from other devices
@@ -138,6 +152,16 @@ pub fn main() !void {
         domain_allocated = true;
     }
     defer if (domain_allocated) allocator.free(full_domain);
+
+    // Subdomain routes are not allowed in local mode
+    if (local) {
+        for (routes[0..route_count]) |route| {
+            if (route.kind == .subdomain) {
+                std.debug.print("subdomain routes are not supported in local mode (-l): {s}\n", .{route.pattern});
+                std.process.exit(1);
+            }
+        }
+    }
 
     // Auto-detect port if not explicitly set
     if (!port_set) {
@@ -474,28 +498,41 @@ fn printHelp() void {
         \\
         \\Commands:
         \\  install              install certificates and DNS
-        \\  install -c           install certificates only
-        \\  install -d           install DNS only
+        \\  install --cert       install certificates only
+        \\  install --dns        install DNS only
         \\  uninstall            uninstall certificates and DNS
-        \\  uninstall -c         uninstall certificates only
-        \\  uninstall -d         uninstall DNS only
+        \\  uninstall --cert     uninstall certificates only
+        \\  uninstall --dns      uninstall DNS only
         \\  start                start service (proxy + DNS + TUI)
-        \\  start -d             start DNS server only (log mode)
+        \\  start --dns          start DNS server only (log mode)
         \\
         \\Options:
         \\  -p=PORT, --port=PORT       target port [auto-detect or 3000]
         \\  -b=ADDR, --bind=ADDR       listen address [default 0.0.0.0]
         \\  --route=PATTERN=PORT       route by subdomain or path (repeatable)
+        \\  -c=PATH, --config=PATH     config file path [default .zlodev]
         \\  --max-body=SIZE            max request body size [default 10M]
         \\  --no-tui                   disable TUI, log to stderr
         \\  -l, --local                use .local domain (mDNS)
+        \\  --dns                      DNS only (install/uninstall/start)
+        \\  --cert                     certificates only (install/uninstall)
         \\  -f, --force                force reinstall
         \\  -h, --help                 show help
         \\  -v, --version              show version
         \\
+        \\Config file (.zlodev):
+        \\  Place a .zlodev file in your project directory, one option per line:
+        \\    port=3000
+        \\    bind=127.0.0.1
+        \\    route=api=3001
+        \\    route=/api=3000
+        \\    no-tui
+        \\  CLI arguments override config file values.
+        \\
         \\Routes:
         \\  --route=api=3001           subdomain: api.dev.lo -> :3001
         \\  --route=/api=3001          path:      dev.lo/api/* -> :3001
+        \\  Subdomain routes are not allowed in local mode (-l).
         \\  Priority: subdomain > longest path > default port
         \\
         \\SIZE accepts suffixes: K (KB), M (MB), G (GB). Example: --max-body=50M
@@ -621,6 +658,105 @@ fn isPortListening(bind_addr: []const u8, port: u16) bool {
     defer compat.closeSocket(sock);
     std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch return false;
     return true;
+}
+
+fn addRoute(allocator: std.mem.Allocator, routes: *[proxy.max_routes]proxy.Route, route_count: *usize, val: []const u8) void {
+    if (route_count.* >= proxy.max_routes) {
+        std.debug.print("too many routes (max {d})\n", .{proxy.max_routes});
+        std.process.exit(1);
+    }
+    if (std.mem.lastIndexOfScalar(u8, val, '=')) |eq| {
+        const pattern = val[0..eq];
+        const port_str = val[eq + 1 ..];
+        const rport = std.fmt.parseInt(u16, port_str, 10) catch {
+            std.debug.print("invalid route port: {s}\n", .{port_str});
+            std.process.exit(1);
+        };
+        if (pattern.len == 0) {
+            std.debug.print("empty route pattern in: {s}\n", .{val});
+            std.process.exit(1);
+        }
+        routes[route_count.*] = .{
+            .kind = if (pattern[0] == '/') .path else .subdomain,
+            .pattern = allocator.dupe(u8, pattern) catch {
+                std.debug.print("out of memory\n", .{});
+                std.process.exit(1);
+            },
+            .port = rport,
+        };
+        route_count.* += 1;
+    } else {
+        std.debug.print("invalid route format, expected PATTERN=PORT: {s}\n", .{val});
+        std.process.exit(1);
+    }
+}
+
+const ConfigResult = struct {
+    port: ?u16 = null,
+    bind: ?[]const u8 = null,
+    no_tui: bool = false,
+    max_body: ?usize = null,
+    local: bool = false,
+    dns: bool = false,
+};
+
+fn readConfigFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    routes: *[proxy.max_routes]proxy.Route,
+    route_count: *usize,
+) !ConfigResult {
+    const file = if (std.fs.path.isAbsolute(path))
+        try std.fs.openFileAbsolute(path, .{})
+    else
+        try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    var buf: [8192]u8 = undefined;
+    const n = try file.readAll(&buf);
+    const content = buf[0..n];
+
+    var result = ConfigResult{};
+
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    while (iter.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        if (lineValue(line, "port") orelse lineValue(line, "p")) |val| {
+            result.port = std.fmt.parseInt(u16, val, 10) catch {
+                std.debug.print("config: invalid port value: {s}\n", .{val});
+                std.process.exit(1);
+            };
+        } else if (lineValue(line, "bind") orelse lineValue(line, "b")) |val| {
+            result.bind = val;
+        } else if (lineValue(line, "max-body")) |val| {
+            result.max_body = parseSize(val) orelse {
+                std.debug.print("config: invalid max-body value: {s}\n", .{val});
+                std.process.exit(1);
+            };
+        } else if (lineValue(line, "route")) |val| {
+            addRoute(allocator, routes, route_count, val);
+        } else if (std.mem.eql(u8, line, "no-tui")) {
+            result.no_tui = true;
+        } else if (std.mem.eql(u8, line, "local") or std.mem.eql(u8, line, "l")) {
+            result.local = true;
+        } else if (std.mem.eql(u8, line, "dns")) {
+            result.dns = true;
+        } else {
+            std.debug.print("config: unknown option: {s}\n", .{line});
+            std.process.exit(1);
+        }
+    }
+
+    return result;
+}
+
+fn lineValue(line: []const u8, key: []const u8) ?[]const u8 {
+    if (line.len > key.len and line[key.len] == '=' and std.mem.eql(u8, line[0..key.len], key)) {
+        return std.mem.trim(u8, line[key.len + 1 ..], " \t");
+    }
+    return null;
 }
 
 fn runCmdOutput(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {

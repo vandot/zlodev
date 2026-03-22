@@ -90,13 +90,13 @@ zlodev start
 
 ```
 zlodev install              install certificates and DNS
-zlodev install -c           install certificates only
-zlodev install -d           install DNS only
+zlodev install --cert       install certificates only
+zlodev install --dns        install DNS only
 zlodev uninstall            uninstall certificates and DNS
-zlodev uninstall -c         uninstall certificates only
-zlodev uninstall -d         uninstall DNS only
+zlodev uninstall --cert     uninstall certificates only
+zlodev uninstall --dns      uninstall DNS only
 zlodev start                start proxy + DNS + TUI
-zlodev start -d             start DNS server only (log mode)
+zlodev start --dns          start DNS server only (log mode)
 ```
 
 ### Options
@@ -105,6 +105,7 @@ zlodev start -d             start DNS server only (log mode)
 -p=PORT, --port=PORT       target port [auto-detect or 3000]
 -b=ADDR, --bind=ADDR       listen address [default 0.0.0.0]
 --route=PATTERN=PORT       route by subdomain or path (repeatable)
+-c=PATH, --config=PATH     config file path [default .zlodev]
 --max-body=SIZE            max request body size [default 10M]
 --no-tui                   disable TUI, log to stderr
 -l, --local                use .local domain (mDNS)
@@ -114,6 +115,22 @@ zlodev start -d             start DNS server only (log mode)
 ```
 
 `SIZE` accepts suffixes: `K` (KB), `M` (MB), `G` (GB). Example: `--max-body=50M`
+
+### Config file
+
+Place a `.zlodev` file in your project directory instead of repeating CLI flags:
+
+```
+port=3000
+bind=127.0.0.1
+route=api=3001
+route=/webhooks=8080
+no-tui
+```
+
+zlodev reads `.zlodev` from the current directory on `start`. Use `-c=PATH` to specify a different location. CLI arguments override config file values.
+
+Supported options: `port`, `p`, `bind`, `b`, `route`, `max-body`, `no-tui`, `local`, `l`, `dns`, `d`.
 
 ### Routing
 
@@ -139,6 +156,8 @@ zlodev start --route=api=3001 --route=/webhooks=8080
 ```
 
 Priority: subdomain match > longest path prefix > default port.
+
+> **Note:** Subdomain routes are not supported in local mode (`-l`), since mDNS does not support arbitrary subdomains.
 
 ### Port auto-detection
 
