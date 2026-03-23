@@ -37,6 +37,7 @@ const EditState = struct {
     // Scroll offset for multi-line fields
     scroll: usize = 0,
     intercepted: bool = false,
+    resp_edit: bool = false, // true when editing response (vs request)
 
     fn activeSlice(self: *EditState) []u8 {
         return switch (self.field) {
@@ -156,7 +157,7 @@ const EditState = struct {
 
     fn nextField(self: *EditState) void {
         self.field = switch (self.field) {
-            .method => .path,
+            .method => if (self.resp_edit) .headers else .path,
             .path => .headers,
             .headers => .body,
             .body => .method,
@@ -169,7 +170,7 @@ const EditState = struct {
         self.field = switch (self.field) {
             .method => .body,
             .path => .method,
-            .headers => .path,
+            .headers => if (self.resp_edit) .method else .path,
             .body => .headers,
         };
         self.cursor = self.activeLen();
@@ -179,6 +180,7 @@ const EditState = struct {
     fn loadFromEntry(self: *EditState, alloc: std.mem.Allocator, entry: *const requests.Entry, backing_idx: usize, is_intercepted: bool) void {
         self.backing_idx = backing_idx;
         self.intercepted = is_intercepted;
+        self.resp_edit = false;
         self.field = .method;
         self.cursor = 0;
         self.scroll = 0;
@@ -215,14 +217,55 @@ const EditState = struct {
 
     fn applyToEntry(self: *const EditState) void {
         const entry = requests.getByBackingIndex(self.backing_idx);
-        @memcpy(entry.method[0..self.method_len], self.method_buf[0..self.method_len]);
-        entry.method_len = @intCast(self.method_len);
-        @memcpy(entry.path[0..self.path_len], self.path_buf[0..self.path_len]);
-        entry.path_len = @intCast(self.path_len);
-        @memcpy(entry.req_headers[0..self.headers_len], self.headers_buf[0..self.headers_len]);
-        entry.req_headers_len = @intCast(self.headers_len);
-        @memcpy(entry.req_body[0..self.body_len], self.body_buf[0..self.body_len]);
-        entry.req_body_len = @intCast(self.body_len);
+        if (self.resp_edit) {
+            // Apply response edits: method_buf holds status code string
+            const status_str = self.method_buf[0..self.method_len];
+            entry.status = std.fmt.parseInt(u16, status_str, 10) catch entry.status;
+            @memcpy(entry.resp_headers[0..self.headers_len], self.headers_buf[0..self.headers_len]);
+            entry.resp_headers_len = @intCast(self.headers_len);
+            @memcpy(entry.resp_body[0..self.body_len], self.body_buf[0..self.body_len]);
+            entry.resp_body_len = @intCast(self.body_len);
+        } else {
+            @memcpy(entry.method[0..self.method_len], self.method_buf[0..self.method_len]);
+            entry.method_len = @intCast(self.method_len);
+            @memcpy(entry.path[0..self.path_len], self.path_buf[0..self.path_len]);
+            entry.path_len = @intCast(self.path_len);
+            @memcpy(entry.req_headers[0..self.headers_len], self.headers_buf[0..self.headers_len]);
+            entry.req_headers_len = @intCast(self.headers_len);
+            @memcpy(entry.req_body[0..self.body_len], self.body_buf[0..self.body_len]);
+            entry.req_body_len = @intCast(self.body_len);
+        }
+    }
+
+    fn loadResponseFromEntry(self: *EditState, alloc: std.mem.Allocator, entry: *const requests.Entry, backing_idx: usize) void {
+        self.backing_idx = backing_idx;
+        self.intercepted = true;
+        self.resp_edit = true;
+        self.field = .method; // method_buf holds status code
+        self.cursor = 0;
+        self.scroll = 0;
+        // Store status code as string in method_buf
+        var status_buf: [7]u8 = undefined;
+        const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{entry.status}) catch "0";
+        @memcpy(self.method_buf[0..status_str.len], status_str);
+        self.method_len = status_str.len;
+        // Path is unused for response edit
+        self.path_len = 0;
+        // Response headers
+        self.headers_len = entry.resp_headers_len;
+        @memcpy(self.headers_buf[0..entry.resp_headers_len], entry.resp_headers[0..entry.resp_headers_len]);
+        // Response body (try to pretty-print JSON)
+        const raw_body = entry.resp_body[0..entry.resp_body_len];
+        if (prettyPrintJson(alloc, raw_body)) |pretty| {
+            defer alloc.free(pretty);
+            const len = @min(pretty.len, self.body_buf.len);
+            @memcpy(self.body_buf[0..len], pretty[0..len]);
+            self.body_len = len;
+        } else {
+            self.body_len = entry.resp_body_len;
+            @memcpy(self.body_buf[0..entry.resp_body_len], raw_body);
+        }
+        self.active = true;
     }
 
     /// Get cursor row and column from byte offset in a multi-line buffer
@@ -489,11 +532,11 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 flash_time = std.time.milliTimestamp();
                             }
                             if (key.matches('r', .{}) and filtered_count > 0) {
-                                // Open edit view in replay mode
+                                // Open edit view in replay mode (not for intercepted or response entries)
                                 const real_idx = filter_map[cursor];
                                 const backing_idx = requests.logicalToBackingIndex(real_idx) orelse continue;
                                 const e = requests.getByBackingIndex(backing_idx);
-                                if (e.state == .intercepted) continue;
+                                if (e.state == .intercepted or e.resp_intercepted) continue;
                                 edit_state.loadFromEntry(alloc, e, backing_idx, false);
                                 view = .edit;
                             }
@@ -508,7 +551,11 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 const real_idx = filter_map[cursor];
                                 const backing_idx = requests.logicalToBackingIndex(real_idx) orelse continue;
                                 const e = requests.getByBackingIndex(backing_idx);
-                                edit_state.loadFromEntry(alloc, e, backing_idx, e.state == .intercepted);
+                                if (e.state == .intercepted and e.resp_intercepted) {
+                                    edit_state.loadResponseFromEntry(alloc, e, backing_idx);
+                                } else {
+                                    edit_state.loadFromEntry(alloc, e, backing_idx, e.state == .intercepted);
+                                }
                                 view = .edit;
                             }
                         },
@@ -552,10 +599,10 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 flash_len = msg.len;
                                 flash_time = std.time.milliTimestamp();
                             } else if (key.matches('r', .{})) {
-                                // Open edit view in replay mode
+                                // Open edit view in replay mode (not for intercepted or response entries)
                                 const backing_idx = requests.logicalToBackingIndex(detail_index) orelse continue;
                                 const e = requests.getByBackingIndex(backing_idx);
-                                if (e.state != .intercepted) {
+                                if (e.state != .intercepted and !e.resp_intercepted) {
                                     edit_state.loadFromEntry(alloc, e, backing_idx, false);
                                     view = .edit;
                                 }
@@ -571,7 +618,11 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             } else if (key.matches('e', .{})) {
                                 const backing_idx = requests.logicalToBackingIndex(detail_index) orelse continue;
                                 const e = requests.getByBackingIndex(backing_idx);
-                                edit_state.loadFromEntry(alloc, e, backing_idx, e.state == .intercepted);
+                                if (e.state == .intercepted and e.resp_intercepted) {
+                                    edit_state.loadResponseFromEntry(alloc, e, backing_idx);
+                                } else {
+                                    edit_state.loadFromEntry(alloc, e, backing_idx, e.state == .intercepted);
+                                }
                                 view = .edit;
                             }
                         },
@@ -794,7 +845,15 @@ fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_
         const orange: vaxis.Color = .{ .rgb = .{ 0xd2, 0x9e, 0x22 } };
         printAt(win, indicator_pos, row, "intercept", .{ .fg = orange });
         var ipos = indicator_pos + 9;
-        // Show active pattern
+        // Show phase and active pattern
+        const i_phase = intercept.getPhase();
+        if (i_phase != .both) {
+            writeAscii(win, ipos, row, ":", .{ .fg = orange });
+            ipos += 1;
+            const phase_str = if (i_phase == .request) "req" else "resp";
+            writeAscii(win, ipos, row, phase_str, .{ .fg = orange });
+            ipos += @as(u16, @intCast(phase_str.len));
+        }
         var pat_buf: [intercept.max_pattern_len]u8 = undefined;
         const pat = intercept.getPattern(&pat_buf);
         if (pat.len > 0) {
@@ -905,13 +964,19 @@ fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Entry, se
     }
 
     const method_color = methodColor(entry.getMethod());
-    writeAscii(win, 2, row, entry.getMethod(), .{ .fg = method_color, .bg = bg, .bold = true });
+    if (entry.resp_intercepted) {
+        printAt(win, 2, row, "↳", .{ .fg = dim, .bg = bg });
+        writeAscii(win, 4, row, entry.getMethod(), .{ .fg = method_color, .bg = bg });
+    } else {
+        writeAscii(win, 2, row, entry.getMethod(), .{ .fg = method_color, .bg = bg, .bold = true });
+    }
 
     const orange: vaxis.Color = .{ .rgb = .{ 0xd2, 0x9e, 0x22 } };
     const red: vaxis.Color = .{ .rgb = .{ 0xf8, 0x51, 0x49 } };
 
     if (entry.state == .intercepted) {
-        writeAscii(win, 11, row, "HOLD", .{ .fg = orange, .bg = bg, .bold = true });
+        const hold_label = if (entry.resp_intercepted) "RESP" else "HOLD";
+        writeAscii(win, 11, row, hold_label, .{ .fg = orange, .bg = bg, .bold = true });
     } else if (entry.state == .dropped) {
         writeAscii(win, 11, row, "DROP", .{ .fg = red, .bg = bg, .bold = true });
     } else {
@@ -1131,17 +1196,24 @@ fn drawEdit(win: vaxis.Window, es: *EditState) void {
     const active_bg: vaxis.Color = .{ .rgb = .{ 0x1c, 0x2b, 0x3a } };
 
     var row: u16 = 1;
-    const title = if (es.intercepted) "EDIT REQUEST" else "REPLAY REQUEST";
+    const title = if (es.resp_edit) "EDIT RESPONSE" else if (es.intercepted) "EDIT REQUEST" else "REPLAY REQUEST";
     printAt(win, 2, row, title, .{ .fg = yellow, .bold = true });
     row += 2;
 
     // Helper to draw a field label + content
-    const fields = [_]struct { label: []const u8, field: EditField, multiline: bool }{
+    const FieldDesc = struct { label: []const u8, field: EditField, multiline: bool };
+    const req_fields = [_]FieldDesc{
         .{ .label = "METHOD", .field = .method, .multiline = false },
         .{ .label = "PATH", .field = .path, .multiline = false },
         .{ .label = "HEADERS", .field = .headers, .multiline = true },
         .{ .label = "BODY", .field = .body, .multiline = true },
     };
+    const resp_fields = [_]FieldDesc{
+        .{ .label = "STATUS", .field = .method, .multiline = false },
+        .{ .label = "HEADERS", .field = .headers, .multiline = true },
+        .{ .label = "BODY", .field = .body, .multiline = true },
+    };
+    const fields: []const FieldDesc = if (es.resp_edit) &resp_fields else &req_fields;
 
     for (fields) |f| {
         if (row >= win.height -| 2) break;
@@ -1318,7 +1390,7 @@ fn drawHelpOverlay(win: vaxis.Window, ctx: HelpContext) void {
         .{ .key = "i", .desc = "intercept (pattern prompt / off)" },
         .{ .key = "d", .desc = "drop / delete" },
         .{ .key = "c", .desc = "copy as curl" },
-        .{ .key = "e", .desc = "edit request" },
+        .{ .key = "e", .desc = "edit request / response" },
         .{ .key = "r", .desc = "edit & replay" },
         .{ .key = "R", .desc = "quick replay" },
         .{ .key = "E", .desc = "export HAR" },
@@ -1503,7 +1575,7 @@ fn dropOrDeleteEntry(logical: usize) void {
 /// Replay a completed request by re-sending it to upstream.
 fn replayEntry(logical: usize) void {
     const entry = requests.getOne(logical) orelse return;
-    if (entry.state == .intercepted) return; // can't replay a held request
+    if (entry.state == .intercepted or entry.resp_intercepted) return;
     const copy = std.heap.page_allocator.create(requests.Entry) catch return;
     copy.* = entry.*;
     const thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, proxy.replay, .{

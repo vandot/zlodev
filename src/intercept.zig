@@ -17,6 +17,12 @@ pub const PendingEntry = struct {
 
 pub const max_pattern_len = 128;
 
+pub const Phase = enum(u8) {
+    both = 0,
+    request = 1,
+    response = 2,
+};
+
 var enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var slots: [max_pending]PendingEntry = @splat(PendingEntry{});
 var mutex: std.Thread.Mutex = .{};
@@ -24,6 +30,7 @@ var mutex: std.Thread.Mutex = .{};
 // Intercept pattern — substring match against "METHOD PATH"
 var pattern_buf: [max_pattern_len]u8 = .{0} ** max_pattern_len;
 var pattern_len: usize = 0;
+var phase: Phase = .both;
 var pattern_mutex: std.Thread.Mutex = .{};
 
 pub fn isEnabled() bool {
@@ -33,13 +40,14 @@ pub fn isEnabled() bool {
 pub fn toggle() void {
     const current = enabled.load(.acquire);
     if (current) {
-        // Disabling — clear pattern
+        // Disabling — clear pattern and phase
         setPattern("");
     }
     enabled.store(!current, .release);
 }
 
 /// Enable intercept with a specific pattern. Empty pattern = match all.
+/// Supports "req:PATTERN" (request only), "resp:PATTERN" (response only), or "PATTERN" (both).
 pub fn enableWithPattern(pat: []const u8) void {
     setPattern(pat);
     enabled.store(true, .release);
@@ -48,9 +56,28 @@ pub fn enableWithPattern(pat: []const u8) void {
 pub fn setPattern(pat: []const u8) void {
     pattern_mutex.lock();
     defer pattern_mutex.unlock();
-    const len = @min(pat.len, max_pattern_len);
-    @memcpy(pattern_buf[0..len], pat[0..len]);
+    // Parse phase prefix
+    var actual_pat = pat;
+    var p: Phase = .both;
+    if (startsWithIgnoreCase(pat, "req:")) {
+        p = .request;
+        actual_pat = pat[4..];
+    } else if (startsWithIgnoreCase(pat, "resp:")) {
+        p = .response;
+        actual_pat = pat[5..];
+    }
+    phase = p;
+    const len = @min(actual_pat.len, max_pattern_len);
+    @memcpy(pattern_buf[0..len], actual_pat[0..len]);
     pattern_len = len;
+}
+
+fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len < needle.len) return false;
+    for (0..needle.len) |i| {
+        if (std.ascii.toLower(haystack[i]) != std.ascii.toLower(needle[i])) return false;
+    }
+    return true;
 }
 
 pub fn getPattern(buf: *[max_pattern_len]u8) []const u8 {
@@ -60,20 +87,36 @@ pub fn getPattern(buf: *[max_pattern_len]u8) []const u8 {
     return buf[0..pattern_len];
 }
 
-/// Check if a request matches the intercept pattern.
-/// Returns true if intercept is enabled and the pattern matches (or pattern is empty).
-pub fn shouldIntercept(method: []const u8, path: []const u8) bool {
-    if (!enabled.load(.acquire)) return false;
-
+pub fn getPhase() Phase {
     pattern_mutex.lock();
     defer pattern_mutex.unlock();
+    return phase;
+}
 
-    // Empty pattern = match all
+/// Check if a request should be intercepted (phase must be .request or .both).
+pub fn shouldInterceptRequest(method: []const u8, path: []const u8) bool {
+    if (!enabled.load(.acquire)) return false;
+    pattern_mutex.lock();
+    defer pattern_mutex.unlock();
+    if (phase == .response) return false;
+    return matchesPattern(method, path);
+}
+
+/// Check if a response should be intercepted (phase must be .response or .both).
+pub fn shouldInterceptResponse(method: []const u8, path: []const u8) bool {
+    if (!enabled.load(.acquire)) return false;
+    pattern_mutex.lock();
+    defer pattern_mutex.unlock();
+    if (phase == .request) return false;
+    return matchesPattern(method, path);
+}
+
+/// Internal pattern matching — must be called with pattern_mutex held.
+fn matchesPattern(method: []const u8, path: []const u8) bool {
     if (pattern_len == 0) return true;
 
     const pat = pattern_buf[0..pattern_len];
 
-    // Try matching against method, path, or "METHOD PATH" combined
     if (containsIgnoreCase(method, pat)) return true;
     if (containsIgnoreCase(path, pat)) return true;
 
@@ -267,50 +310,85 @@ test "findByBackingIndex" {
     release(slot);
 }
 
-test "shouldIntercept with empty pattern matches all" {
+test "shouldInterceptRequest with empty pattern matches all" {
     enabled.store(true, .release);
     setPattern("");
-    try testing.expect(shouldIntercept("GET", "/api/users"));
-    try testing.expect(shouldIntercept("POST", "/login"));
+    try testing.expect(shouldInterceptRequest("GET", "/api/users"));
+    try testing.expect(shouldInterceptRequest("POST", "/login"));
     enabled.store(false, .release);
 }
 
-test "shouldIntercept with path pattern" {
+test "shouldInterceptRequest with path pattern" {
     enabled.store(true, .release);
     setPattern("/api");
-    try testing.expect(shouldIntercept("GET", "/api/users"));
-    try testing.expect(!shouldIntercept("GET", "/login"));
+    try testing.expect(shouldInterceptRequest("GET", "/api/users"));
+    try testing.expect(!shouldInterceptRequest("GET", "/login"));
     enabled.store(false, .release);
 }
 
-test "shouldIntercept with method pattern" {
+test "shouldInterceptRequest with method pattern" {
     enabled.store(true, .release);
     setPattern("POST");
-    try testing.expect(shouldIntercept("POST", "/anything"));
-    try testing.expect(!shouldIntercept("GET", "/anything"));
+    try testing.expect(shouldInterceptRequest("POST", "/anything"));
+    try testing.expect(!shouldInterceptRequest("GET", "/anything"));
     enabled.store(false, .release);
 }
 
-test "shouldIntercept with combined pattern" {
+test "shouldInterceptRequest with combined pattern" {
     enabled.store(true, .release);
     setPattern("POST /api");
-    try testing.expect(shouldIntercept("POST", "/api/auth"));
-    try testing.expect(!shouldIntercept("GET", "/api/auth"));
-    try testing.expect(!shouldIntercept("POST", "/login"));
+    try testing.expect(shouldInterceptRequest("POST", "/api/auth"));
+    try testing.expect(!shouldInterceptRequest("GET", "/api/auth"));
+    try testing.expect(!shouldInterceptRequest("POST", "/login"));
     enabled.store(false, .release);
 }
 
-test "shouldIntercept case insensitive" {
+test "shouldInterceptRequest case insensitive" {
     enabled.store(true, .release);
     setPattern("post /API");
-    try testing.expect(shouldIntercept("POST", "/api/auth"));
+    try testing.expect(shouldInterceptRequest("POST", "/api/auth"));
     enabled.store(false, .release);
 }
 
-test "shouldIntercept returns false when disabled" {
+test "shouldInterceptRequest returns false when disabled" {
     enabled.store(false, .release);
     setPattern("/api");
-    try testing.expect(!shouldIntercept("GET", "/api/users"));
+    try testing.expect(!shouldInterceptRequest("GET", "/api/users"));
+}
+
+test "req: prefix intercepts only requests" {
+    enabled.store(true, .release);
+    setPattern("req:/api");
+    try testing.expect(shouldInterceptRequest("GET", "/api/users"));
+    try testing.expect(!shouldInterceptResponse("GET", "/api/users"));
+    try testing.expectEqual(Phase.request, getPhase());
+    enabled.store(false, .release);
+}
+
+test "resp: prefix intercepts only responses" {
+    enabled.store(true, .release);
+    setPattern("resp:/api");
+    try testing.expect(!shouldInterceptRequest("GET", "/api/users"));
+    try testing.expect(shouldInterceptResponse("GET", "/api/users"));
+    try testing.expectEqual(Phase.response, getPhase());
+    enabled.store(false, .release);
+}
+
+test "no prefix intercepts both" {
+    enabled.store(true, .release);
+    setPattern("/api");
+    try testing.expect(shouldInterceptRequest("GET", "/api/users"));
+    try testing.expect(shouldInterceptResponse("GET", "/api/users"));
+    try testing.expectEqual(Phase.both, getPhase());
+    enabled.store(false, .release);
+}
+
+test "empty pattern with resp: intercepts all responses" {
+    enabled.store(true, .release);
+    setPattern("resp:");
+    try testing.expect(!shouldInterceptRequest("GET", "/anything"));
+    try testing.expect(shouldInterceptResponse("GET", "/anything"));
+    enabled.store(false, .release);
 }
 
 test "toggle clears pattern" {

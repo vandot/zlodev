@@ -10,7 +10,7 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 - **Multi-app routing** — route by subdomain (`api.dev.lo`) or path prefix (`/api`) to local ports or external hosts
 - **Custom DNS** — resolves `*.lo` to localhost, no `/etc/hosts` editing
 - **Terminal UI** — live request list with method, path, status, timing, and body size
-- **Request interception** — hold, inspect, edit, accept, or drop requests with optional pattern matching
+- **Request/response interception** — hold, inspect, edit, accept, or drop requests and responses with optional pattern matching
 - **Request replay** — re-send any completed request
 - **Copy as curl** — copy any request as a `curl` command
 - **HAR export** — export captured traffic as HTTP Archive files
@@ -198,17 +198,25 @@ zlodev start --no-tui
 
 Press `i` in the TUI to enable intercept mode. You'll be prompted for a pattern — matching requests are held for inspection while all others pass through normally.
 
-- **Empty pattern** — intercepts all requests
+- **Empty pattern** — intercepts all requests and responses
 - **Path pattern** — `intercept=/api` matches any request with `/api` in the path
 - **Method pattern** — `intercept=POST` matches all POST requests
 - **Combined** — `intercept=POST /api` matches POST requests to `/api`
+- **Request only** — `intercept=req:/api` holds only requests (responses pass through)
+- **Response only** — `intercept=resp:/api` holds only responses (requests pass through)
+
+Without a `req:` or `resp:` prefix, both requests and responses are intercepted.
+
+When a response is intercepted, the TUI shows two entries: the original request with its upstream round-trip time, and a `↳` response entry showing `RESP` in the status column with a live hold timer. Press `e` on the response entry to edit status code, headers, and body before it reaches the browser. Press `a` to accept or `d` to drop.
+
+Response entries cannot be replayed (`r`/`R`) — replay the original request above it instead, which will naturally produce a new response.
 
 Pattern matching is case-insensitive. Press `i` again to disable intercept and release all held requests.
 
 You can also set a default intercept pattern in your `.zlodev` config file:
 
 ```
-intercept=POST /api
+intercept=resp:POST /api
 ```
 
 ## TUI keybindings
@@ -230,7 +238,7 @@ intercept=POST /api
 | `A` | Accept all held requests |
 | `d` | Drop held request / delete completed request |
 | `c` | Copy request as curl command |
-| `e` | Edit request |
+| `e` | Edit request / response |
 | `r` | Edit & replay request |
 | `R` | Quick replay (no edit) |
 | `E` | Export traffic as HAR file |

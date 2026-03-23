@@ -40,6 +40,7 @@ pub const Entry = struct {
     pinned: bool = false,
     starred: bool = false,
     route_index: u8 = 0xff, // 0xff = no route match, otherwise index into routes
+    resp_intercepted: bool = false, // true when intercepted at response phase (vs request phase)
 
     pub fn getMethod(self: *const Entry) []const u8 {
         return self.method[0..self.method_len];
@@ -150,6 +151,16 @@ pub fn finishEntry(idx: usize, status: u16, duration_ms: u64, resp_headers: []co
     e.pinned = false;
 }
 
+/// Finish a response-intercepted entry. Response data is already in the entry (and may have been edited).
+/// Just updates duration and unpins.
+pub fn finishResponseIntercept(idx: usize, duration_ms: u64) void {
+    mutex.lock();
+    defer mutex.unlock();
+    const e = &entries_backing[idx];
+    e.duration_ms = duration_ms;
+    e.pinned = false;
+}
+
 /// Clear the pinned flag on an entry.
 pub fn unpin(idx: usize) void {
     mutex.lock();
@@ -188,6 +199,7 @@ pub fn clearAll() void {
         entries_backing[i].state = .deleted;
         entries_backing[i].pinned = false;
         entries_backing[i].starred = false;
+        entries_backing[i].resp_intercepted = false;
     }
     count = 0;
     live_count = 0;

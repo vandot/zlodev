@@ -401,7 +401,7 @@ fn handleConnection(
         // Intercept check
         var was_intercepted = false;
         var intercept_backing_idx: usize = 0;
-        if (intercept.shouldIntercept(method, uri)) {
+        if (intercept.shouldInterceptRequest(method, uri)) {
             entry.state = .intercepted;
             const maybe_idx = requests.pushAndPin(entry);
             if (maybe_idx == null) {
@@ -642,6 +642,148 @@ fn handleConnection(
         const response_has_defined_length = is_chunked or resp_content_length != null;
         const must_close = !keep_alive or upstream_conn == .close or !response_has_defined_length;
 
+        const resp_body_start = resp_hdr_end + 4;
+        const initial_body = if (resp_body_start < resp_total) resp_buf[resp_body_start..resp_total] else resp_buf[0..0];
+
+        // Check if we should intercept the response
+        const intercept_resp = intercept.shouldInterceptResponse(method, uri);
+
+        if (intercept_resp) {
+            // Buffer entire response body into entry before forwarding
+            var resp_body_captured: usize = 0;
+
+            if (is_chunked) {
+                resp_body_captured = bufferChunkedBody(upstream, initial_body, &entry.resp_body, &resp_buf);
+                if (resp_body_captured >= requests.max_body_len) {
+                    entry.resp_body_truncated = true;
+                }
+            } else {
+                if (initial_body.len > 0) {
+                    const cap = @min(initial_body.len, requests.max_body_len);
+                    @memcpy(entry.resp_body[0..cap], initial_body[0..cap]);
+                    resp_body_captured = cap;
+                }
+                if (resp_content_length) |cl| {
+                    var body_read: usize = initial_body.len;
+                    while (body_read < cl) {
+                        const n = upstream.read(&resp_buf) catch break;
+                        if (n == 0) break;
+                        const space = requests.max_body_len -| resp_body_captured;
+                        const cap = @min(n, space);
+                        if (cap > 0) {
+                            @memcpy(entry.resp_body[resp_body_captured .. resp_body_captured + cap], resp_buf[0..cap]);
+                            resp_body_captured += cap;
+                        }
+                        body_read += n;
+                    }
+                    if (cl > requests.max_body_len) {
+                        entry.resp_body_truncated = true;
+                    }
+                } else {
+                    while (true) {
+                        const n = upstream.read(&resp_buf) catch break;
+                        if (n == 0) break;
+                        const space = requests.max_body_len -| resp_body_captured;
+                        const cap = @min(n, space);
+                        if (cap > 0) {
+                            @memcpy(entry.resp_body[resp_body_captured .. resp_body_captured + cap], resp_buf[0..cap]);
+                            resp_body_captured += cap;
+                        }
+                    }
+                    if (resp_body_captured >= requests.max_body_len) {
+                        entry.resp_body_truncated = true;
+                    }
+                }
+            }
+            entry.resp_body_len = @intCast(resp_body_captured);
+
+            // Record when upstream response was fully received
+            const resp_received_time = std.time.milliTimestamp();
+            const upstream_dur = resp_received_time - start_time;
+            const req_dur: u64 = if (upstream_dur > 0) @intCast(upstream_dur) else 0;
+
+            // Push or finish the request entry with upstream round-trip time
+            if (was_intercepted) {
+                requests.finishEntry(intercept_backing_idx, entry.status, req_dur, entry.resp_headers[0..entry.resp_headers_len], entry.resp_body[0..entry.resp_body_len]);
+            } else {
+                // Push request entry (copies into ring buffer, so we can reuse entry for response)
+                entry.duration_ms = req_dur;
+                requests.push(entry);
+            }
+
+            // Reuse entry for response intercept — use resp_received_time as timestamp
+            entry.state = .intercepted;
+            entry.resp_intercepted = true;
+            entry.timestamp = resp_received_time;
+            var resp_intercept_idx: usize = 0;
+            const maybe_resp_idx = requests.pushAndPin(entry);
+            if (maybe_resp_idx == null) {
+                // All slots pinned — skip intercept, forward normally
+                entry.state = .normal;
+                entry.resp_intercepted = false;
+            } else {
+                resp_intercept_idx = maybe_resp_idx.?;
+                const slot = intercept.acquire();
+                if (slot == null) {
+                    // All intercept slots full — unpin and forward normally
+                    requests.unpin(resp_intercept_idx);
+                    requests.getByBackingIndex(resp_intercept_idx).state = .normal;
+                    requests.getByBackingIndex(resp_intercept_idx).resp_intercepted = false;
+                } else {
+                    const s = slot.?;
+                    s.backing_index = resp_intercept_idx;
+                    s.event.wait();
+                    const decision = intercept.getDecision(s);
+                    s.event.reset();
+                    intercept.release(s);
+
+                    if (decision == .drop) {
+                        const drop_entry = requests.getByBackingIndex(resp_intercept_idx);
+                        drop_entry.state = .dropped;
+                        const drop_elapsed = std.time.milliTimestamp() - resp_received_time;
+                        drop_entry.duration_ms = if (drop_elapsed > 0) @intCast(drop_elapsed) else 0;
+                        requests.unpin(resp_intercept_idx);
+                        sslSendError(ssl, 502, "Dropped by intercept");
+                        if (keep_alive) continue else return;
+                    }
+
+                    // Accept — read back the (possibly edited) entry for forwarding
+                    const resp_entry = requests.getByBackingIndex(resp_intercept_idx);
+                    resp_entry.state = .accepted;
+
+                    // Forward the (possibly edited) response to client
+                    forwardResponseFromEntry(ssl, resp_entry, is_external, config.domain, must_close);
+
+                    // Duration = hold time only
+                    const hold_elapsed = std.time.milliTimestamp() - resp_received_time;
+                    const hold_dur: u64 = if (hold_elapsed > 0) @intCast(hold_elapsed) else 0;
+                    requests.finishResponseIntercept(resp_intercept_idx, hold_dur);
+
+                    if (must_close) return;
+                    setSocketTimeout(stream.handle, .recv, 15);
+                    continue;
+                }
+            }
+
+            // Fell through: intercept skipped, forward buffered response normally
+            // Request entry was already pushed/finished above
+            forwardResponseFromEntry(ssl, &entry, is_external, config.domain, must_close);
+
+            if (maybe_resp_idx != null) {
+                // Response entry was pushed but intercept was skipped — clean up
+                const e = requests.getByBackingIndex(resp_intercept_idx);
+                e.state = .normal;
+                e.resp_intercepted = false;
+                e.duration_ms = req_dur;
+                requests.unpin(resp_intercept_idx);
+            }
+
+            if (must_close) return;
+            setSocketTimeout(stream.handle, .recv, 15);
+            continue;
+        }
+
+        // Normal path: stream response to client as we read it
         // Forward response status line
         sslWriteAll(ssl, resp_buf[0 .. resp_first_line_end + 2]);
 
@@ -666,10 +808,7 @@ fn handleConnection(
         }
         sslWriteAll(ssl, "\r\n");
 
-        // Forward response body already received
-        const resp_body_start = resp_hdr_end + 4;
         var resp_body_captured: usize = 0;
-        const initial_body = if (resp_body_start < resp_total) resp_buf[resp_body_start..resp_total] else resp_buf[0..0];
 
         // Stream response body from upstream
         if (is_chunked) {
@@ -744,6 +883,79 @@ fn handleConnection(
         // Shorter idle timeout for subsequent requests on this connection
         setSocketTimeout(stream.handle, .recv, 15);
     }
+}
+
+/// Forward a buffered response from an entry to the client.
+/// Used after response intercept (accept) to send the (possibly edited) response.
+fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_external: bool, domain: []const u8, must_close: bool) void {
+    // Build and send status line
+    var status_buf: [64]u8 = undefined;
+    const status_line = std.fmt.bufPrint(&status_buf, "HTTP/1.1 {d} OK\r\n", .{e.status}) catch return;
+    sslWriteAll(ssl, status_line);
+
+    // Forward response headers
+    const resp_hdrs = e.getRespHeaders();
+    if (resp_hdrs.len > 0) {
+        var header_iter = std.mem.splitSequence(u8, resp_hdrs, "\r\n");
+        while (header_iter.next()) |header| {
+            if (header.len == 0) continue;
+            if (startsWithIgnoreCase(header, "connection:")) continue;
+            if (startsWithIgnoreCase(header, "content-length:")) continue;
+            if (startsWithIgnoreCase(header, "transfer-encoding:")) continue;
+            if (is_external and startsWithIgnoreCase(header, "set-cookie:")) {
+                rewriteCookieDomain(ssl, header, domain);
+                sslWriteAll(ssl, "\r\n");
+                continue;
+            }
+            sslWriteAll(ssl, header);
+            sslWriteAll(ssl, "\r\n");
+        }
+    }
+
+    // Set Content-Length to match actual body (may have been edited)
+    const body = e.getRespBody();
+    var cl_buf: [64]u8 = undefined;
+    const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch "";
+    sslWriteAll(ssl, cl_hdr);
+
+    if (must_close) {
+        sslWriteAll(ssl, "Connection: close\r\n");
+    } else {
+        sslWriteAll(ssl, "Connection: keep-alive\r\n");
+    }
+    sslWriteAll(ssl, "\r\n");
+
+    // Send body
+    if (body.len > 0) {
+        sslWriteAll(ssl, body);
+    }
+}
+
+/// Buffer chunked response body from upstream into entry without forwarding to client.
+/// Returns total bytes captured into the body buffer.
+fn bufferChunkedBody(upstream: UpstreamConn, initial: []const u8, body: *[requests.max_body_len]u8, read_buf: *[16384]u8) usize {
+    var captured: usize = 0;
+    var state: ChunkState = .size;
+    var chunk_remaining: usize = 0;
+    var size_val: usize = 0;
+
+    if (initial.len > 0) {
+        for (initial) |byte| {
+            chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured);
+            if (state == .done) return captured;
+        }
+    }
+
+    while (state != .done) {
+        const n = upstream.read(read_buf) catch break;
+        if (n == 0) break;
+        for (read_buf.*[0..n]) |byte| {
+            chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured);
+            if (state == .done) return captured;
+        }
+    }
+
+    return captured;
 }
 
 /// Replay a stored request through the proxy's own TLS endpoint.

@@ -376,10 +376,12 @@
     .terminal-body .method { width: 56px; font-weight: 700; }
     .terminal-body .method.get { color: var(--green); }
     .terminal-body .method.post { color: var(--yellow); }
+    .terminal-body .method.resp { color: var(--text-dim); font-weight: 400; }
     .terminal-body .status { width: 56px; }
     .terminal-body .status.s2 { color: var(--green); }
     .terminal-body .status.s3 { color: var(--yellow); }
     .terminal-body .status.s5 { color: var(--red); }
+    .terminal-body .status.hold { color: var(--yellow); font-weight: 700; }
     .terminal-body .time { width: 56px; color: var(--text-dim); }
     .terminal-body .size { width: 64px; color: var(--text-dim); }
     .terminal-body .path { flex: 1; color: var(--text-muted); min-width: 0; padding-left: 8px; }
@@ -741,19 +743,19 @@
         </div>
         <div class="tui-row">
           <span class="marker"></span>
-          <span class="method get">GET</span>
-          <span class="status s3">304</span>
-          <span class="time">8ms</span>
-          <span class="size">0B</span>
-          <span class="path">/api/dashboard/stats</span>
+          <span class="method post">POST</span>
+          <span class="status s2">200</span>
+          <span class="time">82ms</span>
+          <span class="size">1.1KB</span>
+          <span class="path">/api/auth/login</span>
         </div>
         <div class="tui-row">
           <span class="marker"></span>
-          <span class="method get">GET</span>
-          <span class="status s2">200</span>
-          <span class="time">1ms</span>
-          <span class="size">766B</span>
-          <span class="path">/favicon.ico</span>
+          <span class="method resp">↳ POST</span>
+          <span class="status hold">RESP</span>
+          <span class="time">4s</span>
+          <span class="size">1.1KB</span>
+          <span class="path">/api/auth/login</span>
         </div>
       </div>
     </div>
@@ -789,8 +791,8 @@
       </div>
       <div class="feature reveal">
         <div class="feature-icon">||</div>
-        <h3>Request interception</h3>
-        <p>Hold requests matching a pattern before they reach your server. Inspect, edit, accept, or drop them in real time.</p>
+        <h3>Request &amp; response interception</h3>
+        <p>Hold requests or responses matching a pattern. Inspect, edit status/headers/body, accept, or drop. Use <code>req:</code> or <code>resp:</code> prefix to target a specific phase.</p>
       </div>
       <div class="feature reveal">
         <div class="feature-icon">&lt;r&gt;</div>
