@@ -23,6 +23,7 @@ pub const Route = struct {
     kind: enum { subdomain, path },
     pattern: []const u8,
     port: u16,
+    hostname: ?[]const u8 = null, // null = localhost, set = external host
 };
 
 pub const max_routes = 16;
@@ -49,6 +50,7 @@ fn nextConnId() u64 {
 const RouteResult = struct {
     port: u16,
     index: u8, // 0xff = no route match
+    hostname: ?[]const u8 = null, // null = localhost
 };
 
 /// Resolve the upstream port for a request based on configured routes.
@@ -58,6 +60,7 @@ fn resolveRoute(config: *const ProxyConfig, host: []const u8, uri: []const u8) R
     var best_path_len: usize = 0;
     var best_path_port: ?u16 = null;
     var best_path_idx: u8 = 0xff;
+    var best_path_hostname: ?[]const u8 = null;
 
     for (config.routes, 0..) |route, i| {
         switch (route.kind) {
@@ -72,7 +75,7 @@ fn resolveRoute(config: *const ProxyConfig, host: []const u8, uri: []const u8) R
                     host_name[route.pattern.len] == '.' and
                     std.mem.eql(u8, host_name[route.pattern.len + 1 ..], config.domain))
                 {
-                    return .{ .port = route.port, .index = @intCast(i) };
+                    return .{ .port = route.port, .index = @intCast(i), .hostname = route.hostname };
                 }
             },
             .path => {
@@ -87,6 +90,7 @@ fn resolveRoute(config: *const ProxyConfig, host: []const u8, uri: []const u8) R
                         best_path_len = route.pattern.len;
                         best_path_port = route.port;
                         best_path_idx = @intCast(i);
+                        best_path_hostname = route.hostname;
                     }
                 }
             },
@@ -94,10 +98,58 @@ fn resolveRoute(config: *const ProxyConfig, host: []const u8, uri: []const u8) R
     }
 
     // 2. Return longest path match if found
-    if (best_path_port) |port| return .{ .port = port, .index = best_path_idx };
+    if (best_path_port) |port| return .{ .port = port, .index = best_path_idx, .hostname = best_path_hostname };
 
     // 3. Default
     return .{ .port = config.target_port, .index = 0xff };
+}
+
+/// Upstream connection abstraction — wraps either a plain socket (local) or TLS (external).
+const UpstreamConn = struct {
+    sock: compat.SocketStream,
+    ssl_conn: ?*ssl_c.SSL = null,
+
+    fn writeAll(self: UpstreamConn, data: []const u8) !void {
+        if (self.ssl_conn) |s| {
+            var sent: usize = 0;
+            while (sent < data.len) {
+                const n = ssl_c.SSL_write(s, @ptrCast(data[sent..].ptr), @intCast(data.len - sent));
+                if (n <= 0) return error.SslWrite;
+                sent += @intCast(n);
+            }
+        } else {
+            try self.sock.writeAll(data);
+        }
+    }
+
+    fn read(self: UpstreamConn, buf: []u8) !usize {
+        if (self.ssl_conn) |s| {
+            const n = ssl_c.SSL_read(s, @ptrCast(buf.ptr), @intCast(buf.len));
+            if (n <= 0) return error.SslRead;
+            return @intCast(n);
+        } else {
+            return self.sock.read(buf);
+        }
+    }
+
+    fn close(self: UpstreamConn) void {
+        if (self.ssl_conn) |s| {
+            _ = ssl_c.SSL_shutdown(s);
+            ssl_c.SSL_free(s);
+        }
+        self.sock.close();
+    }
+};
+
+/// Create a TLS client context for connecting to external upstreams.
+fn createClientSslCtx() ?*ssl_c.SSL_CTX {
+    const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_client_method()) orelse return null;
+    // Use system CA certificates for verifying upstream servers
+    if (ssl_c.SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        log.err("component=proxy op=client_ssl error=set_verify_paths_failed", .{});
+    }
+    _ = ssl_c.SSL_CTX_set_mode(ctx, ssl_c.SSL_MODE_AUTO_RETRY);
+    return ctx;
 }
 
 pub fn start(config: *const ProxyConfig) !void {
@@ -143,6 +195,17 @@ pub fn start(config: *const ProxyConfig) !void {
         log.err("component=proxy op=ssl_key path={s} error=load_failed", .{config.key_path});
         return error.SslKey;
     }
+
+    // Create client TLS context for external upstream connections (if any routes have hostnames)
+    var has_external = false;
+    for (config.routes) |route| {
+        if (route.hostname != null) {
+            has_external = true;
+            break;
+        }
+    }
+    const client_ctx: ?*ssl_c.SSL_CTX = if (has_external) createClientSslCtx() else null;
+    defer if (client_ctx) |c| ssl_c.SSL_CTX_free(c);
 
     const address = try std.net.Address.parseIp(config.listen_addr, 443);
     var server = address.listen(.{ .reuse_address = true }) catch |e| {
@@ -199,6 +262,7 @@ pub fn start(config: *const ProxyConfig) !void {
             conn.address,
             config,
             conn_id,
+            client_ctx,
         }) catch |e| {
             log.err("component=proxy op=pool_spawn conn={d} error={any}", .{ conn_id, e });
             ssl_c.SSL_free(ssl);
@@ -213,6 +277,7 @@ fn handleConnection(
     client_addr: std.net.Address,
     config: *const ProxyConfig,
     conn_id: u64,
+    client_ctx: ?*ssl_c.SSL_CTX,
 ) void {
     defer {
         _ = ssl_c.SSL_shutdown(ssl);
@@ -377,14 +442,44 @@ fn handleConnection(
         }
 
         // Connect to upstream (per-request — dev servers may not support keep-alive)
-        const upstream_addr = std.net.Address.parseIp(config.target_host, upstream_port) catch {
-            if (was_intercepted) {
-                requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
+        const is_external = route_result.hostname != null;
+        const upstream_host = route_result.hostname orelse config.target_host;
+
+        // Resolve upstream address — DNS for external, IP parse for local
+        var addr_list: ?*std.net.AddressList = null;
+        defer if (addr_list) |al| al.deinit();
+
+        const upstream_addr: std.net.Address = blk: {
+            if (is_external) {
+                const al = std.net.getAddressList(std.heap.page_allocator, upstream_host, upstream_port) catch {
+                    log.err("component=proxy conn={d} op=dns_resolve host={s} error=failed", .{ conn_id, upstream_host });
+                    if (was_intercepted) {
+                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
+                    }
+                    sslSendError(ssl, 502, "Bad Gateway");
+                    if (keep_alive) continue else return;
+                };
+                addr_list = al;
+                if (al.addrs.len == 0) {
+                    log.err("component=proxy conn={d} op=dns_resolve host={s} error=no_addresses", .{ conn_id, upstream_host });
+                    if (was_intercepted) {
+                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
+                    }
+                    sslSendError(ssl, 502, "Bad Gateway");
+                    if (keep_alive) continue else return;
+                }
+                break :blk al.addrs[0];
+            } else {
+                break :blk std.net.Address.parseIp(config.target_host, upstream_port) catch {
+                    if (was_intercepted) {
+                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
+                    }
+                    sslSendError(ssl, 502, "Bad Gateway");
+                    if (keep_alive) continue else return;
+                };
             }
-            sslSendError(ssl, 502, "Bad Gateway");
-            if (keep_alive) continue else return;
         };
-        const upstream_sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch |e| {
+        const upstream_sock = posix.socket(upstream_addr.any.family, posix.SOCK.STREAM, 0) catch |e| {
             log.err("component=proxy conn={d} op=upstream_socket error={any}", .{ conn_id, e });
             if (was_intercepted) {
                 const dur = std.time.milliTimestamp() - start_time;
@@ -394,7 +489,7 @@ fn handleConnection(
             if (keep_alive) continue else return;
         };
         posix.connect(upstream_sock, &upstream_addr.any, upstream_addr.getOsSockLen()) catch |e| {
-            log.err("component=proxy conn={d} op=upstream_connect error={any}", .{ conn_id, e });
+            log.err("component=proxy conn={d} op=upstream_connect host={s} error={any}", .{ conn_id, upstream_host, e });
             compat.closeSocket(upstream_sock);
             if (was_intercepted) {
                 const dur = std.time.milliTimestamp() - start_time;
@@ -403,7 +498,42 @@ fn handleConnection(
             sslSendError(ssl, 502, "Bad Gateway");
             if (keep_alive) continue else return;
         };
-        const upstream = compat.SocketStream{ .handle = upstream_sock };
+
+        // Wrap in UpstreamConn — TLS for external, plain socket for local
+        var upstream_ssl_obj: ?*ssl_c.SSL = null;
+        if (is_external) {
+            if (client_ctx) |cctx| {
+                const us = ssl_c.SSL_new(cctx) orelse {
+                    log.err("component=proxy conn={d} op=upstream_ssl_new error=alloc_failed", .{conn_id});
+                    compat.closeSocket(upstream_sock);
+                    if (was_intercepted) {
+                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
+                    }
+                    sslSendError(ssl, 502, "Bad Gateway");
+                    if (keep_alive) continue else return;
+                };
+                _ = ssl_c.SSL_set_fd(us, compat.socketToFd(upstream_sock));
+                // Set SNI hostname
+                var sni_buf: [256]u8 = undefined;
+                if (upstream_host.len < sni_buf.len) {
+                    @memcpy(sni_buf[0..upstream_host.len], upstream_host);
+                    sni_buf[upstream_host.len] = 0;
+                    _ = ssl_c.SSL_set_tlsext_host_name(us, &sni_buf);
+                }
+                if (ssl_c.SSL_connect(us) != 1) {
+                    log.err("component=proxy conn={d} op=upstream_tls_handshake host={s} error=failed", .{ conn_id, upstream_host });
+                    ssl_c.SSL_free(us);
+                    compat.closeSocket(upstream_sock);
+                    if (was_intercepted) {
+                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
+                    }
+                    sslSendError(ssl, 502, "Bad Gateway");
+                    if (keep_alive) continue else return;
+                }
+                upstream_ssl_obj = us;
+            }
+        }
+        const upstream = UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
         defer upstream.close();
 
         // Set timeouts on upstream socket
@@ -427,7 +557,21 @@ fn handleConnection(
                 if (header.len == 0) continue;
                 if (startsWithIgnoreCase(header, "cache-control:")) continue;
                 if (startsWithIgnoreCase(header, "content-length:")) continue;
+                // For external routes, replace Host header with upstream hostname
+                if (is_external and startsWithIgnoreCase(header, "host:")) continue;
                 upstream.writeAll(header) catch return;
+                upstream.writeAll("\r\n") catch return;
+            }
+        }
+
+        // For external routes, set Host to upstream and preserve original as X-Forwarded-Host
+        if (is_external) {
+            upstream.writeAll("Host: ") catch return;
+            upstream.writeAll(upstream_host) catch return;
+            upstream.writeAll("\r\n") catch return;
+            if (host.len > 0) {
+                upstream.writeAll("X-Forwarded-Host: ") catch return;
+                upstream.writeAll(host) catch return;
                 upstream.writeAll("\r\n") catch return;
             }
         }
@@ -502,10 +646,16 @@ fn handleConnection(
         sslWriteAll(ssl, resp_buf[0 .. resp_first_line_end + 2]);
 
         // Forward response headers, replacing Connection header with our decision
+        // For external routes, rewrite Set-Cookie Domain to proxy domain
         var resp_header_iter = std.mem.splitSequence(u8, resp_headers_section, "\r\n");
         while (resp_header_iter.next()) |header| {
             if (header.len == 0) continue;
             if (startsWithIgnoreCase(header, "connection:")) continue;
+            if (is_external and startsWithIgnoreCase(header, "set-cookie:")) {
+                rewriteCookieDomain(ssl, header, config.domain);
+                sslWriteAll(ssl, "\r\n");
+                continue;
+            }
             sslWriteAll(ssl, header);
             sslWriteAll(ssl, "\r\n");
         }
@@ -702,6 +852,32 @@ fn sslSendError(ssl: *ssl_c.SSL, status: u16, message: []const u8) void {
     sslWriteAll(ssl, response);
 }
 
+/// Rewrite Domain= attribute in a Set-Cookie header to the proxy domain.
+/// Writes the full header (without trailing \r\n) to the SSL connection.
+fn rewriteCookieDomain(ssl: *ssl_c.SSL, header: []const u8, domain: []const u8) void {
+    // Find "Domain=" (case-insensitive) in the header value
+    var i: usize = 0;
+    while (i + 7 <= header.len) : (i += 1) {
+        if (startsWithIgnoreCase(header[i..], "domain=")) {
+            // Found Domain= at position i
+            // Write everything before "Domain="
+            sslWriteAll(ssl, header[0..i]);
+            // Write "Domain=.<proxy_domain>"
+            sslWriteAll(ssl, "Domain=.");
+            sslWriteAll(ssl, domain);
+            // Skip past the original domain value (until ; or end of header)
+            var j = i + 7;
+            if (j < header.len and header[j] == '.') j += 1; // skip leading dot
+            while (j < header.len and header[j] != ';') : (j += 1) {}
+            // Write the rest of the header
+            sslWriteAll(ssl, header[j..]);
+            return;
+        }
+    }
+    // No Domain= found, forward as-is
+    sslWriteAll(ssl, header);
+}
+
 const ConnectionHeader = enum { keep_alive, close, none };
 
 fn getHeaderValue(headers: []const u8, comptime name: []const u8) ?[]const u8 {
@@ -760,7 +936,7 @@ const ChunkState = enum { size, size_ext, size_cr, data, data_cr, data_lf, trail
 
 fn forwardChunkedBody(
     ssl: *ssl_c.SSL,
-    upstream: compat.SocketStream,
+    upstream: UpstreamConn,
     initial: []const u8,
     resp_body: *[requests.max_body_len]u8,
     read_buf: *[16384]u8,

@@ -7,7 +7,7 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 ## Features
 
 - **HTTPS reverse proxy** — TLS termination with auto-generated CA and domain certificates
-- **Multi-app routing** — route by subdomain (`api.dev.lo`) or path prefix (`/api`) to different ports
+- **Multi-app routing** — route by subdomain (`api.dev.lo`) or path prefix (`/api`) to local ports or external hosts
 - **Custom DNS** — resolves `*.lo` to localhost, no `/etc/hosts` editing
 - **Terminal UI** — live request list with method, path, status, timing, and body size
 - **Request interception** — hold, inspect, edit, accept, or drop requests with optional pattern matching
@@ -155,9 +155,18 @@ zlodev start --route=/api=3001 --route=/admin=8080
 
 # Mix both
 zlodev start --route=api=3001 --route=/webhooks=8080
+
+# External upstream — route to remote services
+zlodev start --route=api=staging.api.example.com
+zlodev start --route=/payments=payments.stripe.com:443
+
+# api.dev.lo → staging.api.example.com:443 (TLS)
+# dev.lo/payments/* → payments.stripe.com:443 (TLS)
 ```
 
 Priority: subdomain match > longest path prefix > default port.
+
+External routes connect via TLS, rewrite the `Host` header to the upstream hostname, and rewrite `Set-Cookie` domain attributes to `dev.lo` so cookies work correctly in the browser. If no port is specified, defaults to 443.
 
 > **Note:** Subdomain routes are not supported in local mode (`-l`), since mDNS does not support arbitrary subdomains.
 

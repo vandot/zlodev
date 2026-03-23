@@ -48,6 +48,7 @@ pub fn main() !void {
     var route_count: usize = 0;
     defer for (routes[0..route_count]) |route| {
         allocator.free(route.pattern);
+        if (route.hostname) |h| allocator.free(h);
     };
     var config_path: ?[]const u8 = null;
 
@@ -511,7 +512,7 @@ fn printHelp() void {
         \\Options:
         \\  -p=PORT, --port=PORT       target port [auto-detect or 3000]
         \\  -b=ADDR, --bind=ADDR       listen address [default 0.0.0.0]
-        \\  --route=PATTERN=PORT       route by subdomain or path (repeatable)
+        \\  --route=PATTERN=TARGET     route by subdomain or path (repeatable)
         \\  -c=PATH, --config=PATH     config file path [default .zlodev]
         \\  --max-body=SIZE            max request body size [default 10M]
         \\  --no-tui                   disable TUI, log to stderr
@@ -533,8 +534,10 @@ fn printHelp() void {
         \\  CLI arguments override config file values.
         \\
         \\Routes:
-        \\  --route=api=3001           subdomain: api.dev.lo -> :3001
-        \\  --route=/api=3001          path:      dev.lo/api/* -> :3001
+        \\  --route=api=3001              subdomain: api.dev.lo -> localhost:3001
+        \\  --route=/api=3001             path:      dev.lo/api/* -> localhost:3001
+        \\  --route=api=example.com       external:  api.dev.lo -> example.com:443
+        \\  --route=api=example.com:8080  external:  api.dev.lo -> example.com:8080
         \\  Subdomain routes are not allowed in local mode (-l).
         \\  Priority: subdomain > longest path > default port
         \\
@@ -670,28 +673,55 @@ fn addRoute(allocator: std.mem.Allocator, routes: *[proxy.max_routes]proxy.Route
     }
     if (std.mem.lastIndexOfScalar(u8, val, '=')) |eq| {
         const pattern = val[0..eq];
-        const port_str = val[eq + 1 ..];
-        const rport = std.fmt.parseInt(u16, port_str, 10) catch {
-            std.debug.print("invalid route port: {s}\n", .{port_str});
-            std.process.exit(1);
-        };
+        const target = val[eq + 1 ..];
         if (pattern.len == 0) {
             std.debug.print("empty route pattern in: {s}\n", .{val});
             std.process.exit(1);
         }
-        routes[route_count.*] = .{
-            .kind = if (pattern[0] == '/') .path else .subdomain,
-            .pattern = allocator.dupe(u8, pattern) catch {
-                std.debug.print("out of memory\n", .{});
+        if (target.len == 0) {
+            std.debug.print("empty route target in: {s}\n", .{val});
+            std.process.exit(1);
+        }
+
+        // Try parsing as a plain port number (local route)
+        if (std.fmt.parseInt(u16, target, 10)) |rport| {
+            routes[route_count.*] = .{
+                .kind = if (pattern[0] == '/') .path else .subdomain,
+                .pattern = allocator.dupe(u8, pattern) catch oom(),
+                .port = rport,
+            };
+        } else |_| {
+            // External host — parse host:port or host (default 443)
+            var hostname: []const u8 = target;
+            var rport: u16 = 443;
+            if (std.mem.lastIndexOfScalar(u8, target, ':')) |colon| {
+                rport = std.fmt.parseInt(u16, target[colon + 1 ..], 10) catch {
+                    std.debug.print("invalid route port in: {s}\n", .{target});
+                    std.process.exit(1);
+                };
+                hostname = target[0..colon];
+            }
+            if (hostname.len == 0) {
+                std.debug.print("empty hostname in route: {s}\n", .{val});
                 std.process.exit(1);
-            },
-            .port = rport,
-        };
+            }
+            routes[route_count.*] = .{
+                .kind = if (pattern[0] == '/') .path else .subdomain,
+                .pattern = allocator.dupe(u8, pattern) catch oom(),
+                .port = rport,
+                .hostname = allocator.dupe(u8, hostname) catch oom(),
+            };
+        }
         route_count.* += 1;
     } else {
-        std.debug.print("invalid route format, expected PATTERN=PORT: {s}\n", .{val});
+        std.debug.print("invalid route format, expected PATTERN=PORT or PATTERN=HOST:PORT: {s}\n", .{val});
         std.process.exit(1);
     }
+}
+
+fn oom() noreturn {
+    std.debug.print("out of memory\n", .{});
+    std.process.exit(1);
 }
 
 const ConfigResult = struct {

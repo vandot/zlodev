@@ -616,11 +616,16 @@
       .hero p { font-size: 16px; }
       .features-grid { grid-template-columns: 1fr; }
       .details-grid { grid-template-columns: 1fr; }
-      .terminal-body { font-size: 11px; }
-      .terminal-body .method { width: 44px; }
-      .terminal-body .time { width: 48px; }
-      .terminal-body .size { width: 52px; }
-      .terminal-body .tui-col-header { font-size: 10px; }
+      .terminal-body { font-size: 11px; overflow-x: hidden; padding: 12px; }
+      .terminal-body .marker { width: 12px; }
+      .terminal-body .method { width: 40px; }
+      .terminal-body .status { width: 36px; }
+      .terminal-body .time { display: none; }
+      .terminal-body .size { display: none; }
+      .terminal-body .path { padding-left: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .terminal-body .tui-col-header { font-size: 9px; }
+      .terminal-body .tui-info { font-size: 10px; }
+      .terminal-body .tui-info .label { width: 56px; }
       .section-title { font-size: 28px; }
       footer .container { flex-direction: column; gap: 16px; }
     }
@@ -760,7 +765,7 @@
       <div class="feature reveal">
         <div class="feature-icon">/&rarr;</div>
         <h3>Multi-app routing</h3>
-        <p>Route by subdomain (<code>api.dev.lo</code>) or path prefix (<code>/api</code>) to different backend ports. Color-coded in the TUI.</p>
+        <p>Route by subdomain (<code>api.dev.lo</code>) or path prefix (<code>/api</code>) to local ports or external hosts. Color-coded in the TUI.</p>
       </div>
       <div class="feature reveal">
         <div class="feature-icon">*.lo</div>
@@ -884,7 +889,7 @@
     <div class="details-grid">
       <div class="detail-card reveal">
         <h3>Multi-app routing</h3>
-        <p>Use <code>--route=api=3001</code> for subdomain routing (<code>api.dev.lo</code>) or <code>--route=/api=3001</code> for path routing. Mix both, add as many as you need. Each route gets a distinct color in the TUI.</p>
+        <p>Use <code>--route=api=3001</code> for subdomain routing (<code>api.dev.lo</code>), <code>--route=/api=3001</code> for path routing, or <code>--route=api=staging.example.com</code> for external upstreams. Mix and match, each route gets a distinct color in the TUI.</p>
       </div>
       <div class="detail-card reveal">
         <h3>Local network / mDNS</h3>

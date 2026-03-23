@@ -765,9 +765,10 @@ fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_
     // Show routes if configured
     for (routes, 0..) |route, i| {
         var route_buf: [128]u8 = undefined;
+        const target_host = route.hostname orelse "127.0.0.1";
         const route_text = switch (route.kind) {
-            .subdomain => std.fmt.bufPrint(&route_buf, "{s}.{s} -> 127.0.0.1:{d}", .{ route.pattern, domain, route.port }) catch "",
-            .path => std.fmt.bufPrint(&route_buf, "{s} -> 127.0.0.1:{d}", .{ route.pattern, route.port }) catch "",
+            .subdomain => std.fmt.bufPrint(&route_buf, "{s}.{s} -> {s}:{d}", .{ route.pattern, domain, target_host, route.port }) catch "",
+            .path => std.fmt.bufPrint(&route_buf, "{s} -> {s}:{d}", .{ route.pattern, target_host, route.port }) catch "",
         };
         const color = route_palette[i % route_palette.len];
         printAt(win, 2, row, "ROUTE", .{ .fg = dim });

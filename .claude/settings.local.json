@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(zig std:*)"
+      "Bash(zig std:*)",
+      "Bash(zig build:*)",
+      "Bash(zig test:*)"
     ]
   }
 }
