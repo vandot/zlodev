@@ -545,6 +545,14 @@
       border: 1px solid var(--border);
     }
 
+    .section-subtitle {
+      font-size: 15px;
+      color: var(--text-muted);
+      line-height: 1.7;
+      max-width: 640px;
+      margin-bottom: 40px;
+    }
+
     /* Details / How it works */
     .details {
       padding: 96px 0;
@@ -653,6 +661,7 @@
     <a href="/" class="logo">zlodev</a>
     <div class="links">
       <a href="#features">Features</a>
+      <a href="#why-https">Why HTTPS?</a>
       <a href="#quickstart">Quick start</a>
       <a href="https://github.com/vandot/zlodev">GitHub</a>
     </div>
@@ -818,6 +827,50 @@
         <div class="feature-icon">:0</div>
         <h3>Port auto-detect</h3>
         <p>Reads <code>.env</code> and framework configs to find your dev server port. Zero config for most setups.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<section class="details" id="why-https">
+  <div class="container">
+    <div class="section-label reveal">The problem</div>
+    <div class="section-title reveal">Why HTTPS in local dev?</div>
+    <p class="section-subtitle reveal">Browsers and upstream services gate real functionality behind TLS. Without local HTTPS, you're testing a different app than what runs in production.</p>
+    <div class="details-grid why-grid">
+      <div class="detail-card reveal">
+        <h3>Webhooks</h3>
+        <p>Stripe, GitHub, Twilio, and Slack all require HTTPS callback URLs. Without a local HTTPS endpoint you're deploying to staging just to test a handler, or re-registering ngrok URLs every session.</p>
+      </div>
+      <div class="detail-card reveal">
+        <h3>OAuth &amp; OIDC flows</h3>
+        <p>Most identity providers (Entra ID, Auth0, Okta, Google) reject redirect URIs that aren't HTTPS. A valid local cert lets you complete the full auth flow without dev-only exceptions that diverge from production.</p>
+      </div>
+      <div class="detail-card reveal">
+        <h3>Secure cookies &amp; SameSite</h3>
+        <p>Browsers treat <code>Secure</code> and <code>SameSite=None</code> cookies differently over plain HTTP. If your app relies on cross-site cookies, embedded iframes, or BFF patterns, you can't reproduce the real behavior without TLS.</p>
+      </div>
+      <div class="detail-card reveal">
+        <h3>Mixed content &amp; HSTS</h3>
+        <p>Browsers block mixed HTTP/HTTPS content aggressively. Local HTTPS lets you catch broken asset references, hardcoded <code>http://</code> URLs, and HSTS preload issues before they hit staging.</p>
+      </div>
+      <div class="detail-card reveal">
+        <h3>Service Workers &amp; PWAs</h3>
+        <p>Service workers are gated behind secure contexts. No HTTPS means no registration outside localhost, which makes offline-first and progressive web app development painful.</p>
+      </div>
+      <div class="detail-card reveal">
+        <h3>CSP &amp; Permissions Policy</h3>
+        <p>Security headers like <code>Content-Security-Policy</code> and <code>upgrade-insecure-requests</code> behave differently in secure vs. insecure contexts. Testing locally with HTTPS matches production semantics.</p>
+      </div>
+      <div class="detail-card reveal">
+        <h3>Mobile device testing</h3>
+        <p>Localhost exceptions don't apply when your phone hits your dev box over the local network. A valid cert on a real hostname avoids the certificate warning dead-end on iOS and Android.</p>
+      </div>
+      <div class="detail-card reveal">
+        <h3>API gateway parity</h3>
+        <p>If production traffic flows through Cloudflare, Azure Front Door, or an NGINX ingress with TLS termination, local HTTPS lets you test <code>X-Forwarded-Proto</code>, HSTS headers, and redirect logic that keys off the scheme.</p>
       </div>
     </div>
   </div>
