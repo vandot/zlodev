@@ -8,6 +8,7 @@ const log = @import("log.zig");
 const sys = @import("sys.zig");
 const tui = @import("tui.zig");
 const shutdown = @import("shutdown.zig");
+const intercept = @import("intercept.zig");
 const build_options = @import("build_options");
 
 const version = build_options.version;
@@ -124,6 +125,7 @@ pub fn main() !void {
             };
             if (cfg.local) local = true;
             if (cfg.dns) dns_only = true;
+            if (cfg.intercept_pattern) |pat| intercept.enableWithPattern(pat);
         } else |_| {
             if (config_path != null) {
                 std.debug.print("config file not found: {s}\n", .{cfg_path});
@@ -526,6 +528,7 @@ fn printHelp() void {
         \\    bind=127.0.0.1
         \\    route=api=3001
         \\    route=/api=3000
+        \\    intercept=POST /api
         \\    no-tui
         \\  CLI arguments override config file values.
         \\
@@ -698,6 +701,7 @@ const ConfigResult = struct {
     max_body: ?usize = null,
     local: bool = false,
     dns: bool = false,
+    intercept_pattern: ?[]const u8 = null,
 };
 
 fn readConfigFile(
@@ -743,6 +747,8 @@ fn readConfigFile(
             result.local = true;
         } else if (std.mem.eql(u8, line, "dns")) {
             result.dns = true;
+        } else if (lineValue(line, "intercept")) |val| {
+            result.intercept_pattern = val;
         } else {
             std.debug.print("config: unknown option: {s}\n", .{line});
             std.process.exit(1);

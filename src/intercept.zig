@@ -15,9 +15,16 @@ pub const PendingEntry = struct {
     decision: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 };
 
+pub const max_pattern_len = 128;
+
 var enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var slots: [max_pending]PendingEntry = @splat(PendingEntry{});
 var mutex: std.Thread.Mutex = .{};
+
+// Intercept pattern — substring match against "METHOD PATH"
+var pattern_buf: [max_pattern_len]u8 = .{0} ** max_pattern_len;
+var pattern_len: usize = 0;
+var pattern_mutex: std.Thread.Mutex = .{};
 
 pub fn isEnabled() bool {
     return enabled.load(.acquire);
@@ -25,7 +32,79 @@ pub fn isEnabled() bool {
 
 pub fn toggle() void {
     const current = enabled.load(.acquire);
+    if (current) {
+        // Disabling — clear pattern
+        setPattern("");
+    }
     enabled.store(!current, .release);
+}
+
+/// Enable intercept with a specific pattern. Empty pattern = match all.
+pub fn enableWithPattern(pat: []const u8) void {
+    setPattern(pat);
+    enabled.store(true, .release);
+}
+
+pub fn setPattern(pat: []const u8) void {
+    pattern_mutex.lock();
+    defer pattern_mutex.unlock();
+    const len = @min(pat.len, max_pattern_len);
+    @memcpy(pattern_buf[0..len], pat[0..len]);
+    pattern_len = len;
+}
+
+pub fn getPattern(buf: *[max_pattern_len]u8) []const u8 {
+    pattern_mutex.lock();
+    defer pattern_mutex.unlock();
+    @memcpy(buf[0..pattern_len], pattern_buf[0..pattern_len]);
+    return buf[0..pattern_len];
+}
+
+/// Check if a request matches the intercept pattern.
+/// Returns true if intercept is enabled and the pattern matches (or pattern is empty).
+pub fn shouldIntercept(method: []const u8, path: []const u8) bool {
+    if (!enabled.load(.acquire)) return false;
+
+    pattern_mutex.lock();
+    defer pattern_mutex.unlock();
+
+    // Empty pattern = match all
+    if (pattern_len == 0) return true;
+
+    const pat = pattern_buf[0..pattern_len];
+
+    // Try matching against method, path, or "METHOD PATH" combined
+    if (containsIgnoreCase(method, pat)) return true;
+    if (containsIgnoreCase(path, pat)) return true;
+
+    // Build "METHOD PATH" for combined match
+    var combined: [520]u8 = undefined;
+    if (method.len + 1 + path.len <= combined.len) {
+        @memcpy(combined[0..method.len], method);
+        combined[method.len] = ' ';
+        @memcpy(combined[method.len + 1 ..][0..path.len], path);
+        const full = combined[0 .. method.len + 1 + path.len];
+        if (containsIgnoreCase(full, pat)) return true;
+    }
+
+    return false;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    if (needle.len == 0) return true;
+    const end = haystack.len - needle.len + 1;
+    for (0..end) |i| {
+        var match = true;
+        for (0..needle.len) |j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
 }
 
 /// Acquire a free intercept slot. Returns null if all slots are occupied.
@@ -186,6 +265,64 @@ test "findByBackingIndex" {
     try testing.expect(found == slot);
     try testing.expect(findByBackingIndex(99) == null);
     release(slot);
+}
+
+test "shouldIntercept with empty pattern matches all" {
+    enabled.store(true, .release);
+    setPattern("");
+    try testing.expect(shouldIntercept("GET", "/api/users"));
+    try testing.expect(shouldIntercept("POST", "/login"));
+    enabled.store(false, .release);
+}
+
+test "shouldIntercept with path pattern" {
+    enabled.store(true, .release);
+    setPattern("/api");
+    try testing.expect(shouldIntercept("GET", "/api/users"));
+    try testing.expect(!shouldIntercept("GET", "/login"));
+    enabled.store(false, .release);
+}
+
+test "shouldIntercept with method pattern" {
+    enabled.store(true, .release);
+    setPattern("POST");
+    try testing.expect(shouldIntercept("POST", "/anything"));
+    try testing.expect(!shouldIntercept("GET", "/anything"));
+    enabled.store(false, .release);
+}
+
+test "shouldIntercept with combined pattern" {
+    enabled.store(true, .release);
+    setPattern("POST /api");
+    try testing.expect(shouldIntercept("POST", "/api/auth"));
+    try testing.expect(!shouldIntercept("GET", "/api/auth"));
+    try testing.expect(!shouldIntercept("POST", "/login"));
+    enabled.store(false, .release);
+}
+
+test "shouldIntercept case insensitive" {
+    enabled.store(true, .release);
+    setPattern("post /API");
+    try testing.expect(shouldIntercept("POST", "/api/auth"));
+    enabled.store(false, .release);
+}
+
+test "shouldIntercept returns false when disabled" {
+    enabled.store(false, .release);
+    setPattern("/api");
+    try testing.expect(!shouldIntercept("GET", "/api/users"));
+}
+
+test "toggle clears pattern" {
+    enabled.store(false, .release);
+    setPattern("test");
+    toggle(); // enable
+    try testing.expect(isEnabled());
+    var buf: [max_pattern_len]u8 = undefined;
+    try testing.expectEqualStrings("test", getPattern(&buf));
+    toggle(); // disable — should clear
+    try testing.expect(!isEnabled());
+    try testing.expectEqualStrings("", getPattern(&buf));
 }
 
 test "multiple acquire and release cycle" {

@@ -38,6 +38,7 @@ pub const Entry = struct {
     resp_body_truncated: bool = false,
     state: EntryState = .normal,
     pinned: bool = false,
+    starred: bool = false,
     route_index: u8 = 0xff, // 0xff = no route match, otherwise index into routes
 
     pub fn getMethod(self: *const Entry) []const u8 {
@@ -156,6 +157,19 @@ pub fn unpin(idx: usize) void {
     entries_backing[idx].pinned = false;
 }
 
+/// Toggle the starred flag on an entry. Starred entries are pinned to survive ring buffer overflow.
+pub fn toggleStar(idx: usize) void {
+    mutex.lock();
+    defer mutex.unlock();
+    const e = &entries_backing[idx];
+    e.starred = !e.starred;
+    if (e.starred) {
+        e.pinned = true;
+    } else if (e.state != .intercepted) {
+        e.pinned = false;
+    }
+}
+
 /// Mark an entry as deleted by backing index.
 pub fn remove(idx: usize) void {
     mutex.lock();
@@ -173,6 +187,7 @@ pub fn clearAll() void {
     for (0..max_entries) |i| {
         entries_backing[i].state = .deleted;
         entries_backing[i].pinned = false;
+        entries_backing[i].starred = false;
     }
     count = 0;
     live_count = 0;
@@ -531,5 +546,41 @@ test "truncation flags preserved through pushAndPin" {
     const stored = getByBackingIndex(idx);
     try testing.expect(stored.resp_body_truncated);
     try testing.expect(!stored.req_body_truncated);
+    unpin(idx);
+}
+
+test "toggleStar pins and unpins" {
+    clearAll();
+    push(makeEntry("GET", "/star-test", 200));
+    const backing_idx = logicalToBackingIndex(0) orelse return error.TestUnexpectedResult;
+    const e = getByBackingIndex(backing_idx);
+
+    try testing.expect(!e.starred);
+    try testing.expect(!e.pinned);
+
+    toggleStar(backing_idx);
+    try testing.expect(e.starred);
+    try testing.expect(e.pinned);
+
+    toggleStar(backing_idx);
+    try testing.expect(!e.starred);
+    try testing.expect(!e.pinned);
+}
+
+test "toggleStar unstar keeps pinned if intercepted" {
+    clearAll();
+    const idx = pushAndPin(makeEntry("GET", "/intercept-star", 200)) orelse return error.TestUnexpectedResult;
+    const e = getByBackingIndex(idx);
+    e.state = .intercepted;
+
+    toggleStar(idx);
+    try testing.expect(e.starred);
+    try testing.expect(e.pinned);
+
+    // Unstar — should stay pinned because intercepted
+    toggleStar(idx);
+    try testing.expect(!e.starred);
+    try testing.expect(e.pinned);
+
     unpin(idx);
 }

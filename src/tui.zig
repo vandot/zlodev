@@ -338,6 +338,9 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     var search_mode: bool = false;
     var search_buf: [128]u8 = .{0} ** 128;
     var search_len: usize = 0;
+    var intercept_mode: bool = false;
+    var intercept_buf: [intercept.max_pattern_len]u8 = .{0} ** intercept.max_pattern_len;
+    var intercept_len: usize = 0;
     var filtered_count: usize = 0;
     // Maps filtered index -> original index in ptr_buf
     var filter_map: [requests.max_entries]usize = undefined;
@@ -383,6 +386,25 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                         continue;
                     }
 
+                    // Intercept pattern input mode
+                    if (intercept_mode) {
+                        if (key.matches(vaxis.Key.escape, .{})) {
+                            intercept_mode = false;
+                            intercept_len = 0;
+                        } else if (key.matches(vaxis.Key.enter, .{})) {
+                            intercept_mode = false;
+                            intercept.enableWithPattern(intercept_buf[0..intercept_len]);
+                        } else if (key.matches(vaxis.Key.backspace, .{})) {
+                            intercept_len -|= 1;
+                        } else if (key.text) |text| {
+                            if (intercept_len + text.len <= intercept_buf.len) {
+                                @memcpy(intercept_buf[intercept_len .. intercept_len + text.len], text);
+                                intercept_len += text.len;
+                            }
+                        }
+                        continue;
+                    }
+
                     if (key.matches('?', .{})) {
                         show_help = !show_help;
                         continue;
@@ -422,14 +444,24 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 detail_scroll = 0;
                                 view = .detail;
                             }
-                            if (key.matches('i', .{}))
-                                intercept.toggle();
+                            if (key.matches('i', .{})) {
+                                if (intercept.isEnabled()) {
+                                    intercept.toggle();
+                                } else {
+                                    intercept_mode = true;
+                                    intercept_len = 0;
+                                }
+                            }
                             if (key.matches('a', .{}) and filtered_count > 0)
                                 acceptEntry(filter_map[cursor]);
                             if (key.matches('A', .{}))
                                 intercept.acceptAll();
                             if (key.matches('C', .{}))
                                 requests.clearAll();
+                            if (key.matches('*', .{}) and filtered_count > 0) {
+                                const bi = requests.logicalToBackingIndex(filter_map[cursor]) orelse continue;
+                                requests.toggleStar(bi);
+                            }
                             if (key.matches('d', .{}) and filtered_count > 0)
                                 dropOrDeleteEntry(filter_map[cursor]);
                             if (key.matches('c', .{}) and filtered_count > 0) {
@@ -500,7 +532,15 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             } else if (key.matches('s', .{})) {
                                 autoscroll = !autoscroll;
                             } else if (key.matches('i', .{})) {
-                                intercept.toggle();
+                                if (intercept.isEnabled()) {
+                                    intercept.toggle();
+                                } else {
+                                    intercept_mode = true;
+                                    intercept_len = 0;
+                                }
+                            } else if (key.matches('*', .{})) {
+                                const bi = requests.logicalToBackingIndex(detail_index) orelse continue;
+                                requests.toggleStar(bi);
                             } else if (key.matches('a', .{})) {
                                 acceptEntry(detail_index);
                             } else if (key.matches('d', .{})) {
@@ -666,7 +706,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                     scroll_offset = cursor - available_rows + 1;
                 }
 
-                drawRequests(win, buf_slice, &filter_map, filtered_count, header_rows, scroll_offset, cursor, autoscroll, show_help, search_mode, search_term);
+                drawRequests(win, buf_slice, &filter_map, filtered_count, header_rows, scroll_offset, cursor, autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len]);
             },
             .detail => {
                 // Resolve filtered cursor to real logical index
@@ -752,11 +792,21 @@ fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_
     if (intercept.isEnabled()) {
         const orange: vaxis.Color = .{ .rgb = .{ 0xd2, 0x9e, 0x22 } };
         printAt(win, indicator_pos, row, "intercept", .{ .fg = orange });
+        var ipos = indicator_pos + 9;
+        // Show active pattern
+        var pat_buf: [intercept.max_pattern_len]u8 = undefined;
+        const pat = intercept.getPattern(&pat_buf);
+        if (pat.len > 0) {
+            writeAscii(win, ipos, row, ":", .{ .fg = orange });
+            ipos += 1;
+            writeAscii(win, ipos, row, pat, .{ .fg = orange });
+            ipos += @as(u16, @intCast(pat.len));
+        }
         const pending = intercept.getPendingCount();
         if (pending > 0) {
             var pending_buf: [32]u8 = undefined;
             const pending_text = std.fmt.bufPrint(&pending_buf, " ({d} held)", .{pending}) catch "";
-            writeAscii(win, indicator_pos + 9, row, pending_text, .{ .fg = orange });
+            writeAscii(win, ipos, row, pending_text, .{ .fg = orange });
         }
     }
     row += 1;
@@ -792,11 +842,15 @@ fn drawRequests(
     show_help: bool,
     search_mode: bool,
     search_term: []const u8,
+    imode: bool,
+    iterm: []const u8,
 ) void {
     if (filtered_count == 0) {
         const msg = if (search_term.len > 0) "no matching requests" else "no requests yet";
         printAt(win, 2, start_row, msg, .{ .fg = .{ .rgb = .{ 0x6e, 0x76, 0x81 } } });
-        if (search_mode or search_term.len > 0)
+        if (imode)
+            drawInterceptBar(win, iterm)
+        else if (search_mode or search_term.len > 0)
             drawSearchBar(win, search_mode, search_term)
         else
             drawFooter(win, autoscroll, show_help);
@@ -830,7 +884,9 @@ fn drawRequests(
         drawRequestLine(win, row, entry, selected);
     }
 
-    if (search_mode or search_term.len > 0)
+    if (imode)
+        drawInterceptBar(win, iterm)
+    else if (search_mode or search_term.len > 0)
         drawSearchBar(win, search_mode, search_term)
     else
         drawFooter(win, autoscroll, show_help);
@@ -840,6 +896,9 @@ fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Entry, se
     const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
     const bg: vaxis.Color = if (selected) .{ .rgb = .{ 0x1c, 0x2b, 0x3a } } else .default;
 
+    if (entry.starred) {
+        writeAscii(win, 0, row, "*", .{ .fg = .{ .rgb = .{ 0xd2, 0x9e, 0x22 } }, .bg = bg, .bold = true });
+    }
     if (selected) {
         printAt(win, 1, row, ">", .{ .fg = .{ .rgb = .{ 0x58, 0xa6, 0xff } }, .bg = bg, .bold = true });
     }
@@ -1188,6 +1247,16 @@ fn drawEdit(win: vaxis.Window, es: *EditState) void {
     writeAscii(win, 2, footer_row, footer_text, .{ .fg = dim });
 }
 
+fn drawInterceptBar(win: vaxis.Window, pattern: []const u8) void {
+    const footer_row = win.height -| 1;
+    const white: vaxis.Color = .{ .rgb = .{ 0xe1, 0xe4, 0xe8 } };
+    const orange: vaxis.Color = .{ .rgb = .{ 0xd2, 0x9e, 0x22 } };
+
+    writeAscii(win, 2, footer_row, "intercept:", .{ .fg = orange, .bold = true });
+    writeAscii(win, 12, footer_row, pattern, .{ .fg = white });
+    writeAscii(win, 12 + @as(u16, @intCast(pattern.len)), footer_row, "_", .{ .fg = orange });
+}
+
 fn drawSearchBar(win: vaxis.Window, search_mode: bool, search_term: []const u8) void {
     const footer_row = win.height -| 1;
     const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
@@ -1244,7 +1313,8 @@ fn drawHelpOverlay(win: vaxis.Window, ctx: HelpContext) void {
         .{ .key = "G", .desc = "go to end" },
         .{ .key = "g", .desc = "go to top" },
         .{ .key = "s", .desc = "toggle autoscroll" },
-        .{ .key = "i", .desc = "toggle intercept" },
+        .{ .key = "*", .desc = "star / unstar request" },
+        .{ .key = "i", .desc = "intercept (pattern prompt / off)" },
         .{ .key = "d", .desc = "drop / delete" },
         .{ .key = "c", .desc = "copy as curl" },
         .{ .key = "e", .desc = "edit request" },

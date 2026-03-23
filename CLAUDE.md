@@ -30,7 +30,7 @@ dns.zig           UDP DNS server (resolves *.lo → 127.0.0.1)
 http_server.zig   HTTP server on port 80 (CA cert download page, HTTPS redirect)
 cert.zig          Certificate generation and system trust store management (BoringSSL)
 requests.zig      Thread-safe ring buffer for captured request/response entries
-intercept.zig     Request interception slots (hold/accept/drop with thread sync)
+intercept.zig     Request interception (pattern matching, hold/accept/drop with thread sync)
 shutdown.zig      Global atomic shutdown flag + signal handlers (SIGINT/SIGTERM)
 log.zig           Structured logging (stderr or file when TUI is active)
 search.zig        Entry search/filter logic
@@ -43,13 +43,14 @@ compat.zig        Cross-platform compatibility (Windows socket I/O, networking i
 ## Key design decisions
 
 - **Thread model**: proxy uses a 64-thread pool (256KB stacks), HTTP server uses 8 threads, DNS is single-threaded. All loops use `poll()` with 1s timeout + `shutdown.isRunning()` check.
-- **Ring buffer**: `requests.zig` stores entries in a fixed-size ring (`max_entries`, default 500). Entries are ~69KB each (fixed-size arrays for headers/body). Pinned entries (intercepted, WebSocket) are skipped during overwrite.
+- **Ring buffer**: `requests.zig` stores entries in a fixed-size ring (`max_entries`, default 500). Entries are ~69KB each (fixed-size arrays for headers/body). Pinned entries (intercepted, WebSocket, starred) are skipped during overwrite.
 - **TLS**: BoringSSL via `@cImport` (API-compatible with OpenSSL). `SSL_set_fd` uses `BIO_NOCLOSE` — the caller must close the socket after `SSL_free`.
-- **Entry lifecycle**: Normal requests use `push()`. Intercepted requests use `pushAndPin()` → `finishEntry()` (which unpins). The TUI can edit pinned entries in-place before accepting.
+- **Entry lifecycle**: Normal requests use `push()`. Intercepted requests use `pushAndPin()` → `finishEntry()` (which unpins). The TUI can edit pinned entries in-place before accepting. Starred entries (`*` key) set `pinned=true` via `toggleStar()` to survive ring buffer overflow; `starred` is a separate bool from `pinned` so unstarring doesn't interfere with intercept pins.
 - **Replay**: Connects to the proxy's own TLS endpoint (127.0.0.1:443) so the request goes through the full proxy path and gets captured naturally.
 - **Chunked encoding**: A state machine parser (`chunkedStep`) decodes chunks for body capture while forwarding raw chunked data to the client.
 - **Routing**: `--route=api=3001` (subdomain) and `--route=/api=3001` (path prefix). `resolveRoute()` in proxy.zig matches Host header for subdomains, longest prefix for paths, falls back to default port. Each entry stores `route_index` for TUI color-coding.
-- **Config file**: `.zlodev` in project directory, parsed by `readConfigFile()` in main.zig. One option per line (same keys as CLI). CLI args override config values. Only read for `start` command.
+- **Config file**: `.zlodev` in project directory, parsed by `readConfigFile()` in main.zig. One option per line (same keys as CLI). CLI args override config values. Only read for `start` command. Supports `intercept=PATTERN` for default intercept pattern.
+- **Intercept patterns**: `intercept.zig` stores a pattern (`pattern_buf`/`pattern_len` with `pattern_mutex`). `shouldIntercept(method, path)` does case-insensitive substring match against method, path, or combined "METHOD PATH". Empty pattern matches all. TUI prompts for pattern on `i` key (like search mode with `/`). Config file can set a default pattern.
 - **Windows**: `compat.SocketStream` wraps Winsock `recv`/`send` (std.net.Stream uses ReadFile which doesn't work with sockets on Windows). `socketToFd`/`fdToSocket` handle SOCKET↔c_int conversion. TUI skips `queryTerminal` on Windows to avoid spurious key events.
 
 ## Code conventions

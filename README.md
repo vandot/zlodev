@@ -10,10 +10,11 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 - **Multi-app routing** — route by subdomain (`api.dev.lo`) or path prefix (`/api`) to different ports
 - **Custom DNS** — resolves `*.lo` to localhost, no `/etc/hosts` editing
 - **Terminal UI** — live request list with method, path, status, timing, and body size
-- **Request interception** — hold, inspect, accept, or drop requests before they reach your server
+- **Request interception** — hold, inspect, edit, accept, or drop requests with optional pattern matching
 - **Request replay** — re-send any completed request
 - **Copy as curl** — copy any request as a `curl` command
 - **HAR export** — export captured traffic as HTTP Archive files
+- **Request starring** — star important requests so they survive ring buffer overflow
 - **Search/filter** — filter requests by path
 - **WebSocket passthrough** — transparent proxying of WebSocket upgrades
 - **Cross-platform** — macOS, Linux, and Windows
@@ -125,12 +126,13 @@ port=3000
 bind=127.0.0.1
 route=api=3001
 route=/webhooks=8080
+intercept=POST /api
 no-tui
 ```
 
 zlodev reads `.zlodev` from the current directory on `start`. Use `-c=PATH` to specify a different location. CLI arguments override config file values.
 
-Supported options: `port`, `p`, `bind`, `b`, `route`, `max-body`, `no-tui`, `local`, `l`, `dns`, `d`.
+Supported options: `port`, `p`, `bind`, `b`, `route`, `max-body`, `intercept`, `no-tui`, `local`, `l`, `dns`.
 
 ### Routing
 
@@ -183,6 +185,23 @@ zlodev start -l
 zlodev start --no-tui
 ```
 
+### Intercept
+
+Press `i` in the TUI to enable intercept mode. You'll be prompted for a pattern — matching requests are held for inspection while all others pass through normally.
+
+- **Empty pattern** — intercepts all requests
+- **Path pattern** — `intercept=/api` matches any request with `/api` in the path
+- **Method pattern** — `intercept=POST` matches all POST requests
+- **Combined** — `intercept=POST /api` matches POST requests to `/api`
+
+Pattern matching is case-insensitive. Press `i` again to disable intercept and release all held requests.
+
+You can also set a default intercept pattern in your `.zlodev` config file:
+
+```
+intercept=POST /api
+```
+
 ## TUI keybindings
 
 ### List view
@@ -196,7 +215,8 @@ zlodev start --no-tui
 | `Enter` | Open detail view |
 | `/` | Search / filter by path |
 | `Esc` | Clear filter |
-| `i` | Toggle intercept mode |
+| `*` | Star / unstar request (survives buffer overflow) |
+| `i` | Intercept (prompts for pattern / toggles off) |
 | `a` | Accept held request |
 | `A` | Accept all held requests |
 | `d` | Drop held request / delete completed request |

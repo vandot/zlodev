@@ -336,7 +336,7 @@ fn handleConnection(
         // Intercept check
         var was_intercepted = false;
         var intercept_backing_idx: usize = 0;
-        if (intercept.isEnabled()) {
+        if (intercept.shouldIntercept(method, uri)) {
             entry.state = .intercepted;
             const maybe_idx = requests.pushAndPin(entry);
             if (maybe_idx == null) {
