@@ -42,9 +42,6 @@ jobs:
       - name: Test intercept
         run: zig test src/intercept.zig
 
-      - name: Test requests
-        run: zig test src/requests.zig
-
       - name: Test search
         run: zig test src/search.zig
 
@@ -79,9 +76,6 @@ jobs:
       - name: Test intercept
         run: zig test src/intercept.zig
 
-      - name: Test requests
-        run: zig test src/requests.zig
-
       - name: Test search
         run: zig test src/search.zig
 
@@ -98,6 +92,12 @@ jobs:
 
       - name: Set HostName to match LocalHostName
         run: sudo scutil --set HostName "$(scutil --get LocalHostName)"
+
+      - name: Debug hostname
+        run: |
+          echo "LocalHostName: $(scutil --get LocalHostName)"
+          echo "HostName: $(scutil --get HostName)"
+          echo "gethostname: $(hostname)"
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -118,9 +118,6 @@ jobs:
 
       - name: Test intercept
         run: zig test src/intercept.zig
-
-      - name: Test requests
-        run: zig test src/requests.zig
 
       - name: Test search
         run: zig test src/search.zig

@@ -169,9 +169,6 @@ test "uninstall and verify" {
 // --- Local mode (hostname.local) ---
 
 test "install --local and verify" {
-    if (getEnvOwned("ZLODEV_TEST_LOCAL")) |val| {
-        testing.allocator.free(val);
-    } else return;
     var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var domain_buf: [512]u8 = undefined;
@@ -194,16 +191,13 @@ test "install --local and verify" {
             try testing.expect(found);
         },
         .windows => {
-            try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", "zlodev" });
+            try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", cn });
         },
         else => {},
     }
 }
 
 test "install --local -f succeeds when already installed" {
-    if (getEnvOwned("ZLODEV_TEST_LOCAL")) |val| {
-        testing.allocator.free(val);
-    } else return;
     var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var domain_buf: [512]u8 = undefined;
@@ -214,9 +208,6 @@ test "install --local -f succeeds when already installed" {
 }
 
 test "uninstall --local and verify" {
-    if (getEnvOwned("ZLODEV_TEST_LOCAL")) |val| {
-        testing.allocator.free(val);
-    } else return;
     var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var domain_buf: [512]u8 = undefined;
@@ -240,7 +231,7 @@ test "uninstall --local and verify" {
             try testing.expect(!found);
         },
         .windows => {
-            const term_wl = try runCmd(&.{ "certutil", "-verifystore", "Root", "zlodev" });
+            const term_wl = try runCmd(&.{ "certutil", "-verifystore", "Root", cn });
             try testing.expect(!std.meta.eql(term_wl, std.process.Child.Term{ .Exited = 0 }));
         },
         else => {},
