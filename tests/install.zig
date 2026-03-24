@@ -126,7 +126,7 @@ test "install and verify" {
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (!(Get-DnsClientNrptRule | Where { $_.Namespace -eq '.lo' })) { exit 1 }" });
-            try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (!(Get-ChildItem Cert:\\LocalMachine\\Root | Where { $_.Subject -match 'zlodev' })) { exit 1 }" });
+            try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", "zlodev" });
         },
         else => {},
     }
@@ -158,7 +158,9 @@ test "uninstall and verify" {
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (Get-DnsClientNrptRule | Where { $_.Namespace -eq '.lo' }) { exit 1 }" });
-            try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (Get-ChildItem Cert:\\LocalMachine\\Root | Where { $_.Subject -match 'zlodev' }) { exit 1 }" });
+            // certutil -verifystore should fail when cert is removed
+            const term_w = try runCmd(&.{ "certutil", "-verifystore", "Root", "zlodev" });
+            try testing.expect(!std.meta.eql(term_w, std.process.Child.Term{ .Exited = 0 }));
         },
         else => {},
     }
@@ -189,7 +191,7 @@ test "install --local and verify" {
             try testing.expect(found);
         },
         .windows => {
-            try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (!(Get-ChildItem Cert:\\LocalMachine\\Root | Where { $_.Subject -match 'zlodev' })) { exit 1 }" });
+            try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", "zlodev" });
         },
         else => {},
     }
@@ -229,7 +231,8 @@ test "uninstall --local and verify" {
             try testing.expect(!found);
         },
         .windows => {
-            try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (Get-ChildItem Cert:\\LocalMachine\\Root | Where { $_.Subject -match 'zlodev' }) { exit 1 }" });
+            const term_wl = try runCmd(&.{ "certutil", "-verifystore", "Root", "zlodev" });
+            try testing.expect(!std.meta.eql(term_wl, std.process.Child.Term{ .Exited = 0 }));
         },
         else => {},
     }

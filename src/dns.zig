@@ -350,9 +350,9 @@ pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []c
             const tmp_netdev = try sys.writeTmpFile(allocator, "dns_netdev", netdev_text);
             defer allocator.free(tmp_netdev);
             try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_netdev, "/etc/systemd/network/zlodev0.netdev" });
-            try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" });
-            // Restart systemd-resolved to pick up the new per-link DNS routing
-            try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" });
+            // Best-effort: services may not be running
+            sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" }) catch {};
+            sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
         },
         .windows => {
             const ps_cmd = try std.fmt.allocPrint(allocator, "Add-DnsClientNrptRule -Namespace '.{s}' -NameServers '{s}'", .{ tld, ip });
@@ -373,9 +373,10 @@ pub fn uninstall(allocator: std.mem.Allocator, tld: []const u8) !void {
         .linux => {
             try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.network" });
             try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.netdev" });
-            try sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" });
-            try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" });
-            try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" });
+            // Best-effort: interface/services may not exist
+            sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
+            sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" }) catch {};
+            sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
         },
         .windows => {
             const ps_cmd = try std.fmt.allocPrint(allocator, "Get-DnsClientNrptRule | Where {{ $_.Namespace -eq '.{s}' }} | Remove-DnsClientNrptRule -Force", .{tld});

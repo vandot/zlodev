@@ -316,9 +316,9 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         },
         .windows => {
             std.debug.print("installing CA and generating certificate\n", .{});
-            const ps_cmd = try std.fmt.allocPrint(allocator, "Import-Certificate -FilePath '{s}' -CertStoreLocation Cert:\\LocalMachine\\Root", .{ca_path});
-            defer allocator.free(ps_cmd);
-            try sys.sudoCmd(allocator, &.{ "Powershell.exe", "-Command", ps_cmd });
+            const der_path = try std.fmt.allocPrint(allocator, "{s}\\zlodevCA.der", .{cert_dir});
+            defer allocator.free(der_path);
+            try sys.sudoCmd(allocator, &.{ "certutil", "-addstore", "Root", der_path });
         },
         else => {},
     }
@@ -360,7 +360,9 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         },
         .windows => {
             std.debug.print("uninstalling and removing CA\n", .{});
-            try sys.sudoCmd(allocator, &.{ "Powershell.exe", "-Command", "Get-ChildItem Cert:\\LocalMachine\\Root | Where-Object {$_.Subject -match 'zlodev'} | Remove-Item" });
+            sys.sudoCmd(allocator, &.{ "certutil", "-delstore", "Root", "zlodev" }) catch {
+                std.debug.print("failed to remove certificate from store\n", .{});
+            };
         },
         else => {},
     }

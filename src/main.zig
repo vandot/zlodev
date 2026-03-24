@@ -266,7 +266,7 @@ fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool,
                 try sys.sudoCmd(allocator, &.{ "sudo", "mkdir", "-p", "/etc/systemd/resolved.conf.d" });
                 try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", "/tmp/zlodev_resolved.conf", "/etc/systemd/resolved.conf.d/zlodev.conf" });
                 std.fs.cwd().deleteFile("/tmp/zlodev_resolved.conf") catch {};
-                try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" });
+                sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
             }
         },
         else => {},

@@ -99,6 +99,9 @@ jobs:
       - name: Set HostName to match LocalHostName
         run: sudo scutil --set HostName "$(scutil --get LocalHostName)"
 
+      - name: Allow keychain trust changes without GUI
+        run: sudo security authorizationdb write com.apple.trust-settings.admin allow
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
