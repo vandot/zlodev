@@ -126,7 +126,7 @@ test "install and verify" {
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (!(Get-DnsClientNrptRule | Where { $_.Namespace -eq '.lo' })) { exit 1 }" });
-            try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", "zlodev" });
+            try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", "dev.lo CA" });
         },
         else => {},
     }
@@ -159,7 +159,7 @@ test "uninstall and verify" {
         .windows => {
             try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (Get-DnsClientNrptRule | Where { $_.Namespace -eq '.lo' }) { exit 1 }" });
             // certutil -verifystore should fail when cert is removed
-            const term_w = try runCmd(&.{ "certutil", "-verifystore", "Root", "zlodev" });
+            const term_w = try runCmd(&.{ "certutil", "-verifystore", "Root", "dev.lo CA" });
             try testing.expect(!std.meta.eql(term_w, std.process.Child.Term{ .Exited = 0 }));
         },
         else => {},
@@ -169,6 +169,9 @@ test "uninstall and verify" {
 // --- Local mode (hostname.local) ---
 
 test "install --local and verify" {
+    if (getEnvOwned("ZLODEV_TEST_LOCAL")) |val| {
+        testing.allocator.free(val);
+    } else return;
     var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var domain_buf: [512]u8 = undefined;
@@ -198,6 +201,9 @@ test "install --local and verify" {
 }
 
 test "install --local -f succeeds when already installed" {
+    if (getEnvOwned("ZLODEV_TEST_LOCAL")) |val| {
+        testing.allocator.free(val);
+    } else return;
     var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var domain_buf: [512]u8 = undefined;
@@ -208,6 +214,9 @@ test "install --local -f succeeds when already installed" {
 }
 
 test "uninstall --local and verify" {
+    if (getEnvOwned("ZLODEV_TEST_LOCAL")) |val| {
+        testing.allocator.free(val);
+    } else return;
     var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var domain_buf: [512]u8 = undefined;
