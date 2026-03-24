@@ -326,8 +326,8 @@ pub fn systemProbe() struct { ip: []const u8, port: u16 } {
 pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []const u8) !void {
     switch (builtin.os.tag) {
         .macos => {
-            // Create /etc/resolver directory if needed
-            std.fs.makeDirAbsolute("/etc/resolver") catch {};
+            // Create /etc/resolver directory if needed (requires sudo)
+            try sys.sudoCmd(allocator, &.{ "sudo", "mkdir", "-p", "/etc/resolver" });
             const text = try std.fmt.allocPrint(allocator, "nameserver {s}\nport {d}\n", .{ ip, port });
             defer allocator.free(text);
             const tmp_path = try sys.writeTmpFile(allocator, "dns_resolver", text);

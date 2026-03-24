@@ -275,11 +275,11 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cert_dir = try getCertPath(&path_buf, domain);
 
-    // Create directories
-    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base_dir = try getBasePath(&base_buf);
-    std.fs.makeDirAbsolute(base_dir) catch {};
-    std.fs.makeDirAbsolute(cert_dir) catch {};
+    // Create directories (recursively, in case intermediate dirs don't exist)
+    std.fs.makeDirAbsolute(cert_dir) catch {
+        // If single-level create failed, try creating the full path
+        std.fs.cwd().makePath(cert_dir) catch return error.CertCreateFailed;
+    };
 
     // Generate CA certificate and key
     const ca = try generateCA(allocator, domain, cert_dir);
@@ -376,11 +376,14 @@ fn removeFromKeychain(allocator: std.mem.Allocator, cert_dir: []const u8) void {
         std.debug.print("CA file path could not be determined, skipping keychain removal\n", .{});
         return;
     };
+    // Remove trust settings first (avoids GUI auth prompt from delete-certificate -t)
+    sys.sudoCmd(allocator, &.{ "sudo", "security", "remove-trusted-cert", "-d", ca_path }) catch {};
+    // Then delete the certificate itself
     const sha1 = getFingerprint(ca_path) catch {
         std.debug.print("CA file not found, skipping keychain removal\n", .{});
         return;
     };
-    sys.sudoCmd(allocator, &.{ "sudo", "security", "delete-certificate", "-t", "-Z", &sha1 }) catch {
+    sys.sudoCmd(allocator, &.{ "sudo", "security", "delete-certificate", "-Z", &sha1 }) catch {
         std.debug.print("failed to remove certificate from keychain\n", .{});
     };
 }

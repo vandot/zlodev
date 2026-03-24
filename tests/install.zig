@@ -32,32 +32,29 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
-fn getenv(comptime name: [:0]const u8) ?[]const u8 {
-    if (builtin.os.tag == .windows) {
-        const result = std.c.getenv(name);
-        if (result) |ptr| {
-            return std.mem.sliceTo(ptr, 0);
-        }
-        return null;
-    }
-    return std.posix.getenv(name);
+fn getEnvOwned(name: []const u8) ?[]const u8 {
+    return std.process.getEnvVarOwned(testing.allocator, name) catch return null;
 }
 
 fn getCertDir(buf: []u8, domain: []const u8) ![]const u8 {
     switch (builtin.os.tag) {
         .macos => {
-            const home = getenv("HOME") orelse return error.NoHomeDir;
+            const home = getEnvOwned("HOME") orelse return error.NoHomeDir;
+            defer testing.allocator.free(home);
             return std.fmt.bufPrint(buf, "{s}/Library/Application Support/zlodev/{s}", .{ home, domain });
         },
         .windows => {
-            const local = getenv("LocalAppData") orelse return error.NoLocalAppData;
+            const local = getEnvOwned("LocalAppData") orelse return error.NoLocalAppData;
+            defer testing.allocator.free(local);
             return std.fmt.bufPrint(buf, "{s}/zlodev/{s}", .{ local, domain });
         },
         else => {
-            if (getenv("XDG_DATA_HOME")) |xdg| {
+            if (getEnvOwned("XDG_DATA_HOME")) |xdg| {
+                defer testing.allocator.free(xdg);
                 return std.fmt.bufPrint(buf, "{s}/zlodev/{s}", .{ xdg, domain });
             }
-            const home = getenv("HOME") orelse return error.NoHomeDir;
+            const home = getEnvOwned("HOME") orelse return error.NoHomeDir;
+            defer testing.allocator.free(home);
             return std.fmt.bufPrint(buf, "{s}/.local/share/zlodev/{s}", .{ home, domain });
         },
     }
@@ -65,7 +62,8 @@ fn getCertDir(buf: []u8, domain: []const u8) ![]const u8 {
 
 fn getHostname(buf: *[hostname_max]u8) []const u8 {
     if (builtin.os.tag == .windows) {
-        const name = getenv("COMPUTERNAME") orelse return "localhost";
+        const name = getEnvOwned("COMPUTERNAME") orelse return "localhost";
+        defer testing.allocator.free(name);
         const len = @min(name.len, buf.len);
         @memcpy(buf[0..len], name[0..len]);
         return buf[0..len];
