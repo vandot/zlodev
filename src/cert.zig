@@ -358,7 +358,12 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         },
         .windows => {
             std.debug.print("uninstalling and removing CA\n", .{});
-            sys.sudoCmd(allocator, &.{ "certutil", "-delstore", "Root", "zlodev" }) catch {
+            const cn = std.fmt.allocPrint(allocator, "{s} CA", .{domain}) catch {
+                std.debug.print("failed to allocate CN string\n", .{});
+                return;
+            };
+            defer allocator.free(cn);
+            sys.sudoCmd(allocator, &.{ "certutil", "-delstore", "Root", cn }) catch {
                 std.debug.print("failed to remove certificate from store\n", .{});
             };
         },
