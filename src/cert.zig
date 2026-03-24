@@ -169,10 +169,11 @@ fn generateCA(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []cons
     try setNameEntry(name, c.NID_organizationName, "zlodev");
     try setNameEntry(name, c.NID_organizationalUnitName, "CA");
 
-    // CN = "{domain} CA"
+    // CN = "{domain} CA" (truncated to 64 bytes — X.509 CN limit)
     const cn = try allocPrintZ(allocator, "{s} CA", .{domain});
     defer allocator.free(cn);
-    try setNameEntry(name, c.NID_commonName, cn);
+    const cn_truncated = if (cn.len > 64) cn[0..64] else @as([]const u8, cn);
+    try setNameEntry(name, c.NID_commonName, cn_truncated);
 
     // Self-signed: issuer = subject
     if (c.X509_set_issuer_name(ca_cert, name) != 1) return error.CertCreateFailed;
@@ -238,7 +239,8 @@ fn generateDomainCert(allocator: std.mem.Allocator, domain: []const u8, ca_cert:
 
     const cn_z = try allocPrintZ(allocator, "{s}", .{domain});
     defer allocator.free(cn_z);
-    try setNameEntry(name, c.NID_commonName, cn_z);
+    const cn_z_truncated = if (cn_z.len > 64) cn_z[0..64] else @as([]const u8, cn_z);
+    try setNameEntry(name, c.NID_commonName, cn_z_truncated);
 
     // Issuer = CA subject
     const ca_subject = c.X509_get_subject_name(ca_cert) orelse return error.CertCreateFailed;
