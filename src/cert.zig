@@ -316,9 +316,7 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         },
         .windows => {
             std.debug.print("installing CA and generating certificate\n", .{});
-            const der_path = try std.fmt.allocPrint(allocator, "{s}\\zlodevCA.der", .{cert_dir});
-            defer allocator.free(der_path);
-            try sys.sudoCmd(allocator, &.{ "certutil", "-addstore", "Root", der_path });
+            try sys.sudoCmd(allocator, &.{ "certutil", "-addstore", "Root", ca_path });
         },
         else => {},
     }
@@ -378,9 +376,6 @@ fn removeFromKeychain(allocator: std.mem.Allocator, cert_dir: []const u8) void {
         std.debug.print("CA file path could not be determined, skipping keychain removal\n", .{});
         return;
     };
-    // Remove trust settings first (avoids GUI auth prompt from delete-certificate -t)
-    sys.sudoCmd(allocator, &.{ "sudo", "security", "remove-trusted-cert", "-d", ca_path }) catch {};
-    // Then delete the certificate itself
     const sha1 = getFingerprint(ca_path) catch {
         std.debug.print("CA file not found, skipping keychain removal\n", .{});
         return;
