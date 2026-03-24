@@ -174,7 +174,8 @@ test "install --local and verify" {
     var domain_buf: [512]u8 = undefined;
     const domain = try std.fmt.bufPrint(&domain_buf, "{s}.local", .{hostname});
     var cn_buf: [512]u8 = undefined;
-    const cn = try std.fmt.bufPrint(&cn_buf, "{s} CA", .{domain});
+    const cn_full = try std.fmt.bufPrint(&cn_buf, "{s} CA", .{domain});
+    const cn = if (cn_full.len > 64) cn_full[0..64] else cn_full;
 
     try runCmdExpectSuccess(&.{ binary_path, "install", "-l" });
     try verifyCertFiles(domain);
@@ -213,7 +214,8 @@ test "uninstall --local and verify" {
     var domain_buf: [512]u8 = undefined;
     const domain = try std.fmt.bufPrint(&domain_buf, "{s}.local", .{hostname});
     var cn_buf: [512]u8 = undefined;
-    const cn = try std.fmt.bufPrint(&cn_buf, "{s} CA", .{domain});
+    const cn_full = try std.fmt.bufPrint(&cn_buf, "{s} CA", .{domain});
+    const cn = if (cn_full.len > 64) cn_full[0..64] else cn_full;
 
     try runCmdExpectSuccess(&.{ binary_path, "uninstall", "-l" });
     try verifyCertDirRemoved(domain);
