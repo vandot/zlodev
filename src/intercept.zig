@@ -184,7 +184,7 @@ pub fn getDecision(slot: *PendingEntry) Decision {
     return @enumFromInt(val);
 }
 
-/// Accept all pending intercepted requests.
+/// Accept all pending intercepted entries (requests and responses).
 pub fn acceptAll() void {
     mutex.lock();
     defer mutex.unlock();

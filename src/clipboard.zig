@@ -107,3 +107,45 @@ pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     }
     return false;
 }
+
+// --- Unit Tests ---
+
+const testing = std.testing;
+
+test "containsIgnoreCase exact match" {
+    try testing.expect(containsIgnoreCase("hello", "hello"));
+}
+
+test "containsIgnoreCase substring" {
+    try testing.expect(containsIgnoreCase("hello world", "world"));
+    try testing.expect(containsIgnoreCase("hello world", "lo wo"));
+}
+
+test "containsIgnoreCase case insensitive" {
+    try testing.expect(containsIgnoreCase("Hello World", "hello"));
+    try testing.expect(containsIgnoreCase("hello", "HELLO"));
+    try testing.expect(containsIgnoreCase("Content-Type", "content-type"));
+}
+
+test "containsIgnoreCase no match" {
+    try testing.expect(!containsIgnoreCase("hello", "xyz"));
+    try testing.expect(!containsIgnoreCase("abc", "abcd"));
+}
+
+test "containsIgnoreCase needle longer than haystack" {
+    try testing.expect(!containsIgnoreCase("hi", "hello"));
+}
+
+test "containsIgnoreCase empty needle" {
+    // Empty needle — end = haystack.len + 1, first iteration matches
+    try testing.expect(containsIgnoreCase("hello", ""));
+}
+
+test "containsIgnoreCase both empty" {
+    try testing.expect(containsIgnoreCase("", ""));
+}
+
+test "containsIgnoreCase single char" {
+    try testing.expect(containsIgnoreCase("abc", "B"));
+    try testing.expect(!containsIgnoreCase("abc", "D"));
+}

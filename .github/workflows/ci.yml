@@ -8,11 +8,13 @@ on:
       - 'src/**'
       - 'build.zig'
       - 'build.zig.zon'
+      - 'tests/**'
   pull_request:
     paths:
       - 'src/**'
       - 'build.zig'
       - 'build.zig.zon'
+      - 'tests/**'
 
 jobs:
   build-and-test-linux:
@@ -43,6 +45,15 @@ jobs:
       - name: Test requests
         run: zig test src/requests.zig
 
+      - name: Test search
+        run: zig test src/search.zig
+
+      - name: Test clipboard
+        run: zig test src/clipboard.zig
+
+      - name: Test install/uninstall
+        run: zig test tests/install.zig
+
   build-and-test-windows:
     runs-on: windows-latest
     steps:
@@ -70,6 +81,15 @@ jobs:
 
       - name: Test requests
         run: zig test src/requests.zig
+
+      - name: Test search
+        run: zig test src/search.zig
+
+      - name: Test clipboard
+        run: zig test src/clipboard.zig
+
+      - name: Test install/uninstall
+        run: zig test tests/install.zig
 
   build-and-test-macos:
     runs-on: macos-latest
@@ -99,3 +119,11 @@ jobs:
       - name: Test requests
         run: zig test src/requests.zig
 
+      - name: Test search
+        run: zig test src/search.zig
+
+      - name: Test clipboard
+        run: zig test src/clipboard.zig
+
+      - name: Test install/uninstall
+        run: zig test tests/install.zig
