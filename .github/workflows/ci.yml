@@ -96,6 +96,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set HostName to match LocalHostName
+        run: sudo scutil --set HostName "$(scutil --get LocalHostName)"
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:

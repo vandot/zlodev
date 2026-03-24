@@ -7,6 +7,8 @@ const binary_path = switch (builtin.os.tag) {
     else => "zig-out/bin/zlodev",
 };
 
+const hostname_max = if (builtin.os.tag == .windows) 256 else std.posix.HOST_NAME_MAX;
+
 fn runCmd(argv: []const []const u8) !std.process.Child.Term {
     var child = std.process.Child.init(argv, testing.allocator);
     child.stdin_behavior = .Ignore;
@@ -30,29 +32,45 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
+fn getenv(comptime name: [:0]const u8) ?[]const u8 {
+    if (builtin.os.tag == .windows) {
+        const result = std.c.getenv(name);
+        if (result) |ptr| {
+            return std.mem.sliceTo(ptr, 0);
+        }
+        return null;
+    }
+    return std.posix.getenv(name);
+}
+
 fn getCertDir(buf: []u8, domain: []const u8) ![]const u8 {
     switch (builtin.os.tag) {
         .macos => {
-            const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+            const home = getenv("HOME") orelse return error.NoHomeDir;
             return std.fmt.bufPrint(buf, "{s}/Library/Application Support/zlodev/{s}", .{ home, domain });
         },
         .windows => {
-            const local = std.posix.getenv("LocalAppData") orelse return error.NoLocalAppData;
+            const local = getenv("LocalAppData") orelse return error.NoLocalAppData;
             return std.fmt.bufPrint(buf, "{s}/zlodev/{s}", .{ local, domain });
         },
         else => {
-            if (std.posix.getenv("XDG_DATA_HOME")) |xdg| {
+            if (getenv("XDG_DATA_HOME")) |xdg| {
                 return std.fmt.bufPrint(buf, "{s}/zlodev/{s}", .{ xdg, domain });
             }
-            const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+            const home = getenv("HOME") orelse return error.NoHomeDir;
             return std.fmt.bufPrint(buf, "{s}/.local/share/zlodev/{s}", .{ home, domain });
         },
     }
 }
 
-fn getHostname(buf: *[std.posix.HOST_NAME_MAX]u8) []const u8 {
+fn getHostname(buf: *[hostname_max]u8) []const u8 {
+    if (builtin.os.tag == .windows) {
+        const name = getenv("COMPUTERNAME") orelse return "localhost";
+        const len = @min(name.len, buf.len);
+        @memcpy(buf[0..len], name[0..len]);
+        return buf[0..len];
+    }
     const hostname = std.posix.gethostname(buf) catch return "unknown";
-    // Strip .local suffix if present (macOS reports FQDN)
     if (std.mem.endsWith(u8, hostname, ".local")) {
         return hostname[0 .. hostname.len - 6];
     }
@@ -151,7 +169,7 @@ test "uninstall and verify" {
 // --- Local mode (hostname.local) ---
 
 test "install --local and verify" {
-    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var domain_buf: [512]u8 = undefined;
     const domain = try std.fmt.bufPrint(&domain_buf, "{s}.local", .{hostname});
@@ -161,7 +179,6 @@ test "install --local and verify" {
     try runCmdExpectSuccess(&.{ binary_path, "install", "-l" });
     try verifyCertFiles(domain);
 
-    // Local mode: no DNS installed (mDNS handles it)
     switch (builtin.os.tag) {
         .macos => {
             try runCmdExpectSuccess(&.{ "security", "find-certificate", "-c", cn, "/Library/Keychains/System.keychain" });
@@ -181,7 +198,7 @@ test "install --local and verify" {
 }
 
 test "install --local -f succeeds when already installed" {
-    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var domain_buf: [512]u8 = undefined;
     const domain = try std.fmt.bufPrint(&domain_buf, "{s}.local", .{hostname});
@@ -191,7 +208,7 @@ test "install --local -f succeeds when already installed" {
 }
 
 test "uninstall --local and verify" {
-    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var domain_buf: [512]u8 = undefined;
     const domain = try std.fmt.bufPrint(&domain_buf, "{s}.local", .{hostname});
