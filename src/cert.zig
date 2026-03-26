@@ -450,34 +450,37 @@ fn removeFromGitCaBundle(allocator: std.mem.Allocator) void {
     std.debug.print("CA removed from Git CA bundle\n", .{});
 }
 
-/// Find the Git CA bundle path using `git config --system http.sslCAInfo`.
+/// Find the Git CA bundle path. Tries `git config` first, then common install paths.
 fn getGitCaBundlePath(allocator: std.mem.Allocator) ?[]const u8 {
-    const output = sys.runCmdOutput(allocator, &.{ "git", "config", "--system", "http.sslCAInfo" }) orelse
-        sys.runCmdOutput(allocator, &.{ "git", "config", "--global", "http.sslCAInfo" }) orelse
-        return null;
-    // Trim trailing whitespace/newlines
-    const trimmed = std.mem.trim(u8, output, " \t\r\n");
-    if (trimmed.len == 0) {
-        allocator.free(output);
-        return null;
-    }
-    // If the trimmed slice is the same as the start, we can just resize
-    if (trimmed.ptr == output.ptr and trimmed.len < output.len) {
-        // Return the original allocation but the caller only uses trimmed.len chars
-        // For simplicity, dupe the trimmed portion
-        const result = allocator.dupe(u8, trimmed) catch {
-            allocator.free(output);
-            return null;
-        };
-        allocator.free(output);
-        return result;
-    }
-    const result = allocator.dupe(u8, trimmed) catch {
-        allocator.free(output);
-        return null;
+    // Try git config
+    const configs = [_][]const []const u8{
+        &.{ "git", "config", "--system", "http.sslCAInfo" },
+        &.{ "git", "config", "--global", "http.sslCAInfo" },
     };
-    allocator.free(output);
-    return result;
+    for (configs) |argv| {
+        if (sys.runCmdOutput(allocator, argv)) |output| {
+            const trimmed = std.mem.trim(u8, output, " \t\r\n");
+            if (trimmed.len > 0) {
+                const result = allocator.dupe(u8, trimmed) catch {
+                    allocator.free(output);
+                    continue;
+                };
+                allocator.free(output);
+                return result;
+            }
+            allocator.free(output);
+        }
+    }
+    // Fallback: check common Git for Windows CA bundle locations
+    const fallback_paths = [_][]const u8{
+        "C:\\Program Files\\Git\\mingw64\\etc\\ssl\\certs\\ca-bundle.crt",
+        "C:\\Program Files (x86)\\Git\\mingw64\\etc\\ssl\\certs\\ca-bundle.crt",
+    };
+    for (fallback_paths) |path| {
+        std.fs.accessAbsolute(path, .{}) catch continue;
+        return allocator.dupe(u8, path) catch return null;
+    }
+    return null;
 }
 
 fn getFingerprint(ca_path: []const u8) ![40]u8 {

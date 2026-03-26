@@ -483,8 +483,8 @@ fn doUninstall(allocator: std.mem.Allocator, full_domain: []const u8, local: boo
                 const avahi = std.mem.trim(u8, avahi_result, "\n\r ");
 
                 if (!std.mem.eql(u8, avahi, "active")) {
-                    try sys.sudoCmd(allocator, &.{ "sudo", "rm", "/etc/systemd/resolved.conf.d/zlodev.conf" });
-                    try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" });
+                    sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/resolved.conf.d/zlodev.conf" }) catch {};
+                    sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
                 }
             }
         },
