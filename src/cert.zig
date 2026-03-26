@@ -319,6 +319,8 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         .windows => {
             std.debug.print("installing CA and generating certificate\n", .{});
             try sys.sudoCmd(allocator, &.{ "certutil", "-addstore", "Root", ca_path });
+            // Also add CA to Git's OpenSSL CA bundle so tools like Git's curl can verify certs
+            appendToGitCaBundle(allocator, ca_path);
         },
         else => {},
     }
@@ -368,6 +370,7 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
             sys.sudoCmd(allocator, &.{ "certutil", "-delstore", "Root", cn }) catch {
                 std.debug.print("failed to remove certificate from store\n", .{});
             };
+            removeFromGitCaBundle(allocator);
         },
         else => {},
     }
@@ -390,6 +393,91 @@ fn removeFromKeychain(allocator: std.mem.Allocator, cert_dir: []const u8) void {
     sys.sudoCmd(allocator, &.{ "sudo", "security", "delete-certificate", "-Z", &sha1 }) catch {
         std.debug.print("failed to remove certificate from keychain\n", .{});
     };
+}
+
+const ca_bundle_marker_begin = "\n# BEGIN zlodev CA\n";
+const ca_bundle_marker_end = "# END zlodev CA\n";
+
+/// Append the zlodev CA PEM to Git's OpenSSL CA bundle so tools using
+/// OpenSSL (e.g. Git's bundled curl) can verify zlodev certificates.
+fn appendToGitCaBundle(allocator: std.mem.Allocator, ca_pem_path: []const u8) void {
+    const bundle_path = getGitCaBundlePath(allocator) orelse return;
+    defer allocator.free(bundle_path);
+
+    // Read CA PEM content
+    const ca_content = std.fs.cwd().readFileAlloc(allocator, ca_pem_path, 8192) catch {
+        std.debug.print("warning: could not read CA file for Git bundle\n", .{});
+        return;
+    };
+    defer allocator.free(ca_content);
+
+    // Check if already present
+    const bundle_content = std.fs.cwd().readFileAlloc(allocator, bundle_path, 4 * 1024 * 1024) catch {
+        std.debug.print("warning: could not read Git CA bundle\n", .{});
+        return;
+    };
+    defer allocator.free(bundle_content);
+    if (std.mem.indexOf(u8, bundle_content, "# BEGIN zlodev CA") != null) return;
+
+    // Append with markers
+    const file = std.fs.cwd().openFile(bundle_path, .{ .mode = .write_only }) catch return;
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(ca_bundle_marker_begin) catch return;
+    file.writeAll(ca_content) catch return;
+    file.writeAll(ca_bundle_marker_end) catch return;
+    std.debug.print("CA also added to Git CA bundle at {s}\n", .{bundle_path});
+}
+
+/// Remove the zlodev CA from Git's OpenSSL CA bundle.
+fn removeFromGitCaBundle(allocator: std.mem.Allocator) void {
+    const bundle_path = getGitCaBundlePath(allocator) orelse return;
+    defer allocator.free(bundle_path);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, bundle_path, 4 * 1024 * 1024) catch return;
+    defer allocator.free(content);
+
+    const begin = std.mem.indexOf(u8, content, ca_bundle_marker_begin) orelse return;
+    const after_begin = begin + ca_bundle_marker_begin.len;
+    const end_marker = std.mem.indexOfPos(u8, content, after_begin, ca_bundle_marker_end) orelse return;
+    const end = end_marker + ca_bundle_marker_end.len;
+
+    // Write content without the marked section
+    const file = std.fs.createFileAbsolute(bundle_path, .{}) catch return;
+    defer file.close();
+    file.writeAll(content[0..begin]) catch return;
+    file.writeAll(content[end..]) catch return;
+    std.debug.print("CA removed from Git CA bundle\n", .{});
+}
+
+/// Find the Git CA bundle path using `git config --system http.sslCAInfo`.
+fn getGitCaBundlePath(allocator: std.mem.Allocator) ?[]const u8 {
+    const output = sys.runCmdOutput(allocator, &.{ "git", "config", "--system", "http.sslCAInfo" }) orelse
+        sys.runCmdOutput(allocator, &.{ "git", "config", "--global", "http.sslCAInfo" }) orelse
+        return null;
+    // Trim trailing whitespace/newlines
+    const trimmed = std.mem.trim(u8, output, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(output);
+        return null;
+    }
+    // If the trimmed slice is the same as the start, we can just resize
+    if (trimmed.ptr == output.ptr and trimmed.len < output.len) {
+        // Return the original allocation but the caller only uses trimmed.len chars
+        // For simplicity, dupe the trimmed portion
+        const result = allocator.dupe(u8, trimmed) catch {
+            allocator.free(output);
+            return null;
+        };
+        allocator.free(output);
+        return result;
+    }
+    const result = allocator.dupe(u8, trimmed) catch {
+        allocator.free(output);
+        return null;
+    };
+    allocator.free(output);
+    return result;
 }
 
 fn getFingerprint(ca_path: []const u8) ![40]u8 {

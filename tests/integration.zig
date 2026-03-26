@@ -77,8 +77,8 @@ fn pollUrl(url: []const u8, timeout_ms: u64, insecure: bool) !void {
 test "windows: health endpoint" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
-    // Install
-    try runCmdExpectSuccess(&.{ binary_path, "install" });
+    // Install (force to handle leftover state from previous runs)
+    try runCmdExpectSuccess(&.{ binary_path, "install", "-f" });
     defer {
         _ = runCmd(&.{ binary_path, "uninstall" }) catch {};
     }
@@ -107,8 +107,8 @@ test "local mode: mDNS smoke test" {
     defer killProcess(&httpbin);
     try pollUrl("http://localhost:9000/get", 60_000, false);
 
-    // Install --local
-    try runCmdExpectSuccess(&.{ binary_path, "install", "-l" });
+    // Install --local (force to handle leftover state from previous runs)
+    try runCmdExpectSuccess(&.{ binary_path, "install", "-l", "-f" });
     defer {
         _ = runCmd(&.{ binary_path, "uninstall", "-l" }) catch {};
     }
@@ -159,8 +159,8 @@ test "dev.lo: full integration" {
     try pollUrl("http://localhost:9001/api/get", 60_000, false);
     try pollUrl("http://localhost:9002/get", 60_000, false);
 
-    // Install
-    try runCmdExpectSuccess(&.{ binary_path, "install" });
+    // Install (force to handle leftover state from previous runs)
+    try runCmdExpectSuccess(&.{ binary_path, "install", "-f" });
     defer {
         _ = runCmd(&.{ binary_path, "uninstall" }) catch {};
     }

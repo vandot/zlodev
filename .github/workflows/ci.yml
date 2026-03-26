@@ -155,9 +155,7 @@ jobs:
           .venv/bin/pip install httpbin==0.10.2 gunicorn==23.0.0
 
       - name: Setup capabilities
-        run: |
-          sudo apt-get install -y libcap2-bin
-          sudo setcap 'cap_net_bind_service=+ep' ./zig-out/bin/zlodev
+        run: sudo setcap 'cap_net_bind_service=+ep' ./zig-out/bin/zlodev
 
       - name: Configure systemd-resolved as system resolver
         run: |
@@ -214,6 +212,9 @@ jobs:
 
       - name: Build
         run: zig build
+
+      - name: Clear HTTP port 80 reservation
+        run: netsh http delete urlacl url=http://+:80/
 
       - name: Run integration tests
         timeout-minutes: 10
