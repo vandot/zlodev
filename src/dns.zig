@@ -373,8 +373,10 @@ pub fn uninstall(allocator: std.mem.Allocator, tld: []const u8) !void {
         .linux => {
             try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.network" });
             try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.netdev" });
-            // Best-effort: interface/services may not exist
-            sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
+            // Only delete interface if it exists
+            if (std.fs.accessAbsolute("/sys/class/net/zlodev0", .{})) |_| {
+                sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
+            } else |_| {}
             sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" }) catch {};
             sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
         },

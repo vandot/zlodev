@@ -159,6 +159,11 @@ jobs:
           sudo apt-get install -y libcap2-bin
           sudo setcap 'cap_net_bind_service=+ep' ./zig-out/bin/zlodev
 
+      - name: Configure systemd-resolved as system resolver
+        run: |
+          sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+          sudo systemctl restart systemd-resolved
+
       - name: Run integration tests
         timeout-minutes: 10
         run: |

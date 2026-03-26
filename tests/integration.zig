@@ -52,15 +52,17 @@ fn getHostname(buf: *[hostname_max]u8) []const u8 {
     return hostname;
 }
 
+const null_dev = if (builtin.os.tag == .windows) "NUL" else "/dev/null";
+
 /// Poll a URL until it returns HTTP 200, or timeout.
 /// Set insecure=true for HTTPS polling before trust store may be visible.
 fn pollUrl(url: []const u8, timeout_ms: u64, insecure: bool) !void {
     const start = std.time.milliTimestamp();
     while (true) {
         const term = if (insecure)
-            runCmd(&.{ "curl", "-sf", "--insecure", "--max-time", "2", "-o", "/dev/null", url })
+            runCmd(&.{ "curl", "-sf", "--insecure", "--max-time", "2", "-o", null_dev, url })
         else
-            runCmd(&.{ "curl", "-sf", "--max-time", "2", "-o", "/dev/null", url });
+            runCmd(&.{ "curl", "-sf", "--max-time", "2", "-o", null_dev, url });
         if (term) |t| {
             if (std.meta.eql(t, std.process.Child.Term{ .Exited = 0 })) return;
         } else |_| {}
