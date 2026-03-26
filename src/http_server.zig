@@ -126,6 +126,9 @@ fn handleRequest(stream: std.net.Stream, domain: []const u8, ca_pem_path: []cons
         serveFile(stream, ca_pem_path, "application/x-pem-file", "zlodevCA.pem") catch {
             sendError(stream, "500 Internal Server Error");
         };
+    } else if (std.mem.eql(u8, path, "/health")) {
+        const health_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        stream.writeAll(health_response) catch return;
     } else {
         // Redirect to HTTPS
         var resp_buf: [1024]u8 = undefined;

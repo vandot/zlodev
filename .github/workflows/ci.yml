@@ -9,12 +9,14 @@ on:
       - 'build.zig'
       - 'build.zig.zon'
       - 'tests/**'
+      - '.github/workflows/**'
   pull_request:
     paths:
       - 'src/**'
       - 'build.zig'
       - 'build.zig.zon'
       - 'tests/**'
+      - '.github/workflows/**'
 
 jobs:
   build-and-test-linux:
@@ -127,3 +129,87 @@ jobs:
 
       - name: Test install/uninstall
         run: zig test tests/install.zig
+
+  integration-test-linux:
+    needs: build-and-test-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Build
+        run: zig build
+
+      - name: Install hurl
+        run: |
+          curl -sSL https://github.com/Orange-OpenSource/hurl/releases/download/6.0.0/hurl_6.0.0_amd64.deb -o /tmp/hurl.deb
+          sudo dpkg -i /tmp/hurl.deb
+
+      - name: Install httpbin
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install httpbin==0.10.2 gunicorn==23.0.0
+
+      - name: Setup capabilities
+        run: |
+          sudo apt-get install -y libcap2-bin
+          sudo setcap 'cap_net_bind_service=+ep' ./zig-out/bin/zlodev
+
+      - name: Run integration tests
+        timeout-minutes: 10
+        run: |
+          export PATH="$(pwd)/.venv/bin:$PATH"
+          zig test tests/integration.zig
+
+  integration-test-macos:
+    needs: build-and-test-macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set HostName to match LocalHostName
+        run: sudo scutil --set HostName "$(scutil --get LocalHostName)"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Build
+        run: zig build
+
+      - name: Install hurl
+        run: brew install hurl
+
+      - name: Install httpbin
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install httpbin==0.10.2 gunicorn==23.0.0
+
+      - name: Run integration tests
+        timeout-minutes: 10
+        run: |
+          export PATH="$(pwd)/.venv/bin:$PATH"
+          zig test tests/integration.zig
+
+  integration-test-windows:
+    needs: build-and-test-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Build
+        run: zig build
+
+      - name: Run integration tests
+        timeout-minutes: 10
+        run: zig test tests/integration.zig
