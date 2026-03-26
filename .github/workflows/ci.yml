@@ -166,7 +166,23 @@ jobs:
         timeout-minutes: 10
         run: |
           export PATH="$(pwd)/.venv/bin:$PATH"
+          # Enable core dumps for segfault diagnosis
+          ulimit -c unlimited
+          sudo sysctl -w kernel.core_pattern=$(pwd)/core.%p
           zig test tests/integration.zig
+
+      - name: Analyze core dump on failure
+        if: failure()
+        run: |
+          CORE=$(find . -maxdepth 1 -name 'core.*' -type f 2>/dev/null | head -1)
+          if [ -n "$CORE" ]; then
+            sudo apt-get install -y gdb
+            gdb -batch -ex "thread apply all bt full" ./zig-out/bin/zlodev "$CORE"
+          else
+            echo "No core dump found — segfault may be in a child process"
+            # Try looking system-wide
+            find /tmp -name 'core.*' 2>/dev/null | head -5
+          fi
 
   integration-test-macos:
     needs: build-and-test-macos
@@ -213,8 +229,15 @@ jobs:
       - name: Build
         run: zig build
 
-      - name: Clear HTTP port 80 reservation
-        run: netsh http delete urlacl url=http://+:80/
+      - name: Free port 80
+        shell: pwsh
+        run: |
+          # Stop services that may hold port 80
+          Stop-Service W3SVC -ErrorAction SilentlyContinue
+          Stop-Service WAS -ErrorAction SilentlyContinue
+          netsh http delete urlacl url=http://+:80/ 2>$null
+          # Show what's using port 80 for diagnostics
+          netstat -ano | Select-String ":80 " | Select-String "LISTENING"
 
       - name: Run integration tests
         timeout-minutes: 10
