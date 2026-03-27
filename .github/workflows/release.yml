@@ -42,7 +42,7 @@ jobs:
       - name: Package
         run: |
           if [ "${{ matrix.target }}" = "x86_64-windows" ]; then
-            zip ${{ matrix.artifact }}.zip zig-out/bin/zlodev.exe
+            cd zig-out/bin && zip ../../${{ matrix.artifact }}.zip zlodev.exe
           else
             tar -czf ${{ matrix.artifact }}.tar.gz -C zig-out/bin zlodev
           fi
