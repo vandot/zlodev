@@ -19,7 +19,7 @@ on:
       - '.github/workflows/**'
 
 jobs:
-  build-and-test-linux:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,97 +52,6 @@ jobs:
 
       - name: Test install/uninstall
         run: zig test tests/install.zig
-
-  build-and-test-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.1
-
-      - name: Build
-        run: zig build
-
-      - name: Test dns
-        run: zig test src/dns.zig
-
-      - name: Test requests + har
-        run: zig test src/har.zig
-
-      - name: Test proxy
-        run: zig test src/proxy.zig
-
-      - name: Test intercept
-        run: zig test src/intercept.zig
-
-      - name: Test search
-        run: zig test src/search.zig
-
-      - name: Test clipboard
-        run: zig test src/clipboard.zig
-
-      - name: Test install/uninstall
-        run: zig test tests/install.zig
-
-  build-and-test-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set HostName to match LocalHostName
-        run: sudo scutil --set HostName "$(scutil --get LocalHostName)"
-
-      - name: Debug hostname
-        run: |
-          echo "LocalHostName: $(scutil --get LocalHostName)"
-          echo "HostName: $(scutil --get HostName)"
-          echo "gethostname: $(hostname)"
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.1
-
-      - name: Build
-        run: zig build
-
-      - name: Test dns
-        run: zig test src/dns.zig
-
-      - name: Test requests + har
-        run: zig test src/har.zig
-
-      - name: Test proxy
-        run: zig test src/proxy.zig
-
-      - name: Test intercept
-        run: zig test src/intercept.zig
-
-      - name: Test search
-        run: zig test src/search.zig
-
-      - name: Test clipboard
-        run: zig test src/clipboard.zig
-
-      - name: Test install/uninstall
-        run: zig test tests/install.zig
-
-  integration-test-linux:
-    needs: build-and-test-linux
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.1
-
-      - name: Build
-        run: zig build
 
       - name: Install httpbin
         run: |
@@ -168,8 +77,7 @@ jobs:
           export PATH="$(pwd)/.venv/bin:$PATH"
           zig test tests/integration.zig
 
-  integration-test-macos:
-    needs: build-and-test-macos
+  macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -185,6 +93,27 @@ jobs:
       - name: Build
         run: zig build
 
+      - name: Test dns
+        run: zig test src/dns.zig
+
+      - name: Test requests + har
+        run: zig test src/har.zig
+
+      - name: Test proxy
+        run: zig test src/proxy.zig
+
+      - name: Test intercept
+        run: zig test src/intercept.zig
+
+      - name: Test search
+        run: zig test src/search.zig
+
+      - name: Test clipboard
+        run: zig test src/clipboard.zig
+
+      - name: Test install/uninstall
+        run: zig test tests/install.zig
+
       - name: Install hurl
         run: brew install hurl
 
@@ -199,8 +128,7 @@ jobs:
           export PATH="$(pwd)/.venv/bin:$PATH"
           zig test tests/integration.zig
 
-  integration-test-windows:
-    needs: build-and-test-windows
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -212,6 +140,27 @@ jobs:
 
       - name: Build
         run: zig build
+
+      - name: Test dns
+        run: zig test src/dns.zig
+
+      - name: Test requests + har
+        run: zig test src/har.zig
+
+      - name: Test proxy
+        run: zig test src/proxy.zig
+
+      - name: Test intercept
+        run: zig test src/intercept.zig
+
+      - name: Test search
+        run: zig test src/search.zig
+
+      - name: Test clipboard
+        run: zig test src/clipboard.zig
+
+      - name: Test install/uninstall
+        run: zig test tests/install.zig
 
       - name: Free port 80
         shell: pwsh
