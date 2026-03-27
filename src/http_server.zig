@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const log = @import("log.zig");
 const shutdown = @import("shutdown.zig");
+const compat = @import("compat.zig");
 
 pub fn serve(bind_addr: []const u8, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {
     const address = std.net.Address.parseIp(bind_addr, 80) catch |e| {
@@ -47,9 +48,10 @@ pub fn serve(bind_addr: []const u8, domain: []const u8, ca_pem_path: []const u8,
         };
         consecutive_failures = 0;
 
-        pool.spawn(handleRequest, .{ conn.stream, domain, ca_pem_path, ca_der_path }) catch |e| {
+        const stream = compat.SocketStream{ .handle = conn.stream.handle };
+        pool.spawn(handleRequest, .{ stream, domain, ca_pem_path, ca_der_path }) catch |e| {
             log.err("component=http op=pool_spawn error={any}", .{e});
-            conn.stream.close();
+            stream.close();
         };
     }
 }
@@ -82,7 +84,7 @@ fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return true;
 }
 
-fn handleRequest(stream: std.net.Stream, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {
+fn handleRequest(stream: compat.SocketStream, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {
     defer stream.close();
 
     // Read request
@@ -126,6 +128,9 @@ fn handleRequest(stream: std.net.Stream, domain: []const u8, ca_pem_path: []cons
         serveFile(stream, ca_pem_path, "application/x-pem-file", "zlodevCA.pem") catch {
             sendError(stream, "500 Internal Server Error");
         };
+    } else if (std.mem.eql(u8, path, "/health")) {
+        const health_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        stream.writeAll(health_response) catch return;
     } else {
         // Redirect to HTTPS
         var resp_buf: [1024]u8 = undefined;
@@ -139,7 +144,7 @@ fn handleRequest(stream: std.net.Stream, domain: []const u8, ca_pem_path: []cons
     }
 }
 
-fn serveCaPage(stream: std.net.Stream, domain: []const u8, platform: Platform) void {
+fn serveCaPage(stream: compat.SocketStream, domain: []const u8, platform: Platform) void {
     const page = caPage(domain, platform);
     var header_buf: [256]u8 = undefined;
     const header = std.fmt.bufPrint(&header_buf,
@@ -247,7 +252,7 @@ const ca_page_desktop = ca_page_style ++
     \\</div></body></html>
 ;
 
-fn serveFile(stream: std.net.Stream, file_path: []const u8, content_type: []const u8, filename: []const u8) !void {
+fn serveFile(stream: compat.SocketStream, file_path: []const u8, content_type: []const u8, filename: []const u8) !void {
     const file = try std.fs.openFileAbsolute(file_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(std.heap.page_allocator, 1024 * 1024);
@@ -265,7 +270,7 @@ fn serveFile(stream: std.net.Stream, file_path: []const u8, content_type: []cons
     try stream.writeAll(content);
 }
 
-fn sendError(stream: std.net.Stream, status: []const u8) void {
+fn sendError(stream: compat.SocketStream, status: []const u8) void {
     var buf: [256]u8 = undefined;
     const response = std.fmt.bufPrint(&buf,
         "HTTP/1.1 {s}\r\nContent-Length: 0\r\n\r\n", .{status}) catch return;

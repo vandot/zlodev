@@ -148,7 +148,7 @@ pub fn finishEntry(idx: usize, status: u16, duration_ms: u64, resp_headers: []co
     const rsb_len = @min(resp_body.len, max_body_len);
     @memcpy(e.resp_body[0..rsb_len], resp_body[0..rsb_len]);
     e.resp_body_len = @intCast(rsb_len);
-    e.pinned = false;
+    if (!e.starred) e.pinned = false;
 }
 
 /// Finish a response-intercepted entry. Response data is already in the entry (and may have been edited).
@@ -158,7 +158,7 @@ pub fn finishResponseIntercept(idx: usize, duration_ms: u64) void {
     defer mutex.unlock();
     const e = &entries_backing[idx];
     e.duration_ms = duration_ms;
-    e.pinned = false;
+    if (!e.starred) e.pinned = false;
 }
 
 /// Clear the pinned flag on an entry.
@@ -595,4 +595,111 @@ test "toggleStar unstar keeps pinned if intercepted" {
     try testing.expect(e.pinned);
 
     unpin(idx);
+}
+
+test "finishEntry preserves pin when starred" {
+    clearAll();
+    const idx = pushAndPin(makeEntry("POST", "/api", 0)) orelse return error.TestUnexpectedResult;
+    const e = getByBackingIndex(idx);
+
+    // Star the entry while intercepted
+    toggleStar(idx);
+    try testing.expect(e.starred);
+    try testing.expect(e.pinned);
+
+    // Finish — should stay pinned because starred
+    finishEntry(idx, 200, 50, "Content-Type: text/plain", "ok");
+    try testing.expect(e.pinned);
+    try testing.expect(e.starred);
+    try testing.expectEqual(@as(u16, 200), e.status);
+}
+
+test "finishEntry unpins when not starred" {
+    clearAll();
+    const idx = pushAndPin(makeEntry("POST", "/api", 0)) orelse return error.TestUnexpectedResult;
+    const e = getByBackingIndex(idx);
+    try testing.expect(!e.starred);
+    try testing.expect(e.pinned);
+
+    finishEntry(idx, 200, 50, "", "");
+    try testing.expect(!e.pinned);
+}
+
+test "finishResponseIntercept updates duration and unpins" {
+    clearAll();
+    const idx = pushAndPin(makeEntry("GET", "/resp", 200)) orelse return error.TestUnexpectedResult;
+    const e = getByBackingIndex(idx);
+    e.resp_intercepted = true;
+
+    // Set some response data that should be preserved
+    const resp_body = "response body";
+    @memcpy(e.resp_body[0..resp_body.len], resp_body);
+    e.resp_body_len = @intCast(resp_body.len);
+
+    finishResponseIntercept(idx, 123);
+    try testing.expectEqual(@as(u64, 123), e.duration_ms);
+    try testing.expect(!e.pinned);
+    // Response data preserved
+    try testing.expectEqualStrings(resp_body, e.getRespBody());
+}
+
+test "finishResponseIntercept preserves pin when starred" {
+    clearAll();
+    const idx = pushAndPin(makeEntry("GET", "/resp-star", 200)) orelse return error.TestUnexpectedResult;
+    const e = getByBackingIndex(idx);
+    e.resp_intercepted = true;
+
+    toggleStar(idx);
+    try testing.expect(e.starred);
+
+    finishResponseIntercept(idx, 99);
+    try testing.expect(e.pinned); // stays pinned because starred
+    try testing.expectEqual(@as(u64, 99), e.duration_ms);
+}
+
+test "resp_intercepted flag" {
+    clearAll();
+    var e = makeEntry("GET", "/test", 200);
+    try testing.expect(!e.resp_intercepted);
+
+    e.resp_intercepted = true;
+    push(e);
+
+    const stored = getOne(0) orelse return error.TestUnexpectedResult;
+    try testing.expect(stored.resp_intercepted);
+}
+
+test "clearAll resets resp_intercepted and starred" {
+    clearAll();
+    var e = makeEntry("GET", "/test", 200);
+    e.resp_intercepted = true;
+    e.starred = true;
+    push(e);
+
+    clearAll();
+    // After clearAll, backing entries should have flags reset
+    const backing = getByBackingIndex(0);
+    try testing.expect(!backing.resp_intercepted);
+    try testing.expect(!backing.starred);
+}
+
+test "starred entry survives ring buffer overflow" {
+    clearAll();
+    // Push and star first entry
+    push(makeEntry("GET", "/starred", 200));
+    const star_idx = logicalToBackingIndex(0) orelse return error.TestUnexpectedResult;
+    toggleStar(star_idx);
+
+    // Fill remaining slots and overflow
+    for (0..max_entries + 5) |i| {
+        var e = makeEntry("GET", "/filler", 200);
+        e.timestamp = @intCast(i + 100);
+        push(e);
+    }
+
+    // Starred entry should still exist
+    const starred = getByBackingIndex(star_idx);
+    try testing.expect(starred.starred);
+    try testing.expect(starred.pinned);
+    try testing.expectEqualStrings("/starred", starred.getPath());
 }

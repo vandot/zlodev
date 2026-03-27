@@ -215,7 +215,24 @@ const EditState = struct {
         return std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .whitespace = .indent_2 }) catch null;
     }
 
-    fn applyToEntry(self: *const EditState) void {
+    /// Compact JSON by re-serializing without whitespace. Returns compacted length written
+    /// into dest, or null if body isn't valid JSON (in which case dest is untouched).
+    fn compactJson(alloc: std.mem.Allocator, src: []const u8, dest: []u8) ?usize {
+        if (src.len == 0) return null;
+        const first = for (src) |ch| {
+            if (ch != ' ' and ch != '\t' and ch != '\n' and ch != '\r') break ch;
+        } else return null;
+        if (first != '{' and first != '[') return null;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, src, .{}) catch return null;
+        defer parsed.deinit();
+        const compact = std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .whitespace = .minified }) catch return null;
+        defer alloc.free(compact);
+        const len = @min(compact.len, dest.len);
+        @memcpy(dest[0..len], compact[0..len]);
+        return len;
+    }
+
+    fn applyToEntry(self: *const EditState, alloc: std.mem.Allocator) void {
         const entry = requests.getByBackingIndex(self.backing_idx);
         if (self.resp_edit) {
             // Apply response edits: method_buf holds status code string
@@ -223,8 +240,14 @@ const EditState = struct {
             entry.status = std.fmt.parseInt(u16, status_str, 10) catch entry.status;
             @memcpy(entry.resp_headers[0..self.headers_len], self.headers_buf[0..self.headers_len]);
             entry.resp_headers_len = @intCast(self.headers_len);
-            @memcpy(entry.resp_body[0..self.body_len], self.body_buf[0..self.body_len]);
-            entry.resp_body_len = @intCast(self.body_len);
+            // Compact JSON body to remove pretty-print whitespace
+            if (compactJson(alloc, self.body_buf[0..self.body_len], &entry.resp_body)) |len| {
+                entry.resp_body_len = @intCast(len);
+            } else {
+                @memcpy(entry.resp_body[0..self.body_len], self.body_buf[0..self.body_len]);
+                entry.resp_body_len = @intCast(self.body_len);
+            }
+            entry.resp_body_truncated = false;
         } else {
             @memcpy(entry.method[0..self.method_len], self.method_buf[0..self.method_len]);
             entry.method_len = @intCast(self.method_len);
@@ -232,8 +255,13 @@ const EditState = struct {
             entry.path_len = @intCast(self.path_len);
             @memcpy(entry.req_headers[0..self.headers_len], self.headers_buf[0..self.headers_len]);
             entry.req_headers_len = @intCast(self.headers_len);
-            @memcpy(entry.req_body[0..self.body_len], self.body_buf[0..self.body_len]);
-            entry.req_body_len = @intCast(self.body_len);
+            // Compact JSON body to remove pretty-print whitespace
+            if (compactJson(alloc, self.body_buf[0..self.body_len], &entry.req_body)) |len| {
+                entry.req_body_len = @intCast(len);
+            } else {
+                @memcpy(entry.req_body[0..self.body_len], self.body_buf[0..self.body_len]);
+                entry.req_body_len = @intCast(self.body_len);
+            }
         }
     }
 
@@ -551,6 +579,8 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 const real_idx = filter_map[cursor];
                                 const backing_idx = requests.logicalToBackingIndex(real_idx) orelse continue;
                                 const e = requests.getByBackingIndex(backing_idx);
+                                // Block edit on completed response entries (can't replay a response)
+                                if (e.resp_intercepted and e.state != .intercepted) continue;
                                 if (e.state == .intercepted and e.resp_intercepted) {
                                     edit_state.loadResponseFromEntry(alloc, e, backing_idx);
                                 } else {
@@ -618,6 +648,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             } else if (key.matches('e', .{})) {
                                 const backing_idx = requests.logicalToBackingIndex(detail_index) orelse continue;
                                 const e = requests.getByBackingIndex(backing_idx);
+                                if (e.resp_intercepted and e.state != .intercepted) continue;
                                 if (e.state == .intercepted and e.resp_intercepted) {
                                     edit_state.loadResponseFromEntry(alloc, e, backing_idx);
                                 } else {
@@ -634,7 +665,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             } else if (key.matches('s', .{ .ctrl = true })) {
                                 if (edit_state.intercepted) {
                                     // Intercepted: apply edits to entry and accept
-                                    edit_state.applyToEntry();
+                                    edit_state.applyToEntry(alloc);
                                     const slot = intercept.findByBackingIndex(edit_state.backing_idx);
                                     if (slot) |s| intercept.setDecision(s, .accept);
                                 } else {

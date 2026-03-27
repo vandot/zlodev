@@ -220,7 +220,7 @@ pub fn start(config: *const ProxyConfig) !void {
     log.info("component=proxy op=listening ip={s} port=443 target={s}:{d}", .{ config.listen_addr, config.target_host, config.target_port });
 
     var pool: std.Thread.Pool = undefined;
-    pool.init(.{ .allocator = std.heap.page_allocator, .n_jobs = 64, .stack_size = 256 * 1024 }) catch |e| {
+    pool.init(.{ .allocator = std.heap.page_allocator, .n_jobs = 64, .stack_size = if (builtin.cpu.arch == .x86_64) 4 * 1024 * 1024 else 1024 * 1024 }) catch |e| {
         log.err("component=proxy op=pool_init error={any}", .{e});
         return e;
     };
@@ -325,6 +325,13 @@ fn handleConnection(
         const version = parts.next() orelse "HTTP/1.0";
         var addr_buf: [46]u8 = undefined;
         log.info("component=proxy conn={d} method={s} uri={s} client={s}", .{ conn_id, method, uri, formatAddress(client_addr, &addr_buf) });
+
+        // Health check — return immediately, bypass everything
+        if (std.mem.eql(u8, uri, "/health")) {
+            const health_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            sslWriteAll(ssl, health_response);
+            return;
+        }
 
         // Determine keep-alive based on HTTP version and Connection header
         const is_http11 = std.mem.eql(u8, version, "HTTP/1.1");
@@ -890,7 +897,7 @@ fn handleConnection(
 fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_external: bool, domain: []const u8, must_close: bool) void {
     // Build and send status line
     var status_buf: [64]u8 = undefined;
-    const status_line = std.fmt.bufPrint(&status_buf, "HTTP/1.1 {d} OK\r\n", .{e.status}) catch return;
+    const status_line = std.fmt.bufPrint(&status_buf, "HTTP/1.1 {d} {s}\r\n", .{ e.status, reasonPhrase(e.status) }) catch return;
     sslWriteAll(ssl, status_line);
 
     // Forward response headers
@@ -1056,6 +1063,31 @@ fn sslWriteAll(ssl: *ssl_c.SSL, data: []const u8) void {
     }
 }
 
+fn reasonPhrase(status: u16) []const u8 {
+    return switch (status) {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        413 => "Content Too Large",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        else => "OK",
+    };
+}
+
 fn sslSendError(ssl: *ssl_c.SSL, status: u16, message: []const u8) void {
     var buf: [512]u8 = undefined;
     const response = std.fmt.bufPrint(&buf, "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
@@ -1067,8 +1099,10 @@ fn sslSendError(ssl: *ssl_c.SSL, status: u16, message: []const u8) void {
 /// Rewrite Domain= attribute in a Set-Cookie header to the proxy domain.
 /// Writes the full header (without trailing \r\n) to the SSL connection.
 fn rewriteCookieDomain(ssl: *ssl_c.SSL, header: []const u8, domain: []const u8) void {
-    // Find "Domain=" (case-insensitive) in the header value
-    var i: usize = 0;
+    // Find "Domain=" (case-insensitive) in the cookie attributes (after first ;)
+    // Skip the cookie value to avoid matching "domain=" inside it
+    const attr_start = if (std.mem.indexOfScalar(u8, header, ';')) |pos| pos else header.len;
+    var i: usize = attr_start;
     while (i + 7 <= header.len) : (i += 1) {
         if (startsWithIgnoreCase(header[i..], "domain=")) {
             // Found Domain= at position i
@@ -1487,6 +1521,157 @@ test "getConnectionHeader upgrade ignored" {
     // "Upgrade" doesn't match "close" or "keep-alive", so returns .none-like behavior
     // but the header IS present — it just has an unrecognized value
     try testing.expectEqual(ConnectionHeader.none, getConnectionHeader("Connection: Upgrade\r\n"));
+}
+
+test "resolveRoute subdomain match" {
+    const routes = [_]Route{
+        .{ .kind = .subdomain, .pattern = "api", .port = 3001 },
+    };
+    const config = ProxyConfig{
+        .target_host = "127.0.0.1",
+        .target_port = 3000,
+        .listen_addr = "0.0.0.0",
+        .cert_path = "",
+        .key_path = "",
+        .ca_path = "",
+        .server_ident = "",
+        .routes = &routes,
+    };
+    const result = resolveRoute(&config, "api.dev.lo", "/test");
+    try testing.expectEqual(@as(u16, 3001), result.port);
+    try testing.expectEqual(@as(u8, 0), result.index);
+    try testing.expect(result.hostname == null);
+}
+
+test "resolveRoute subdomain with port in host" {
+    const routes = [_]Route{
+        .{ .kind = .subdomain, .pattern = "api", .port = 3001 },
+    };
+    const config = ProxyConfig{
+        .target_host = "127.0.0.1",
+        .target_port = 3000,
+        .listen_addr = "0.0.0.0",
+        .cert_path = "",
+        .key_path = "",
+        .ca_path = "",
+        .server_ident = "",
+        .routes = &routes,
+    };
+    const result = resolveRoute(&config, "api.dev.lo:443", "/");
+    try testing.expectEqual(@as(u16, 3001), result.port);
+}
+
+test "resolveRoute path match longest prefix" {
+    const routes = [_]Route{
+        .{ .kind = .path, .pattern = "/api", .port = 3001 },
+        .{ .kind = .path, .pattern = "/api/v2", .port = 3002 },
+    };
+    const config = ProxyConfig{
+        .target_host = "127.0.0.1",
+        .target_port = 3000,
+        .listen_addr = "0.0.0.0",
+        .cert_path = "",
+        .key_path = "",
+        .ca_path = "",
+        .server_ident = "",
+        .routes = &routes,
+    };
+    const result = resolveRoute(&config, "dev.lo", "/api/v2/users");
+    try testing.expectEqual(@as(u16, 3002), result.port);
+    try testing.expectEqual(@as(u8, 1), result.index);
+}
+
+test "resolveRoute default fallback" {
+    const routes = [_]Route{
+        .{ .kind = .subdomain, .pattern = "api", .port = 3001 },
+    };
+    const config = ProxyConfig{
+        .target_host = "127.0.0.1",
+        .target_port = 3000,
+        .listen_addr = "0.0.0.0",
+        .cert_path = "",
+        .key_path = "",
+        .ca_path = "",
+        .server_ident = "",
+        .routes = &routes,
+    };
+    const result = resolveRoute(&config, "dev.lo", "/");
+    try testing.expectEqual(@as(u16, 3000), result.port);
+    try testing.expectEqual(@as(u8, 0xff), result.index);
+}
+
+test "resolveRoute external hostname" {
+    const routes = [_]Route{
+        .{ .kind = .subdomain, .pattern = "api", .port = 443, .hostname = "staging.example.com" },
+    };
+    const config = ProxyConfig{
+        .target_host = "127.0.0.1",
+        .target_port = 3000,
+        .listen_addr = "0.0.0.0",
+        .cert_path = "",
+        .key_path = "",
+        .ca_path = "",
+        .server_ident = "",
+        .routes = &routes,
+    };
+    const result = resolveRoute(&config, "api.dev.lo", "/");
+    try testing.expectEqual(@as(u16, 443), result.port);
+    try testing.expectEqualStrings("staging.example.com", result.hostname.?);
+}
+
+test "resolveRoute no routes" {
+    const config = ProxyConfig{
+        .target_host = "127.0.0.1",
+        .target_port = 8080,
+        .listen_addr = "0.0.0.0",
+        .cert_path = "",
+        .key_path = "",
+        .ca_path = "",
+        .server_ident = "",
+    };
+    const result = resolveRoute(&config, "dev.lo", "/anything");
+    try testing.expectEqual(@as(u16, 8080), result.port);
+    try testing.expectEqual(@as(u8, 0xff), result.index);
+}
+
+test "reasonPhrase common codes" {
+    try testing.expectEqualStrings("OK", reasonPhrase(200));
+    try testing.expectEqualStrings("Not Found", reasonPhrase(404));
+    try testing.expectEqualStrings("Internal Server Error", reasonPhrase(500));
+    try testing.expectEqualStrings("Bad Gateway", reasonPhrase(502));
+    try testing.expectEqualStrings("Unauthorized", reasonPhrase(401));
+    try testing.expectEqualStrings("Moved Permanently", reasonPhrase(301));
+}
+
+test "reasonPhrase unknown code falls back to OK" {
+    try testing.expectEqualStrings("OK", reasonPhrase(999));
+    try testing.expectEqualStrings("OK", reasonPhrase(0));
+}
+
+test "isChunkedEncoding true" {
+    try testing.expect(isChunkedEncoding("Transfer-Encoding: chunked\r\n"));
+    try testing.expect(isChunkedEncoding("transfer-encoding: chunked\r\n"));
+    try testing.expect(isChunkedEncoding("Host: dev.lo\r\nTransfer-Encoding: chunked\r\n"));
+}
+
+test "isChunkedEncoding false" {
+    try testing.expect(!isChunkedEncoding("Content-Length: 42\r\n"));
+    try testing.expect(!isChunkedEncoding("Transfer-Encoding: gzip\r\n"));
+    try testing.expect(!isChunkedEncoding(""));
+}
+
+test "getHeaderValue found" {
+    try testing.expectEqualStrings("dev.lo", getHeaderValue("Host: dev.lo\r\nAccept: */*\r\n", "host:").?);
+    try testing.expectEqualStrings("*/*", getHeaderValue("Host: dev.lo\r\nAccept: */*\r\n", "accept:").?);
+}
+
+test "getHeaderValue not found" {
+    try testing.expect(getHeaderValue("Host: dev.lo\r\n", "content-type:") == null);
+    try testing.expect(getHeaderValue("", "host:") == null);
+}
+
+test "getHeaderValue trims whitespace" {
+    try testing.expectEqualStrings("dev.lo", getHeaderValue("Host:   dev.lo  \r\n", "host:").?);
 }
 
 test "default_max_request_body is 10MB" {

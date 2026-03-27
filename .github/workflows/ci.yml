@@ -3,19 +3,23 @@ name: CI
 on:
   push:
     branches:
-      - '**'
+      - main
     paths:
       - 'src/**'
       - 'build.zig'
       - 'build.zig.zon'
+      - 'tests/**'
+      - '.github/workflows/**'
   pull_request:
     paths:
       - 'src/**'
       - 'build.zig'
       - 'build.zig.zon'
+      - 'tests/**'
+      - '.github/workflows/**'
 
 jobs:
-  build-and-test-linux:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,10 +44,91 @@ jobs:
       - name: Test intercept
         run: zig test src/intercept.zig
 
-      - name: Test requests
-        run: zig test src/requests.zig
+      - name: Test search
+        run: zig test src/search.zig
 
-  build-and-test-windows:
+      - name: Test clipboard
+        run: zig test src/clipboard.zig
+
+      - name: Test install/uninstall
+        run: zig test tests/install.zig
+
+      - name: Install httpbin
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install httpbin==0.10.2 gunicorn==23.0.0
+
+      - name: Setup capabilities
+        run: sudo setcap 'cap_net_bind_service=+ep' ./zig-out/bin/zlodev
+
+      - name: Configure systemd-resolved as system resolver
+        run: |
+          sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+          # Use nss-resolve for per-link DNS routing (stub at 127.0.0.53
+          # may not reliably route custom TLDs via per-link config)
+          sudo apt-get update
+          sudo apt-get install -y libnss-resolve
+          sudo sed -i 's/^hosts:.*/hosts: files resolve [!UNAVAIL=return] dns/' /etc/nsswitch.conf
+          sudo systemctl restart systemd-resolved
+
+      - name: Run integration tests
+        timeout-minutes: 10
+        run: |
+          export PATH="$(pwd)/.venv/bin:$PATH"
+          zig test tests/integration.zig
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set HostName to match LocalHostName
+        run: sudo scutil --set HostName "$(scutil --get LocalHostName)"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Build
+        run: zig build
+
+      - name: Test dns
+        run: zig test src/dns.zig
+
+      - name: Test requests + har
+        run: zig test src/har.zig
+
+      - name: Test proxy
+        run: zig test src/proxy.zig
+
+      - name: Test intercept
+        run: zig test src/intercept.zig
+
+      - name: Test search
+        run: zig test src/search.zig
+
+      - name: Test clipboard
+        run: zig test src/clipboard.zig
+
+      - name: Test install/uninstall
+        run: zig test tests/install.zig
+
+      - name: Install hurl
+        run: brew install hurl
+
+      - name: Install httpbin
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install httpbin==0.10.2 gunicorn==23.0.0
+
+      - name: Run integration tests
+        timeout-minutes: 10
+        run: |
+          export PATH="$(pwd)/.venv/bin:$PATH"
+          zig test tests/integration.zig
+
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,34 +153,25 @@ jobs:
       - name: Test intercept
         run: zig test src/intercept.zig
 
-      - name: Test requests
-        run: zig test src/requests.zig
+      - name: Test search
+        run: zig test src/search.zig
 
-  build-and-test-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
+      - name: Test clipboard
+        run: zig test src/clipboard.zig
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.1
+      - name: Test install/uninstall
+        run: zig test tests/install.zig
 
-      - name: Build
-        run: zig build
+      - name: Free port 80
+        shell: pwsh
+        run: |
+          # Stop services that may hold port 80
+          Stop-Service W3SVC -ErrorAction SilentlyContinue
+          Stop-Service WAS -ErrorAction SilentlyContinue
+          netsh http delete urlacl url=http://+:80/ 2>$null
+          # Show what's using port 80 for diagnostics
+          netstat -ano | Select-String ":80 " | Select-String "LISTENING"
 
-      - name: Test dns
-        run: zig test src/dns.zig
-
-      - name: Test requests + har
-        run: zig test src/har.zig
-
-      - name: Test proxy
-        run: zig test src/proxy.zig
-
-      - name: Test intercept
-        run: zig test src/intercept.zig
-
-      - name: Test requests
-        run: zig test src/requests.zig
-
+      - name: Run integration tests
+        timeout-minutes: 10
+        run: zig test tests/integration.zig
