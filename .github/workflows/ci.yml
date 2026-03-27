@@ -166,6 +166,11 @@ jobs:
           sudo sed -i 's/^hosts:.*/hosts: files resolve [!UNAVAIL=return] dns/' /etc/nsswitch.conf
           sudo systemctl restart systemd-resolved
 
+      - name: Setup tmate debug session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          detached: true
+
       - name: Run integration tests
         timeout-minutes: 10
         run: |
@@ -256,6 +261,11 @@ jobs:
           netsh http delete urlacl url=http://+:80/ 2>$null
           # Show what's using port 80 for diagnostics
           netstat -ano | Select-String ":80 " | Select-String "LISTENING"
+
+      - name: Setup tmate debug session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          detached: true
 
       - name: Run integration tests
         timeout-minutes: 10

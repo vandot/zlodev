@@ -169,6 +169,12 @@ test "uninstall and verify" {
 // --- Local mode (hostname.local) ---
 
 test "install --local and verify" {
+    // On Linux, systemd-resolved may have died during the previous uninstall test.
+    // Restart it so the local install can detect it.
+    if (builtin.os.tag == .linux) {
+        _ = runCmd(&.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
+        std.Thread.sleep(1 * std.time.ns_per_s);
+    }
     var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var domain_buf: [512]u8 = undefined;
