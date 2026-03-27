@@ -169,10 +169,11 @@ fn generateCA(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []cons
     try setNameEntry(name, c.NID_organizationName, "zlodev");
     try setNameEntry(name, c.NID_organizationalUnitName, "CA");
 
-    // CN = "{domain} CA"
+    // CN = "{domain} CA" (truncated to 64 bytes — X.509 CN limit)
     const cn = try allocPrintZ(allocator, "{s} CA", .{domain});
     defer allocator.free(cn);
-    try setNameEntry(name, c.NID_commonName, cn);
+    const cn_truncated = if (cn.len > 64) cn[0..64] else @as([]const u8, cn);
+    try setNameEntry(name, c.NID_commonName, cn_truncated);
 
     // Self-signed: issuer = subject
     if (c.X509_set_issuer_name(ca_cert, name) != 1) return error.CertCreateFailed;
@@ -238,7 +239,8 @@ fn generateDomainCert(allocator: std.mem.Allocator, domain: []const u8, ca_cert:
 
     const cn_z = try allocPrintZ(allocator, "{s}", .{domain});
     defer allocator.free(cn_z);
-    try setNameEntry(name, c.NID_commonName, cn_z);
+    const cn_z_truncated = if (cn_z.len > 64) cn_z[0..64] else @as([]const u8, cn_z);
+    try setNameEntry(name, c.NID_commonName, cn_z_truncated);
 
     // Issuer = CA subject
     const ca_subject = c.X509_get_subject_name(ca_cert) orelse return error.CertCreateFailed;
@@ -275,11 +277,11 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cert_dir = try getCertPath(&path_buf, domain);
 
-    // Create directories
-    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base_dir = try getBasePath(&base_buf);
-    std.fs.makeDirAbsolute(base_dir) catch {};
-    std.fs.makeDirAbsolute(cert_dir) catch {};
+    // Create directories (recursively, in case intermediate dirs don't exist)
+    std.fs.makeDirAbsolute(cert_dir) catch {
+        // If single-level create failed, try creating the full path
+        std.fs.cwd().makePath(cert_dir) catch return error.CertCreateFailed;
+    };
 
     // Generate CA certificate and key
     const ca = try generateCA(allocator, domain, cert_dir);
@@ -316,9 +318,9 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         },
         .windows => {
             std.debug.print("installing CA and generating certificate\n", .{});
-            const ps_cmd = try std.fmt.allocPrint(allocator, "Import-Certificate -FilePath '{s}' -CertStoreLocation Cert:\\LocalMachine\\Root", .{ca_path});
-            defer allocator.free(ps_cmd);
-            try sys.sudoCmd(allocator, &.{ "Powershell.exe", "-Command", ps_cmd });
+            try sys.sudoCmd(allocator, &.{ "certutil", "-addstore", "Root", ca_path });
+            // Also add CA to Git's OpenSSL CA bundle so tools like Git's curl can verify certs
+            appendToGitCaBundle(allocator, ca_path);
         },
         else => {},
     }
@@ -360,7 +362,15 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         },
         .windows => {
             std.debug.print("uninstalling and removing CA\n", .{});
-            try sys.sudoCmd(allocator, &.{ "Powershell.exe", "-Command", "Get-ChildItem Cert:\\LocalMachine\\Root | Where-Object {$_.Subject -match 'zlodev'} | Remove-Item" });
+            const cn = std.fmt.allocPrint(allocator, "{s} CA", .{domain}) catch {
+                std.debug.print("failed to allocate CN string\n", .{});
+                return;
+            };
+            defer allocator.free(cn);
+            sys.sudoCmd(allocator, &.{ "certutil", "-delstore", "Root", cn }) catch {
+                std.debug.print("failed to remove certificate from store\n", .{});
+            };
+            removeFromGitCaBundle(allocator);
         },
         else => {},
     }
@@ -380,9 +390,97 @@ fn removeFromKeychain(allocator: std.mem.Allocator, cert_dir: []const u8) void {
         std.debug.print("CA file not found, skipping keychain removal\n", .{});
         return;
     };
-    sys.sudoCmd(allocator, &.{ "sudo", "security", "delete-certificate", "-t", "-Z", &sha1 }) catch {
+    sys.sudoCmd(allocator, &.{ "sudo", "security", "delete-certificate", "-Z", &sha1 }) catch {
         std.debug.print("failed to remove certificate from keychain\n", .{});
     };
+}
+
+const ca_bundle_marker_begin = "\n# BEGIN zlodev CA\n";
+const ca_bundle_marker_end = "# END zlodev CA\n";
+
+/// Append the zlodev CA PEM to Git's OpenSSL CA bundle so tools using
+/// OpenSSL (e.g. Git's bundled curl) can verify zlodev certificates.
+fn appendToGitCaBundle(allocator: std.mem.Allocator, ca_pem_path: []const u8) void {
+    const bundle_path = getGitCaBundlePath(allocator) orelse return;
+    defer allocator.free(bundle_path);
+
+    // Read CA PEM content
+    const ca_content = std.fs.cwd().readFileAlloc(allocator, ca_pem_path, 8192) catch {
+        std.debug.print("warning: could not read CA file for Git bundle\n", .{});
+        return;
+    };
+    defer allocator.free(ca_content);
+
+    // Check if already present
+    const bundle_content = std.fs.cwd().readFileAlloc(allocator, bundle_path, 4 * 1024 * 1024) catch {
+        std.debug.print("warning: could not read Git CA bundle\n", .{});
+        return;
+    };
+    defer allocator.free(bundle_content);
+    if (std.mem.indexOf(u8, bundle_content, "# BEGIN zlodev CA") != null) return;
+
+    // Append with markers
+    const file = std.fs.cwd().openFile(bundle_path, .{ .mode = .write_only }) catch return;
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(ca_bundle_marker_begin) catch return;
+    file.writeAll(ca_content) catch return;
+    file.writeAll(ca_bundle_marker_end) catch return;
+    std.debug.print("CA also added to Git CA bundle at {s}\n", .{bundle_path});
+}
+
+/// Remove the zlodev CA from Git's OpenSSL CA bundle.
+fn removeFromGitCaBundle(allocator: std.mem.Allocator) void {
+    const bundle_path = getGitCaBundlePath(allocator) orelse return;
+    defer allocator.free(bundle_path);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, bundle_path, 4 * 1024 * 1024) catch return;
+    defer allocator.free(content);
+
+    const begin = std.mem.indexOf(u8, content, ca_bundle_marker_begin) orelse return;
+    const after_begin = begin + ca_bundle_marker_begin.len;
+    const end_marker = std.mem.indexOfPos(u8, content, after_begin, ca_bundle_marker_end) orelse return;
+    const end = end_marker + ca_bundle_marker_end.len;
+
+    // Write content without the marked section
+    const file = std.fs.createFileAbsolute(bundle_path, .{}) catch return;
+    defer file.close();
+    file.writeAll(content[0..begin]) catch return;
+    file.writeAll(content[end..]) catch return;
+    std.debug.print("CA removed from Git CA bundle\n", .{});
+}
+
+/// Find the Git CA bundle path. Tries `git config` first, then common install paths.
+fn getGitCaBundlePath(allocator: std.mem.Allocator) ?[]const u8 {
+    // Try git config
+    const configs = [_][]const []const u8{
+        &.{ "git", "config", "--system", "http.sslCAInfo" },
+        &.{ "git", "config", "--global", "http.sslCAInfo" },
+    };
+    for (configs) |argv| {
+        if (sys.runCmdOutput(allocator, argv)) |output| {
+            const trimmed = std.mem.trim(u8, output, " \t\r\n");
+            if (trimmed.len > 0) {
+                const result = allocator.dupe(u8, trimmed) catch {
+                    allocator.free(output);
+                    continue;
+                };
+                allocator.free(output);
+                return result;
+            }
+            allocator.free(output);
+        }
+    }
+    // Fallback: check common Git for Windows CA bundle locations
+    const fallback_paths = [_][]const u8{
+        "C:\\Program Files\\Git\\mingw64\\etc\\ssl\\certs\\ca-bundle.crt",
+        "C:\\Program Files (x86)\\Git\\mingw64\\etc\\ssl\\certs\\ca-bundle.crt",
+    };
+    for (fallback_paths) |path| {
+        std.fs.accessAbsolute(path, .{}) catch continue;
+        return allocator.dupe(u8, path) catch return null;
+    }
+    return null;
 }
 
 fn getFingerprint(ca_path: []const u8) ![40]u8 {

@@ -11,3 +11,7 @@ zig-pkg/
 *.swp
 *.swo
 *~
+
+# zlodev
+.zlodev
+
