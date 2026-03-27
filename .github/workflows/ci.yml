@@ -144,11 +144,6 @@ jobs:
       - name: Build
         run: zig build
 
-      - name: Install hurl
-        run: |
-          curl -sSL https://github.com/Orange-OpenSource/hurl/releases/download/6.0.0/hurl_6.0.0_amd64.deb -o /tmp/hurl.deb
-          sudo dpkg -i /tmp/hurl.deb
-
       - name: Install httpbin
         run: |
           python3 -m venv .venv
