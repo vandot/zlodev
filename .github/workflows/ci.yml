@@ -171,6 +171,20 @@ jobs:
           sudo sysctl -w kernel.core_pattern=$(pwd)/core.%p
           zig test tests/integration.zig
 
+      - name: DNS diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== resolv.conf ==="
+          cat /etc/resolv.conf
+          echo "=== resolvectl status ==="
+          resolvectl status || true
+          echo "=== resolvectl query dev.lo ==="
+          resolvectl query dev.lo || true
+          echo "=== ip link show zlodev0 ==="
+          ip link show zlodev0 || true
+          echo "=== networkctl status zlodev0 ==="
+          networkctl status zlodev0 || true
+
       - name: Analyze core dump on failure
         if: failure()
         run: |

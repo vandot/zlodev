@@ -86,7 +86,8 @@ test "windows: health endpoint" {
     // Construct CA path for --cacert (Windows curl/Schannel may not see user cert store)
     var ca_buf: [std.fs.max_path_bytes]u8 = undefined;
     const ca_path = blk: {
-        const local_app_data = std.posix.getenv("LocalAppData") orelse return error.SkipZigTest;
+        const local_app_data = std.process.getEnvVarOwned(testing.allocator, "LocalAppData") catch return error.SkipZigTest;
+        defer testing.allocator.free(local_app_data);
         break :blk std.fmt.bufPrint(&ca_buf, "{s}/zlodev/dev.lo/zlodevCA.pem", .{local_app_data}) catch return error.SkipZigTest;
     };
 
@@ -180,6 +181,12 @@ test "dev.lo: full integration" {
         "--route=remote=httpbin.org:443",
     });
     defer killProcess(&proxy);
+
+    // Flush systemd-resolved cache — install restarts resolved before the DNS
+    // server is running, so it may cache the server as unreachable.
+    if (builtin.os.tag == .linux) {
+        _ = runCmd(&.{ "resolvectl", "flush-caches" }) catch {};
+    }
 
     // Poll for proxy readiness
     try pollUrl("https://dev.lo/health", 30_000, true);
