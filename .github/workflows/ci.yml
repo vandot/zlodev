@@ -160,6 +160,10 @@ jobs:
       - name: Configure systemd-resolved as system resolver
         run: |
           sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+          # Use nss-resolve for per-link DNS routing (stub at 127.0.0.53
+          # may not reliably route custom TLDs via per-link config)
+          sudo apt-get install -y libnss-resolve
+          sudo sed -i 's/^hosts:.*/hosts: files resolve [!UNAVAIL=return] dns/' /etc/nsswitch.conf
           sudo systemctl restart systemd-resolved
 
       - name: Run integration tests

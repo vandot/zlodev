@@ -83,14 +83,6 @@ test "windows: health endpoint" {
         _ = runCmd(&.{ binary_path, "uninstall" }) catch {};
     }
 
-    // Construct CA path for --cacert (Windows curl/Schannel may not see user cert store)
-    var ca_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const ca_path = blk: {
-        const local_app_data = std.process.getEnvVarOwned(testing.allocator, "LocalAppData") catch return error.SkipZigTest;
-        defer testing.allocator.free(local_app_data);
-        break :blk std.fmt.bufPrint(&ca_buf, "{s}/zlodev/dev.lo/zlodevCA.pem", .{local_app_data}) catch return error.SkipZigTest;
-    };
-
     // Start proxy (no upstream needed for /health)
     var proxy = try startBackground(&.{ binary_path, "start", "--no-tui" });
     defer killProcess(&proxy);
@@ -98,8 +90,8 @@ test "windows: health endpoint" {
     // Poll for readiness
     try pollUrl("https://dev.lo/health", 30_000, true);
 
-    // Test HTTPS /health (use --cacert to explicitly trust the CA)
-    try runCmdExpectSuccess(&.{ "curl", "-sf", "--cacert", ca_path, "https://dev.lo/health" });
+    // Test HTTPS /health (CA is in Git's ca-bundle from install)
+    try runCmdExpectSuccess(&.{ "curl", "-sf", "https://dev.lo/health" });
 
     // Test HTTP /health
     try runCmdExpectSuccess(&.{ "curl", "-sf", "http://dev.lo/health" });
@@ -182,10 +174,13 @@ test "dev.lo: full integration" {
     });
     defer killProcess(&proxy);
 
-    // Flush systemd-resolved cache — install restarts resolved before the DNS
-    // server is running, so it may cache the server as unreachable.
+    // On Linux, systemd-resolved may have cached the DNS server as unreachable
+    // (install restarts resolved before the DNS server is running). Wait for
+    // the DNS server to be up, flush caches, then verify resolution.
     if (builtin.os.tag == .linux) {
+        std.Thread.sleep(2 * std.time.ns_per_s);
         _ = runCmd(&.{ "resolvectl", "flush-caches" }) catch {};
+        _ = runCmd(&.{ "resolvectl", "query", "dev.lo" }) catch {};
     }
 
     // Poll for proxy readiness
