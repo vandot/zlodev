@@ -90,8 +90,8 @@ test "windows: health endpoint" {
     // Poll for readiness
     try pollUrl("https://dev.lo/health", 30_000, true);
 
-    // Test HTTPS /health (CA is in Git's ca-bundle from install)
-    try runCmdExpectSuccess(&.{ "curl", "-sf", "https://dev.lo/health" });
+    // Test HTTPS /health (--ssl-no-revoke: Schannel can't check CRL for local CA)
+    try runCmdExpectSuccess(&.{ "curl", "-sf", "--ssl-no-revoke", "https://dev.lo/health" });
 
     // Test HTTP /health
     try runCmdExpectSuccess(&.{ "curl", "-sf", "http://dev.lo/health" });
@@ -173,15 +173,6 @@ test "dev.lo: full integration" {
         "--route=remote=httpbin.org:443",
     });
     defer killProcess(&proxy);
-
-    // On Linux, systemd-resolved may have cached the DNS server as unreachable
-    // (install restarts resolved before the DNS server is running). Wait for
-    // the DNS server to be up, flush caches, then verify resolution.
-    if (builtin.os.tag == .linux) {
-        std.Thread.sleep(2 * std.time.ns_per_s);
-        _ = runCmd(&.{ "resolvectl", "flush-caches" }) catch {};
-        _ = runCmd(&.{ "resolvectl", "query", "dev.lo" }) catch {};
-    }
 
     // Poll for proxy readiness
     try pollUrl("https://dev.lo/health", 30_000, true);

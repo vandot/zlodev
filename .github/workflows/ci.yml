@@ -167,46 +167,11 @@ jobs:
           sudo sed -i 's/^hosts:.*/hosts: files resolve [!UNAVAIL=return] dns/' /etc/nsswitch.conf
           sudo systemctl restart systemd-resolved
 
-      - name: Setup tmate debug session
-        uses: mxschmitt/action-tmate@v3
-        with:
-          detached: true
-
       - name: Run integration tests
         timeout-minutes: 10
         run: |
           export PATH="$(pwd)/.venv/bin:$PATH"
-          # Enable core dumps for segfault diagnosis
-          ulimit -c unlimited
-          sudo sysctl -w kernel.core_pattern=$(pwd)/core.%p
           zig test tests/integration.zig
-
-      - name: DNS diagnostics on failure
-        if: failure()
-        run: |
-          echo "=== resolv.conf ==="
-          cat /etc/resolv.conf
-          echo "=== resolvectl status ==="
-          resolvectl status || true
-          echo "=== resolvectl query dev.lo ==="
-          resolvectl query dev.lo || true
-          echo "=== ip link show zlodev0 ==="
-          ip link show zlodev0 || true
-          echo "=== networkctl status zlodev0 ==="
-          networkctl status zlodev0 || true
-
-      - name: Analyze core dump on failure
-        if: failure()
-        run: |
-          CORE=$(find . -maxdepth 1 -name 'core.*' -type f 2>/dev/null | head -1)
-          if [ -n "$CORE" ]; then
-            sudo apt-get install -y gdb
-            gdb -batch -ex "thread apply all bt full" ./zig-out/bin/zlodev "$CORE"
-          else
-            echo "No core dump found — segfault may be in a child process"
-            # Try looking system-wide
-            find /tmp -name 'core.*' 2>/dev/null | head -5
-          fi
 
   integration-test-macos:
     needs: build-and-test-macos
@@ -262,11 +227,6 @@ jobs:
           netsh http delete urlacl url=http://+:80/ 2>$null
           # Show what's using port 80 for diagnostics
           netstat -ano | Select-String ":80 " | Select-String "LISTENING"
-
-      - name: Setup tmate debug session
-        uses: mxschmitt/action-tmate@v3
-        with:
-          detached: true
 
       - name: Run integration tests
         timeout-minutes: 10
