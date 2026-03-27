@@ -220,7 +220,7 @@ pub fn start(config: *const ProxyConfig) !void {
     log.info("component=proxy op=listening ip={s} port=443 target={s}:{d}", .{ config.listen_addr, config.target_host, config.target_port });
 
     var pool: std.Thread.Pool = undefined;
-    pool.init(.{ .allocator = std.heap.page_allocator, .n_jobs = 64, .stack_size = 256 * 1024 }) catch |e| {
+    pool.init(.{ .allocator = std.heap.page_allocator, .n_jobs = 64, .stack_size = 1024 * 1024 }) catch |e| {
         log.err("component=proxy op=pool_init error={any}", .{e});
         return e;
     };

@@ -83,6 +83,13 @@ test "windows: health endpoint" {
         _ = runCmd(&.{ binary_path, "uninstall" }) catch {};
     }
 
+    // Construct CA path for --cacert (Windows curl/Schannel may not see user cert store)
+    var ca_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const ca_path = blk: {
+        const local_app_data = std.posix.getenv("LocalAppData") orelse return error.SkipZigTest;
+        break :blk std.fmt.bufPrint(&ca_buf, "{s}/zlodev/dev.lo/zlodevCA.pem", .{local_app_data}) catch return error.SkipZigTest;
+    };
+
     // Start proxy (no upstream needed for /health)
     var proxy = try startBackground(&.{ binary_path, "start", "--no-tui" });
     defer killProcess(&proxy);
@@ -90,8 +97,8 @@ test "windows: health endpoint" {
     // Poll for readiness
     try pollUrl("https://dev.lo/health", 30_000, true);
 
-    // Test HTTPS /health
-    try runCmdExpectSuccess(&.{ "curl", "-sf", "https://dev.lo/health" });
+    // Test HTTPS /health (use --cacert to explicitly trust the CA)
+    try runCmdExpectSuccess(&.{ "curl", "-sf", "--cacert", ca_path, "https://dev.lo/health" });
 
     // Test HTTP /health
     try runCmdExpectSuccess(&.{ "curl", "-sf", "http://dev.lo/health" });
