@@ -320,8 +320,8 @@ fn handleConnection(
         const request_line = req_buf[0..first_line_end];
 
         var parts = std.mem.splitScalar(u8, request_line, ' ');
-        const method = parts.next() orelse return;
-        const uri = parts.next() orelse return;
+        var method = parts.next() orelse return;
+        var uri = parts.next() orelse return;
         const version = parts.next() orelse "HTTP/1.0";
         var addr_buf: [46]u8 = undefined;
         log.info("component=proxy conn={d} method={s} uri={s} client={s}", .{ conn_id, method, uri, formatAddress(client_addr, &addr_buf) });
@@ -340,7 +340,7 @@ fn handleConnection(
         const keep_alive = if (client_conn == .close) false else if (client_conn == .keep_alive) true else is_http11;
 
         // Extract Host header for route resolution
-        const host = getHeaderValue(req_hdr_section, "host:") orelse "";
+        var host = getHeaderValue(req_hdr_section, "host:") orelse "";
         const route_result = resolveRoute(config, host, uri);
         const upstream_port = route_result.port;
 
@@ -357,6 +357,11 @@ fn handleConnection(
         const rh_len = @min(req_hdr_section.len, requests.max_header_len);
         @memcpy(entry.req_headers[0..rh_len], req_hdr_section[0..rh_len]);
         entry.req_headers_len = @intCast(rh_len);
+
+        // Re-derive from entry to avoid use-after-free when body read overwrites req_buf
+        method = entry.method[0..m_len];
+        uri = entry.path[0..p_len];
+        host = getHeaderValue(entry.req_headers[0..rh_len], "host:") orelse "";
 
         // Check for WebSocket upgrade
         if (isWebSocketUpgrade(req_hdr_section)) {
@@ -447,6 +452,18 @@ fn handleConnection(
                 }
             }
         }
+
+        // Ensure intercepted entries are unpinned on any early exit after this point.
+        // Normal completion paths call finishEntry/finishResponseIntercept explicitly,
+        // which set status/duration before unpinning — so this defer only fires for
+        // error exits where the entry would otherwise be pinned forever.
+        defer if (was_intercepted) {
+            const e = requests.getByBackingIndex(intercept_backing_idx);
+            if (e.pinned and !e.starred and e.state == .accepted) {
+                const dur = std.time.milliTimestamp() - start_time;
+                requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
+            }
+        };
 
         // Connect to upstream (per-request — dev servers may not support keep-alive)
         const is_external = route_result.hostname != null;

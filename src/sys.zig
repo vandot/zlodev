@@ -50,7 +50,10 @@ pub fn runCmdOutput(allocator: std.mem.Allocator, argv: []const []const u8) ?[]c
         result.deinit(allocator);
         return null;
     }
-    return result.items;
+    return result.toOwnedSlice(allocator) catch {
+        result.deinit(allocator);
+        return null;
+    };
 }
 
 pub fn dirExists(path: []const u8) bool {

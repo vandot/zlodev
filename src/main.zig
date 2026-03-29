@@ -764,7 +764,7 @@ fn readConfigFile(
                 std.process.exit(1);
             };
         } else if (lineValue(line, "bind") orelse lineValue(line, "b")) |val| {
-            result.bind = val;
+            result.bind = allocator.dupe(u8, val) catch null;
         } else if (lineValue(line, "max-body")) |val| {
             result.max_body = parseSize(val) orelse {
                 std.debug.print("config: invalid max-body value: {s}\n", .{val});
@@ -779,7 +779,7 @@ fn readConfigFile(
         } else if (std.mem.eql(u8, line, "dns")) {
             result.dns = true;
         } else if (lineValue(line, "intercept")) |val| {
-            result.intercept_pattern = val;
+            result.intercept_pattern = allocator.dupe(u8, val) catch null;
         } else {
             std.debug.print("config: unknown option: {s}\n", .{line});
             std.process.exit(1);
