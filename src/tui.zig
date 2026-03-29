@@ -312,6 +312,8 @@ const EditState = struct {
             if (i < slice.len and slice[i] == '\n') {
                 row += 1;
                 col = 0;
+            } else if (i < slice.len and slice[i] == '\r') {
+                // Skip carriage return — don't count as visible column
             } else {
                 col += 1;
             }
