@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root");
+const intercept = @import("intercept.zig");
 
 pub const max_entries: usize = if (@hasDecl(root, "build_options"))
     root.build_options.max_entries
@@ -165,7 +166,7 @@ pub fn finishResponseIntercept(idx: usize, duration_ms: u64) void {
 pub fn unpin(idx: usize) void {
     mutex.lock();
     defer mutex.unlock();
-    entries_backing[idx].pinned = false;
+    if (!entries_backing[idx].starred) entries_backing[idx].pinned = false;
 }
 
 /// Toggle the starred flag on an entry. Starred entries are pinned to survive ring buffer overflow.
@@ -193,6 +194,15 @@ pub fn remove(idx: usize) void {
 
 /// Clear all entries.
 pub fn clearAll() void {
+    // First, drop all pending intercepts to wake blocked proxy threads.
+    intercept.dropAll();
+
+    // Spin-wait for proxy threads to process drops and release their slots (up to 100ms).
+    var wait_iters: usize = 0;
+    while (intercept.getPendingCount() > 0 and wait_iters < 100) : (wait_iters += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
     mutex.lock();
     defer mutex.unlock();
     for (0..max_entries) |i| {
@@ -702,4 +712,25 @@ test "starred entry survives ring buffer overflow" {
     try testing.expect(starred.starred);
     try testing.expect(starred.pinned);
     try testing.expectEqualStrings("/starred", starred.getPath());
+}
+
+test "unpin preserves pinned flag on starred entries" {
+    clearAll();
+    // Push and pin an entry
+    const e = Entry{ .timestamp = 1 };
+    const idx = pushAndPin(e).?;
+
+    // Star the entry
+    toggleStar(idx);
+    const entry = getByBackingIndex(idx);
+    try testing.expect(entry.starred);
+    try testing.expect(entry.pinned);
+
+    // Unpin should NOT clear pinned because it's starred
+    unpin(idx);
+    try testing.expect(entry.pinned);
+
+    // Unstar, then unpin should clear pinned
+    toggleStar(idx);
+    try testing.expect(!entry.pinned);
 }

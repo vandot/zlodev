@@ -196,6 +196,19 @@ pub fn acceptAll() void {
     }
 }
 
+/// Drop all pending intercepts — sets decision to drop and signals all active slots.
+/// Used by clearAll() to wake blocked proxy threads before clearing entries.
+pub fn dropAll() void {
+    mutex.lock();
+    defer mutex.unlock();
+    for (&slots) |*s| {
+        if (s.active) {
+            s.decision.store(@intFromEnum(Decision.drop), .release);
+            s.event.set();
+        }
+    }
+}
+
 /// Count active (held) slots.
 pub fn getPendingCount() usize {
     mutex.lock();
@@ -423,4 +436,19 @@ test "multiple acquire and release cycle" {
     release(new_slot);
     release(acquired[0]);
     release(acquired[3]);
+}
+
+test "dropAll signals all active slots" {
+    releaseAll();
+    const s = acquire().?;
+    try std.testing.expect(s.active);
+    try std.testing.expectEqual(@as(usize, 1), getPendingCount());
+
+    dropAll();
+    try std.testing.expectEqual(@as(u8, @intFromEnum(Decision.drop)), s.decision.load(.acquire));
+
+    s.event.wait();
+    s.event.reset();
+    release(s);
+    try std.testing.expectEqual(@as(usize, 0), getPendingCount());
 }
