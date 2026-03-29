@@ -233,6 +233,8 @@ const EditState = struct {
     }
 
     fn applyToEntry(self: *const EditState, alloc: std.mem.Allocator) void {
+        requests.lock();
+        defer requests.unlock();
         const entry = requests.getByBackingIndex(self.backing_idx);
         if (self.resp_edit) {
             // Apply response edits: method_buf holds status code string
@@ -1605,10 +1607,15 @@ fn dropOrDeleteEntry(logical: usize) void {
 
 /// Replay a completed request by re-sending it to upstream.
 fn replayEntry(logical: usize) void {
-    const entry = requests.getOne(logical) orelse return;
-    if (entry.state == .intercepted or entry.resp_intercepted) return;
     const copy = std.heap.page_allocator.create(requests.Entry) catch return;
-    copy.* = entry.*;
+    if (!requests.copyEntry(logical, copy)) {
+        std.heap.page_allocator.destroy(copy);
+        return;
+    }
+    if (copy.state == .intercepted or copy.resp_intercepted) {
+        std.heap.page_allocator.destroy(copy);
+        return;
+    }
     const thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, proxy.replay, .{
         copy,
     }) catch {

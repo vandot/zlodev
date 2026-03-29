@@ -61,6 +61,7 @@ fn parseQuestion(data: []const u8) ?DnsQuestion {
     // Skip QNAME labels
     while (pos < data.len and data[pos] != 0) {
         const label_len = @as(usize, data[pos]);
+        if (label_len >= 0xC0) return null; // compression pointer — not supported
         pos += 1 + label_len;
         if (pos >= data.len) return null;
     }
@@ -80,6 +81,7 @@ fn decodeName(data: []const u8, name_start: usize, name_end: usize, buf: []u8) [
     var out: usize = 0;
     while (pos < name_end and data[pos] != 0) {
         const label_len = @as(usize, data[pos]);
+        if (label_len >= 0xC0) break; // compression pointer — stop decoding
         pos += 1;
         if (out > 0) {
             buf[out] = '.';
@@ -607,4 +609,16 @@ test "writeU32" {
     try testing.expectEqual(@as(u8, 0x34), buf[1]);
     try testing.expectEqual(@as(u8, 0x56), buf[2]);
     try testing.expectEqual(@as(u8, 0x78), buf[3]);
+}
+
+test "parseQuestion rejects compression pointers" {
+    // Craft a packet with a compression pointer (0xC0) where a label length should be
+    var pkt: [20]u8 = .{0} ** 20;
+    // Header (12 bytes)
+    pkt[4] = 0; pkt[5] = 1; // QDCOUNT = 1
+    // QNAME starting at byte 12: compression pointer instead of label
+    pkt[12] = 0xC0; // compression pointer
+    pkt[13] = 0x00; // pointer offset
+    const result = parseQuestion(&pkt);
+    try std.testing.expect(result == null);
 }

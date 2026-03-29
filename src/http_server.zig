@@ -132,6 +132,14 @@ fn handleRequest(stream: compat.SocketStream, domain: []const u8, ca_pem_path: [
         const health_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         stream.writeAll(health_response) catch return;
     } else {
+        // Reject paths with CRLF to prevent header injection
+        for (path) |ch| {
+            if (ch == '\r' or ch == '\n') {
+                const bad_response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
+                stream.writeAll(bad_response) catch return;
+                return;
+            }
+        }
         // Redirect to HTTPS
         var resp_buf: [1024]u8 = undefined;
         const response = std.fmt.bufPrint(&resp_buf,
