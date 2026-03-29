@@ -161,7 +161,7 @@ fn buildResponse(
             var pos: usize = 0;
             writeU16(buf, pos, header.id);
             pos += 2;
-            writeU16(buf, pos, 0x8000); // QR=1, RCODE=0
+            writeU16(buf, pos, 0x8400); // QR=1, AA=1, RCODE=0
             pos += 2;
             writeU16(buf, pos, 1); // QDCOUNT
             pos += 2;
@@ -181,7 +181,7 @@ fn buildResponse(
             var pos: usize = 0;
             writeU16(buf, pos, header.id);
             pos += 2;
-            writeU16(buf, pos, 0x8000); // QR=1, RCODE=0
+            writeU16(buf, pos, 0x8400); // QR=1, AA=1, RCODE=0
             pos += 2;
             writeU16(buf, pos, 1); // QDCOUNT
             pos += 2;
@@ -203,7 +203,7 @@ fn buildResponse(
     // Header
     writeU16(buf, pos, header.id);
     pos += 2;
-    writeU16(buf, pos, 0x8000); // QR=1, RCODE=0
+    writeU16(buf, pos, 0x8400); // QR=1, AA=1, RCODE=0
     pos += 2;
     writeU16(buf, pos, 1); // QDCOUNT
     pos += 2;
@@ -473,10 +473,8 @@ test "parseQuestion AAAA" {
 test "parseQuestion too small" {
     const data = [_]u8{ 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0 }; // < 12 bytes
     // parseQuestion requires at least 12 bytes for header
-    // With only 11 bytes, behavior depends on implementation
-    // The function should handle this gracefully
     const result = parseQuestion(&data);
-    _ = result; // Just verify it doesn't crash
+    try testing.expect(result == null);
 }
 
 test "decodeName simple" {
@@ -514,7 +512,7 @@ test "buildResponse A record for matching domain" {
     // Check response header
     const resp_header = parseHeader(&resp_buf);
     try testing.expectEqual(@as(u16, 0x1234), resp_header.id);
-    try testing.expectEqual(@as(u16, 0x8000), resp_header.flags); // QR=1, RCODE=0
+    try testing.expectEqual(@as(u16, 0x8400), resp_header.flags); // QR=1, AA=1, RCODE=0
     try testing.expectEqual(@as(u16, 1), resp_header.qd_count);
     try testing.expectEqual(@as(u16, 1), resp_header.an_count);
 
@@ -562,7 +560,7 @@ test "buildResponse unsupported type for matching domain" {
     try testing.expect(resp_len > 0);
 
     const resp_header = parseHeader(&resp_buf);
-    try testing.expectEqual(@as(u16, 0x8000), resp_header.flags); // NOERROR
+    try testing.expectEqual(@as(u16, 0x8400), resp_header.flags); // QR=1, AA=1, NOERROR
     try testing.expectEqual(@as(u16, 0), resp_header.an_count); // no answer
 }
 
@@ -575,7 +573,7 @@ test "buildResponse subdomain matches TLD" {
     try testing.expect(resp_len > 0);
 
     const resp_header = parseHeader(&resp_buf);
-    try testing.expectEqual(@as(u16, 0x8000), resp_header.flags); // NOERROR, not NXDOMAIN
+    try testing.expectEqual(@as(u16, 0x8400), resp_header.flags); // QR=1, AA=1, NOERROR
     try testing.expectEqual(@as(u16, 1), resp_header.an_count);
 }
 
@@ -588,7 +586,7 @@ test "buildResponse exact TLD matches" {
     try testing.expect(resp_len > 0);
 
     const resp_header = parseHeader(&resp_buf);
-    try testing.expectEqual(@as(u16, 0x8000), resp_header.flags); // NOERROR
+    try testing.expectEqual(@as(u16, 0x8400), resp_header.flags); // QR=1, AA=1, NOERROR
     try testing.expectEqual(@as(u16, 1), resp_header.an_count);
 }
 

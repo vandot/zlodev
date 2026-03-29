@@ -365,7 +365,7 @@ fn handleConnection(
 
         // Check for WebSocket upgrade
         if (isWebSocketUpgrade(req_hdr_section)) {
-            handleWebSocket(ssl, req_buf[0..total], config, &entry);
+            handleWebSocket(ssl, req_buf[0..total], config, upstream_port, &entry);
             return;
         }
 
@@ -619,7 +619,7 @@ fn handleConnection(
             return;
         }
 
-        if (fwd_body.len > 0) {
+        {
             var cl_buf: [64]u8 = undefined;
             const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{fwd_body.len}) catch "";
             upstream.writeAll(cl_hdr) catch return;
@@ -973,16 +973,16 @@ fn bufferChunkedBody(upstream: UpstreamConn, initial: []const u8, body: *[reques
     if (initial.len > 0) {
         for (initial) |byte| {
             chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured);
-            if (state == .done) return captured;
+            if (state == .done or state == .parse_error) return captured;
         }
     }
 
-    while (state != .done) {
+    while (state != .done and state != .parse_error) {
         const n = upstream.read(read_buf) catch break;
         if (n == 0) break;
         for (read_buf.*[0..n]) |byte| {
             chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured);
-            if (state == .done) return captured;
+            if (state == .done or state == .parse_error) return captured;
         }
     }
 
@@ -1202,7 +1202,7 @@ fn isChunkedEncoding(headers: []const u8) bool {
     return false;
 }
 
-const ChunkState = enum { size, size_ext, size_cr, data, data_cr, data_lf, trailer_start, trailer_line, trailer_line_cr, trailer_end_cr, done };
+const ChunkState = enum { size, size_ext, size_cr, data, data_cr, data_lf, trailer_start, trailer_line, trailer_line_cr, trailer_end_cr, done, parse_error };
 
 fn forwardChunkedBody(
     ssl: *ssl_c.SSL,
@@ -1220,17 +1220,17 @@ fn forwardChunkedBody(
         sslWriteAll(ssl, initial);
         for (initial) |byte| {
             chunkedStep(byte, &state, &chunk_remaining, &size_val, resp_body, &captured);
-            if (state == .done) return captured;
+            if (state == .done or state == .parse_error) return captured;
         }
     }
 
-    while (state != .done) {
+    while (state != .done and state != .parse_error) {
         const n = upstream.read(read_buf) catch break;
         if (n == 0) break;
         sslWriteAll(ssl, read_buf.*[0..n]);
         for (read_buf.*[0..n]) |byte| {
             chunkedStep(byte, &state, &chunk_remaining, &size_val, resp_body, &captured);
-            if (state == .done) return captured;
+            if (state == .done or state == .parse_error) return captured;
         }
     }
 
@@ -1252,7 +1252,10 @@ fn chunkedStep(
             } else if (byte == ';') {
                 state.* = .size_ext;
             } else {
-                const digit = std.fmt.charToDigit(byte, 16) catch return;
+                const digit = std.fmt.charToDigit(byte, 16) catch {
+                    state.* = .parse_error;
+                    return;
+                };
                 size_val.* = size_val.* * 16 + digit;
             }
         },
@@ -1301,6 +1304,7 @@ fn chunkedStep(
             state.* = .done;
         },
         .done => {},
+        .parse_error => {},
     }
 }
 
@@ -1319,12 +1323,13 @@ fn handleWebSocket(
     ssl: *ssl_c.SSL,
     raw_request: []const u8,
     config: *const ProxyConfig,
+    upstream_port: u16,
     entry: *requests.Entry,
 ) void {
     log.info("component=proxy op=websocket_upgrade uri={s}", .{entry.getPath()});
 
-    // Connect to upstream
-    const upstream_addr = std.net.Address.parseIp(config.target_host, config.target_port) catch |e| {
+    // Connect to upstream (use resolved route port, not default)
+    const upstream_addr = std.net.Address.parseIp(config.target_host, upstream_port) catch |e| {
         log.err("component=proxy op=websocket_connect error={any}", .{e});
         return;
     };

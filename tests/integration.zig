@@ -127,7 +127,7 @@ test "local mode: mDNS smoke test" {
     pollUrl(health_url, 30_000, true) catch |e| {
         if (e == error.PollTimeout) {
             std.debug.print("mDNS not available, skipping local mode test\n", .{});
-            return;
+            return error.SkipZigTest;
         }
         return e;
     };

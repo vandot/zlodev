@@ -7,32 +7,36 @@ pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) 
 
     var buf: [65536]u8 = undefined;
     var pos: usize = 0;
+    var truncated = false;
 
     const append = struct {
-        fn f(b: []u8, p: *usize, data: []const u8) void {
+        fn f(b: []u8, p: *usize, data: []const u8, trunc: *bool) void {
             const space = b.len - p.*;
             const n = @min(data.len, space);
             @memcpy(b[p.*..][0..n], data[0..n]);
             p.* += n;
+            if (n < data.len) trunc.* = true;
         }
     }.f;
 
     const appendByte = struct {
-        fn f(b: []u8, p: *usize, ch: u8) void {
+        fn f(b: []u8, p: *usize, ch: u8, trunc: *bool) void {
             if (p.* < b.len) {
                 b[p.*] = ch;
                 p.* += 1;
+            } else {
+                trunc.* = true;
             }
         }
     }.f;
 
-    append(&buf, &pos, "curl -k");
+    append(&buf, &pos, "curl -k", &truncated);
 
     // Method (skip -X for GET since it's the default)
     const method = entry.getMethod();
     if (!std.mem.eql(u8, method, "GET")) {
-        append(&buf, &pos, " -X ");
-        append(&buf, &pos, method);
+        append(&buf, &pos, " -X ", &truncated);
+        append(&buf, &pos, method, &truncated);
     }
 
     // Headers
@@ -41,36 +45,39 @@ pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) 
     while (hdr_iter.next()) |header| {
         if (header.len == 0) continue;
         if (header.len >= 5 and containsIgnoreCase(header[0..5], "host:")) continue;
-        append(&buf, &pos, " -H '");
+        append(&buf, &pos, " -H '", &truncated);
         for (header) |ch| {
             if (ch == '\'') {
-                append(&buf, &pos, "'\\''");
+                append(&buf, &pos, "'\\''", &truncated);
             } else {
-                appendByte(&buf, &pos, ch);
+                appendByte(&buf, &pos, ch, &truncated);
             }
         }
-        appendByte(&buf, &pos, '\'');
+        appendByte(&buf, &pos, '\'', &truncated);
     }
 
     // Body
     const body = entry.getReqBody();
     if (body.len > 0) {
-        append(&buf, &pos, " -d '");
+        append(&buf, &pos, " -d '", &truncated);
         for (body) |ch| {
             if (ch == '\'') {
-                append(&buf, &pos, "'\\''");
+                append(&buf, &pos, "'\\''", &truncated);
             } else {
-                appendByte(&buf, &pos, ch);
+                appendByte(&buf, &pos, ch, &truncated);
             }
         }
-        appendByte(&buf, &pos, '\'');
+        appendByte(&buf, &pos, '\'', &truncated);
     }
 
     // URL
-    append(&buf, &pos, " 'https://");
-    append(&buf, &pos, domain);
-    append(&buf, &pos, entry.getPath());
-    appendByte(&buf, &pos, '\'');
+    append(&buf, &pos, " 'https://", &truncated);
+    append(&buf, &pos, domain, &truncated);
+    append(&buf, &pos, entry.getPath(), &truncated);
+    appendByte(&buf, &pos, '\'', &truncated);
+
+    // If truncated, don't copy a broken curl command to clipboard
+    if (truncated) return;
 
     // Pipe to clipboard (platform-specific)
     const clip_cmd: []const []const u8 = switch (@import("builtin").os.tag) {
