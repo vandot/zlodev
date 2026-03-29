@@ -442,11 +442,27 @@ fn removeFromGitCaBundle(allocator: std.mem.Allocator) void {
     const end_marker = std.mem.indexOfPos(u8, content, after_begin, ca_bundle_marker_end) orelse return;
     const end = end_marker + ca_bundle_marker_end.len;
 
-    // Write content without the marked section
-    const file = std.fs.createFileAbsolute(bundle_path, .{}) catch return;
-    defer file.close();
-    file.writeAll(content[0..begin]) catch return;
-    file.writeAll(content[end..]) catch return;
+    // Write to a temporary file, then rename atomically
+    const tmp_path = std.fmt.allocPrint(allocator, "{s}.zlodev_tmp", .{bundle_path}) catch return;
+    defer allocator.free(tmp_path);
+
+    const tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch return;
+    tmp_file.writeAll(content[0..begin]) catch {
+        tmp_file.close();
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return;
+    };
+    tmp_file.writeAll(content[end..]) catch {
+        tmp_file.close();
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return;
+    };
+    tmp_file.close();
+
+    std.fs.renameAbsolute(tmp_path, bundle_path) catch {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return;
+    };
     std.debug.print("CA removed from Git CA bundle\n", .{});
 }
 
