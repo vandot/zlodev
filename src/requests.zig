@@ -135,6 +135,17 @@ pub fn getByBackingIndex(idx: usize) *Entry {
     return &entries_backing[idx];
 }
 
+/// Lock the entries mutex. Must be paired with unlock().
+/// Use for external code that needs to modify entries in-place.
+pub fn lock() void {
+    mutex.lock();
+}
+
+/// Unlock the entries mutex.
+pub fn unlock() void {
+    mutex.unlock();
+}
+
 /// Update a pinned entry in-place (thread-safe) and unpin it.
 /// req_body is not updated here — it's already set during pushAndPin (and may have been edited).
 pub fn finishEntry(idx: usize, status: u16, duration_ms: u64, resp_headers: []const u8, resp_body: []const u8) void {
@@ -270,6 +281,27 @@ pub fn getOne(index: usize) ?*const Entry {
         seen += 1;
     }
     return null;
+}
+
+/// Copy an entry by logical index into caller-provided storage, under the mutex.
+/// Returns true if the entry was found and copied, false otherwise.
+pub fn copyEntry(logical: usize, dest: *Entry) bool {
+    mutex.lock();
+    defer mutex.unlock();
+    ensureInit();
+    if (count == 0) return false;
+    const ring_start = if (count >= max_entries) write_pos else 0;
+    var seen: usize = 0;
+    for (0..count) |i| {
+        const idx = (ring_start + i) % max_entries;
+        if (entries_backing[idx].state == .deleted) continue;
+        if (seen == logical) {
+            dest.* = entries_backing[idx];
+            return true;
+        }
+        seen += 1;
+    }
+    return false;
 }
 
 pub fn getCount() usize {

@@ -157,9 +157,9 @@ fn generateCA(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []cons
 
     // Validity: now to +3650 days
     const not_before = c.X509_get_notBefore(ca_cert);
-    _ = c.X509_gmtime_adj(not_before, 0);
+    if (c.X509_gmtime_adj(not_before, 0) == null) return error.CertCreateFailed;
     const not_after = c.X509_get_notAfter(ca_cert);
-    _ = c.X509_gmtime_adj(not_after, 3650 * 24 * 60 * 60);
+    if (c.X509_gmtime_adj(not_after, 3650 * 24 * 60 * 60) == null) return error.CertCreateFailed;
 
     // Subject name
     const name = c.X509_get_subject_name(ca_cert) orelse return error.CertCreateFailed;
@@ -225,9 +225,9 @@ fn generateDomainCert(allocator: std.mem.Allocator, domain: []const u8, ca_cert:
 
     // Validity: now to +398 days
     const not_before = c.X509_get_notBefore(domain_cert);
-    _ = c.X509_gmtime_adj(not_before, 0);
+    if (c.X509_gmtime_adj(not_before, 0) == null) return error.CertCreateFailed;
     const not_after = c.X509_get_notAfter(domain_cert);
-    _ = c.X509_gmtime_adj(not_after, 398 * 24 * 60 * 60);
+    if (c.X509_gmtime_adj(not_after, 398 * 24 * 60 * 60) == null) return error.CertCreateFailed;
 
     // Subject name
     const name = c.X509_get_subject_name(domain_cert) orelse return error.CertCreateFailed;

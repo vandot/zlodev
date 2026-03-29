@@ -444,7 +444,7 @@ fn handleConnection(
                         drop_entry.duration_ms = if (drop_elapsed > 0) @intCast(drop_elapsed) else 0;
                         requests.unpin(intercept_backing_idx);
                         sslSendError(ssl, 502, "Dropped by intercept");
-                        if (keep_alive) continue else return;
+                        return;
                     }
 
                     // Accept — update state and continue to upstream
@@ -481,7 +481,7 @@ fn handleConnection(
                         requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
                     }
                     sslSendError(ssl, 502, "Bad Gateway");
-                    if (keep_alive) continue else return;
+                    return;
                 };
                 addr_list = al;
                 if (al.addrs.len == 0) {
@@ -490,7 +490,7 @@ fn handleConnection(
                         requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
                     }
                     sslSendError(ssl, 502, "Bad Gateway");
-                    if (keep_alive) continue else return;
+                    return;
                 }
                 break :blk al.addrs[0];
             } else {
@@ -499,7 +499,7 @@ fn handleConnection(
                         requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
                     }
                     sslSendError(ssl, 502, "Bad Gateway");
-                    if (keep_alive) continue else return;
+                    return;
                 };
             }
         };
@@ -510,7 +510,7 @@ fn handleConnection(
                 requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
             }
             sslSendError(ssl, 502, "Bad Gateway");
-            if (keep_alive) continue else return;
+            return;
         };
         posix.connect(upstream_sock, &upstream_addr.any, upstream_addr.getOsSockLen()) catch |e| {
             log.err("component=proxy conn={d} op=upstream_connect host={s} error={any}", .{ conn_id, upstream_host, e });
@@ -520,7 +520,7 @@ fn handleConnection(
                 requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
             }
             sslSendError(ssl, 502, "Bad Gateway");
-            if (keep_alive) continue else return;
+            return;
         };
 
         // Wrap in UpstreamConn — TLS for external, plain socket for local
@@ -534,7 +534,7 @@ fn handleConnection(
                         requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
                     }
                     sslSendError(ssl, 502, "Bad Gateway");
-                    if (keep_alive) continue else return;
+                    return;
                 };
                 _ = ssl_c.SSL_set_fd(us, compat.socketToFd(upstream_sock));
                 // Set SNI hostname
@@ -552,7 +552,7 @@ fn handleConnection(
                         requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
                     }
                     sslSendError(ssl, 502, "Bad Gateway");
-                    if (keep_alive) continue else return;
+                    return;
                 }
                 upstream_ssl_obj = us;
             }
@@ -612,6 +612,13 @@ fn handleConnection(
 
         // Add correct Content-Length for the (possibly edited) body
         const fwd_body = fwd_entry.getReqBody();
+
+        // If body was truncated, we can't forward it correctly — reject
+        if (fwd_entry.req_body_truncated) {
+            sslSendError(ssl, 413, "Request body too large for proxy buffer");
+            return;
+        }
+
         if (fwd_body.len > 0) {
             var cl_buf: [64]u8 = undefined;
             const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{fwd_body.len}) catch "";
@@ -768,7 +775,7 @@ fn handleConnection(
                         drop_entry.duration_ms = if (drop_elapsed > 0) @intCast(drop_elapsed) else 0;
                         requests.unpin(resp_intercept_idx);
                         sslSendError(ssl, 502, "Dropped by intercept");
-                        if (keep_alive) continue else return;
+                        return;
                     }
 
                     // Accept — read back the (possibly edited) entry for forwarding

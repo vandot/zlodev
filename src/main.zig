@@ -174,7 +174,7 @@ pub fn main() !void {
     switch (command) {
         .install => {
             if (dns_only and cert_only) {
-                std.debug.print("-d and -c are mutually exclusive\n", .{});
+                std.debug.print("--dns and --cert are mutually exclusive\n", .{});
                 std.process.exit(1);
             }
             if (dns_only) {
@@ -194,7 +194,7 @@ pub fn main() !void {
         },
         .uninstall => {
             if (dns_only and cert_only) {
-                std.debug.print("-d and -c are mutually exclusive\n", .{});
+                std.debug.print("--dns and --cert are mutually exclusive\n", .{});
                 std.process.exit(1);
             }
             if (dns_only) {
