@@ -1,8 +1,14 @@
 # zlodev
 
+[![CI](https://github.com/vandot/zlodev/actions/workflows/ci.yml/badge.svg)](https://github.com/vandot/zlodev/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/vandot/zlodev)](https://github.com/vandot/zlodev/releases) ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
+
 Local reverse proxy with TLS termination, custom DNS, and a terminal UI.
 
 zlodev sits between your browser and your local dev server, providing HTTPS with a real certificate, a custom domain (`https://dev.lo`), and a TUI for inspecting, intercepting, and replaying HTTP traffic.
+
+<p align="center">
+  <img src="docs/demo.gif" alt="zlodev TUI demo" width="800">
+</p>
 
 ## Features
 

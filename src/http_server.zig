@@ -48,6 +48,10 @@ pub fn serve(bind_addr: []const u8, domain: []const u8, ca_pem_path: []const u8,
         };
         consecutive_failures = 0;
 
+        // Set receive timeout to prevent slow clients from exhausting the thread pool
+        const timeout = posix.timeval{ .sec = 5, .usec = 0 };
+        posix.setsockopt(conn.stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+
         const stream = compat.SocketStream{ .handle = conn.stream.handle };
         pool.spawn(handleRequest, .{ stream, domain, ca_pem_path, ca_der_path }) catch |e| {
             log.err("component=http op=pool_spawn error={any}", .{e});

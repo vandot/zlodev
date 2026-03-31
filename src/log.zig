@@ -4,6 +4,7 @@ const compat = @import("compat.zig");
 
 var muted: bool = false;
 var log_file: ?std.fs.File = null;
+var log_mutex: std.Thread.Mutex = .{};
 
 pub fn mute() void {
     muted = true;
@@ -59,6 +60,8 @@ pub fn err(comptime fmt: []const u8, args: anytype) void {
         if (log_file) |f| {
             var line_buf: [4096]u8 = undefined;
             const line = std.fmt.bufPrint(&line_buf, "[{s}] ERROR " ++ fmt ++ "\n", .{ts} ++ args) catch return;
+            log_mutex.lock();
+            defer log_mutex.unlock();
             f.writeAll(line) catch {};
         }
     } else {
