@@ -1196,7 +1196,11 @@ fn isChunkedEncoding(headers: []const u8) bool {
     while (iter.next()) |header| {
         if (startsWithIgnoreCase(header, "transfer-encoding:")) {
             const value = std.mem.trimLeft(u8, header["transfer-encoding:".len..], " ");
-            if (startsWithIgnoreCase(value, "chunked")) return true;
+            var token_iter = std.mem.splitScalar(u8, value, ',');
+            while (token_iter.next()) |token| {
+                const trimmed = std.mem.trim(u8, token, " ");
+                if (trimmed.len == 7 and startsWithIgnoreCase(trimmed, "chunked")) return true;
+            }
         }
     }
     return false;
