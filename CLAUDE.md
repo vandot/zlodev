@@ -30,9 +30,9 @@ dns.zig           UDP DNS server (resolves *.lo → 127.0.0.1)
 http_server.zig   HTTP server on port 80 (CA cert download page, HTTPS redirect)
 cert.zig          Certificate generation and system trust store management (BoringSSL)
 requests.zig      Thread-safe ring buffer for captured request/response entries
-intercept.zig     Request interception (pattern matching, hold/accept/drop with thread sync)
+intercept.zig     Request interception (pattern matching, hold/accept/drop with thread sync, dropAll/getPendingCount)
 shutdown.zig      Global atomic shutdown flag + signal handlers (SIGINT/SIGTERM)
-log.zig           Structured logging (stderr or file when TUI is active)
+log.zig           Structured logging (stderr or file when TUI is active, mutex-protected writes)
 search.zig        Entry search/filter logic
 clipboard.zig     Copy-as-curl and case-insensitive string helpers
 har.zig           HAR (HTTP Archive) export
@@ -43,11 +43,11 @@ compat.zig        Cross-platform compatibility (Windows socket I/O, networking i
 ## Key design decisions
 
 - **Thread model**: proxy uses a 64-thread pool (256KB stacks), HTTP server uses 8 threads, DNS is single-threaded. All loops use `poll()` with 1s timeout + `shutdown.isRunning()` check.
-- **Ring buffer**: `requests.zig` stores entries in a fixed-size ring (`max_entries`, default 500). Entries are ~69KB each (fixed-size arrays for headers/body). Pinned entries (intercepted, WebSocket, starred) are skipped during overwrite.
+- **Ring buffer**: `requests.zig` stores entries in a fixed-size ring (`max_entries`, default 500). Entries are ~69KB each (fixed-size arrays for headers/body). Pinned entries (intercepted, WebSocket, starred) are skipped during overwrite. `copyEntry()` provides mutex-protected entry copies for TUI replay. `lock()`/`unlock()` expose the mutex for external callers (e.g. TUI edits). `clearAll()` calls `intercept.dropAll()` and waits for pending entries to drain.
 - **TLS**: BoringSSL via `@cImport` (API-compatible with OpenSSL). `SSL_set_fd` uses `BIO_NOCLOSE` — the caller must close the socket after `SSL_free`.
 - **Entry lifecycle**: Normal requests use `push()`. Intercepted requests use `pushAndPin()` → `finishEntry()` (which unpins). The TUI can edit pinned entries in-place before accepting. Starred entries (`*` key) set `pinned=true` via `toggleStar()` to survive ring buffer overflow; `starred` is a separate bool from `pinned` so unstarring doesn't interfere with intercept pins.
 - **Replay**: Connects to the proxy's own TLS endpoint (127.0.0.1:443) so the request goes through the full proxy path and gets captured naturally.
-- **Chunked encoding**: A state machine parser (`chunkedStep`) decodes chunks for body capture while forwarding raw chunked data to the client.
+- **Chunked encoding**: A state machine parser (`chunkedStep`) decodes chunks for body capture while forwarding raw chunked data to the client. Invalid hex digits transition to `.parse_error` state, and all forwarding loops check for this alongside `.done`.
 - **Routing**: `--route=api=3001` (subdomain) and `--route=/api=3001` (path prefix). `resolveRoute()` in proxy.zig matches Host header for subdomains, longest prefix for paths, falls back to default port. Each entry stores `route_index` for TUI color-coding. Routes can target external hosts (`--route=api=staging.example.com:443`) — the `Route.hostname` field is set, and the proxy connects via outbound TLS with SNI, rewrites `Host` header to upstream, and rewrites `Set-Cookie Domain=` to the proxy domain.
 - **Config file**: `.zlodev` in project directory, parsed by `readConfigFile()` in main.zig. One option per line (same keys as CLI). CLI args override config values. Only read for `start` command. Supports `intercept=PATTERN` for default intercept pattern.
 - **Intercept patterns**: `intercept.zig` stores a pattern (`pattern_buf`/`pattern_len` with `pattern_mutex`) and a `Phase` (`.both`, `.request`, `.response`). `shouldInterceptRequest`/`shouldInterceptResponse` do case-insensitive substring match against method, path, or combined "METHOD PATH". Empty pattern matches all. Prefix `req:` intercepts only requests, `resp:` only responses, no prefix = both. TUI prompts for pattern on `i` key. Config file can set a default pattern.
@@ -61,6 +61,12 @@ compat.zig        Cross-platform compatibility (Windows socket I/O, networking i
 - BoringSSL interop via `@cImport` — C types/functions accessed through `ssl_c.*` (proxy) or `c.*` (cert)
 - TUI renders at 50ms intervals via `std.Thread.sleep`, not event-driven
 - All string comparisons for HTTP headers use `startsWithIgnoreCase` (defined locally in proxy.zig and http_server.zig)
+- `isChunkedEncoding` splits Transfer-Encoding by comma and checks each token (handles `gzip, chunked`)
+- HTTP server sets `SO_RCVTIMEO` (5s) on accepted connections to prevent slow-client thread exhaustion
+- HTTP server rejects paths containing `\r` or `\n` to prevent CRLF injection in redirects
+- DNS server sets the AA (Authoritative Answer) flag and rejects compression pointers in queries
+- `cert.zig` uses atomic write (temp file + rename) for git CA bundle modification
+- `clipboard.zig` detects truncation during curl command building and skips clipboard copy if truncated
 
 ## Important notes
 
@@ -71,3 +77,7 @@ compat.zig        Cross-platform compatibility (Windows socket I/O, networking i
 - CLI flag `-c` is `--config`, not `--cert`. `-d` is removed — use `--dns` and `--cert` (no short forms).
 - Subdomain routes are blocked in local mode (`-l`) since mDNS doesn't support arbitrary subdomains.
 - `start --dns` cannot be combined with other start options (port, bind, routes, etc.).
+- Error messages use full flag names (`--dns` and `--cert`, not `-d` and `-c`).
+- Proxy rejects intercepted requests with truncated bodies (413 status) rather than forwarding partial data.
+- After `sslSendError`, always `return` (never `continue` in keep-alive loop) since the TLS state may be corrupted.
+- `forwardResponseFromEntry` always emits `Content-Length`, even for zero-length bodies.
