@@ -807,7 +807,7 @@
       <div class="feature reveal">
         <div class="feature-icon">&gt;_</div>
         <h3>Terminal UI</h3>
-        <p>Live request list with method, path, status, timing, and body size. Detail view for headers and body.</p>
+        <p>Live request list with method, path, status, timing, and body size. Detail view for headers and body. Optional split-pane logs for your dev server output.</p>
       </div>
       <div class="feature reveal">
         <div class="feature-icon">||</div>
@@ -911,21 +911,34 @@
       <div class="step reveal">
         <div class="step-num">3</div>
         <div class="step-content">
-          <h3>Start your dev server</h3>
-          <pre><span class="prompt">$</span>npm run dev <span class="comment"># or whatever starts your app</span></pre>
-        </div>
-      </div>
-      <div class="step reveal">
-        <div class="step-num">4</div>
-        <div class="step-content">
-          <h3>Start zlodev</h3>
-          <pre><span class="prompt">$</span>zlodev start</pre>
+          <h3>Start zlodev with your dev server</h3>
+          <pre><span class="prompt">$</span>zlodev start --command="npm run dev"</pre>
+          <p style="font-size: 13px; color: var(--text-muted); margin-top: 12px;">zlodev will start your dev server and show logs in a split-pane below the request list. Press <code>l</code> to toggle logs, <code>Tab</code> to switch focus, <code>j</code>/<code>k</code> to scroll, and <code>R</code> to restart.</p>
         </div>
       </div>
     </div>
     <p class="quickstart-result reveal">
       Your app is now at <code>https://dev.lo</code>
     </p>
+    <div style="margin-top: 48px; padding-top: 32px; border-top: 1px solid var(--border);">
+      <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 20px;">Or run your dev server separately:</p>
+      <div class="steps" style="margin-top: 24px;">
+        <div class="step reveal">
+          <div class="step-num">A</div>
+          <div class="step-content">
+            <h3>Start your dev server</h3>
+            <pre><span class="prompt">$</span>npm run dev</pre>
+          </div>
+        </div>
+        <div class="step reveal">
+          <div class="step-num">B</div>
+          <div class="step-content">
+            <h3>Start zlodev</h3>
+            <pre><span class="prompt">$</span>zlodev start</pre>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -951,6 +964,34 @@
       <div class="detail-card reveal">
         <h3>HTTP server</h3>
         <p>A plain HTTP server on port 80 serves the CA certificate download page for mobile devices and redirects other traffic to HTTPS.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<section class="details">
+  <div class="container">
+    <div class="section-label reveal">Development</div>
+    <div class="section-title reveal">Launch and monitor your dev server</div>
+    <p class="section-subtitle reveal">zlodev can start and monitor your dev server alongside the proxy, showing logs in a split-pane TUI.</p>
+    <div class="details-grid">
+      <div class="detail-card reveal">
+        <h3>Integrated command runner</h3>
+        <p>Use <code>--command="npm run dev"</code> to let zlodev start your dev server. The process launches alongside the proxy and restarts when you press <code>R</code> in the logs pane.</p>
+      </div>
+      <div class="detail-card reveal">
+        <h3>Split-pane logs</h3>
+        <p>Server output appears in a bottom pane (press <code>l</code> to toggle). Switch focus between requests and logs with <code>Tab</code>, scroll with <code>j</code>/<code>k</code>, and toggle autoscroll with <code>s</code>.</p>
+      </div>
+      <div class="detail-card reveal">
+        <h3>Clean process management</h3>
+        <p>SIGTERM with graceful timeout, SIGKILL fallback on Unix. Job objects for clean termination on Windows. Logs continue after restart without losing history.</p>
+      </div>
+      <div class="detail-card reveal">
+        <h3>Config file integration</h3>
+        <p>Store the command in your <code>.zlodev</code> config file: <code>command=npm run dev</code>. One less CLI flag to remember.</p>
       </div>
     </div>
   </div>

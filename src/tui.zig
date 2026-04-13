@@ -7,6 +7,7 @@ const proxy = @import("proxy.zig");
 const har = @import("har.zig");
 const clipboard = @import("clipboard.zig");
 const search = @import("search.zig");
+const subprocess = @import("subprocess.zig");
 
 pub const Event = union(enum) {
     key_press: vaxis.Key,
@@ -360,7 +361,7 @@ const EditState = struct {
     }
 };
 
-pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, routes: []const proxy.Route) !void {
+pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, routes: []const proxy.Route, has_command: bool) !void {
     const proxy_text = try std.fmt.allocPrint(alloc, "https -> 127.0.0.1:{d}", .{target_port});
     defer alloc.free(proxy_text);
     const ca_text = try std.fmt.allocPrint(alloc, "http://{s}/ca", .{domain});
@@ -399,7 +400,16 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
 
     var cursor: usize = 0;
     var scroll_offset: usize = 0;
-    var autoscroll: bool = true;
+    var req_autoscroll: bool = true;
+    var logs_visible: bool = has_command;
+    _ = &logs_visible;
+    const Focus = enum { requests, logs };
+    var focus: Focus = .requests;
+    _ = &focus;
+    var logs_scroll: usize = 0;
+    _ = &logs_scroll;
+    var logs_autoscroll: bool = true;
+    _ = &logs_autoscroll;
     var last_count: usize = 0;
     var view: View = .list;
     var detail_scroll: usize = 0;
@@ -488,6 +498,15 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                         show_help = false;
                         continue;
                     }
+                    if (key.matches('l', .{}) and has_command) {
+                        logs_visible = !logs_visible;
+                        if (!logs_visible) focus = .requests;
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.tab, .{}) and logs_visible) {
+                        focus = if (focus == .requests) .logs else .requests;
+                        continue;
+                    }
 
                     switch (view) {
                         .list => {
@@ -497,16 +516,44 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 search_len = 0;
                                 continue;
                             }
-                            if (key.matches('s', .{}))
-                                autoscroll = !autoscroll;
-                            if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{}))
-                                cursor +|= 1;
-                            if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{}))
-                                cursor -|= 1;
-                            if (key.matches('G', .{}))
-                                cursor = std.math.maxInt(usize);
-                            if (key.matches('g', .{}))
-                                cursor = 0;
+                            if (key.matches('s', .{})) {
+                                if (focus == .logs and logs_visible) {
+                                    logs_autoscroll = !logs_autoscroll;
+                                } else {
+                                    req_autoscroll = !req_autoscroll;
+                                }
+                            }
+                            if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+                                if (focus == .logs and logs_visible) {
+                                    logs_scroll +|= 1;
+                                    logs_autoscroll = false;
+                                } else {
+                                    cursor +|= 1;
+                                }
+                            }
+                            if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+                                if (focus == .logs and logs_visible) {
+                                    logs_scroll -|= 1;
+                                    logs_autoscroll = false;
+                                } else {
+                                    cursor -|= 1;
+                                }
+                            }
+                            if (key.matches('G', .{})) {
+                                if (focus == .logs and logs_visible) {
+                                    const total = subprocess.getLineCount();
+                                    logs_scroll = total;
+                                } else {
+                                    cursor = std.math.maxInt(usize);
+                                }
+                            }
+                            if (key.matches('g', .{})) {
+                                if (focus == .logs and logs_visible) {
+                                    logs_scroll = 0;
+                                } else {
+                                    cursor = 0;
+                                }
+                            }
                             if (key.matches(vaxis.Key.escape, .{})) {
                                 // Clear filter
                                 search_len = 0;
@@ -572,12 +619,20 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 edit_state.loadFromEntry(alloc, e, backing_idx, false);
                                 view = .edit;
                             }
-                            if (key.matches('R', .{}) and filtered_count > 0) {
-                                replayEntry(filter_map[cursor]);
-                                const msg = "Replayed!";
-                                @memcpy(flash_buf[0..msg.len], msg);
-                                flash_len = msg.len;
-                                flash_time = std.time.milliTimestamp();
+                            if (key.matches('R', .{})) {
+                                if (focus == .logs and logs_visible and has_command) {
+                                    subprocess.restart();
+                                    const msg = "Restarting...";
+                                    @memcpy(flash_buf[0..msg.len], msg);
+                                    flash_len = msg.len;
+                                    flash_time = std.time.milliTimestamp();
+                                } else if (filtered_count > 0) {
+                                    replayEntry(filter_map[cursor]);
+                                    const msg = "Replayed!";
+                                    @memcpy(flash_buf[0..msg.len], msg);
+                                    flash_len = msg.len;
+                                    flash_time = std.time.milliTimestamp();
+                                }
                             }
                             if (key.matches('e', .{}) and filtered_count > 0) {
                                 const real_idx = filter_map[cursor];
@@ -611,7 +666,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             } else if (key.matches('g', .{})) {
                                 detail_scroll = 0;
                             } else if (key.matches('s', .{})) {
-                                autoscroll = !autoscroll;
+                                req_autoscroll = !req_autoscroll;
                             } else if (key.matches('i', .{})) {
                                 if (intercept.isEnabled()) {
                                     intercept.toggle();
@@ -767,7 +822,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
             filtered_count = raw_count;
         }
 
-        if (autoscroll and current_count > last_count and filtered_count > 0) {
+        if (req_autoscroll and current_count > last_count and filtered_count > 0) {
             cursor = filtered_count - 1;
             if (view == .detail) detail_scroll = 0;
         }
@@ -782,17 +837,64 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
 
         switch (view) {
             .list => {
-                const header_rows = drawHeader(win, domain, proxy_text, ca_text, raw_count, autoscroll, routes);
-                const available_rows = if (win.height > header_rows + 2) win.height - header_rows - 2 else 1;
+                const header_rows = drawHeader(win, domain, proxy_text, ca_text, raw_count, req_autoscroll, routes);
+                const footer_h: u16 = 2; // footer + search/intercept bar
+                const body_h = if (win.height > header_rows + footer_h) win.height - header_rows - footer_h else 1;
 
-                // Adjust scroll to keep cursor visible
-                if (cursor < scroll_offset) {
-                    scroll_offset = cursor;
-                } else if (cursor >= scroll_offset + available_rows) {
-                    scroll_offset = cursor - available_rows + 1;
+                if (logs_visible) {
+                    // Split layout: 60% requests, 40% logs, 2 rows for borders
+                    const border_rows: u16 = 2;
+                    const usable = if (body_h > border_rows) body_h - border_rows else 1;
+                    const req_h: u16 = @max(1, usable * 60 / 100);
+                    const logs_h: u16 = if (usable > req_h) usable - req_h else 1;
+
+                    // Requests border + pane
+                    drawBorder(win, header_rows, "", focus == .requests);
+                    const req_start = header_rows + 1;
+
+                    // Create a child window for the requests pane so drawRequests is clipped
+                    const req_win = win.child(.{
+                        .x_off = 0,
+                        .y_off = req_start,
+                        .width = win.width,
+                        .height = req_h,
+                    });
+                    // Adjust scroll to keep cursor visible within req_h
+                    if (cursor < scroll_offset) {
+                        scroll_offset = cursor;
+                    } else if (cursor >= scroll_offset + req_h) {
+                        scroll_offset = cursor - req_h + 1;
+                    }
+                    // Pass req_win with start_row=0 (drawing relative to the child window), draw_footer=false
+                    drawRequests(req_win, buf_slice, &filter_map, filtered_count, 0, scroll_offset, cursor, req_autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len], false, has_command);
+
+                    // Logs border + pane
+                    const logs_border_y = req_start + req_h;
+                    var label_buf: [32]u8 = undefined;
+                    const label = if (logs_autoscroll)
+                        (std.fmt.bufPrint(&label_buf, " logs (autoscroll) ", .{}) catch " logs ")
+                    else
+                        " logs ";
+                    drawBorder(win, logs_border_y, label, focus == .logs);
+                    drawLogs(win, logs_border_y + 1, logs_h, logs_autoscroll, logs_scroll);
+
+                    // Draw footer in main window below logs pane
+                    if (intercept_mode)
+                        drawInterceptBar(win, intercept_buf[0..intercept_len])
+                    else if (search_mode or search_term.len > 0)
+                        drawSearchBar(win, search_mode, search_term)
+                    else
+                        drawFooter(win, req_autoscroll, show_help, has_command);
+                } else {
+                    // Original single-pane layout (unchanged)
+                    const available_rows = if (win.height > header_rows + 2) win.height - header_rows - 2 else 1;
+                    if (cursor < scroll_offset) {
+                        scroll_offset = cursor;
+                    } else if (cursor >= scroll_offset + available_rows) {
+                        scroll_offset = cursor - available_rows + 1;
+                    }
+                    drawRequests(win, buf_slice, &filter_map, filtered_count, header_rows, scroll_offset, cursor, req_autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len], true, has_command);
                 }
-
-                drawRequests(win, buf_slice, &filter_map, filtered_count, header_rows, scroll_offset, cursor, autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len]);
             },
             .detail => {
                 // Resolve filtered cursor to real logical index
@@ -800,7 +902,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                     detail_index = filter_map[cursor];
                 }
                 const entry = if (filtered_count > 0) requests.getOne(detail_index) else null;
-                drawDetail(alloc, win, entry, detail_index, raw_count, autoscroll, &detail_scroll, show_help, show_body);
+                drawDetail(alloc, win, entry, detail_index, raw_count, req_autoscroll, &detail_scroll, show_help, show_body);
             },
             .edit => {
                 drawEdit(win, &edit_state);
@@ -939,16 +1041,20 @@ fn drawRequests(
     search_term: []const u8,
     imode: bool,
     iterm: []const u8,
+    draw_footer: bool,
+    has_cmd: bool,
 ) void {
     if (filtered_count == 0) {
         const msg = if (search_term.len > 0) "no matching requests" else "no requests yet";
         printAt(win, 2, start_row, msg, .{ .fg = .{ .rgb = .{ 0x6e, 0x76, 0x81 } } });
-        if (imode)
-            drawInterceptBar(win, iterm)
-        else if (search_mode or search_term.len > 0)
-            drawSearchBar(win, search_mode, search_term)
-        else
-            drawFooter(win, autoscroll, show_help);
+        if (draw_footer) {
+            if (imode)
+                drawInterceptBar(win, iterm)
+            else if (search_mode or search_term.len > 0)
+                drawSearchBar(win, search_mode, search_term)
+            else
+                drawFooter(win, autoscroll, show_help, has_cmd);
+        }
         return;
     }
 
@@ -979,12 +1085,14 @@ fn drawRequests(
         drawRequestLine(win, row, entry, selected);
     }
 
-    if (imode)
-        drawInterceptBar(win, iterm)
-    else if (search_mode or search_term.len > 0)
-        drawSearchBar(win, search_mode, search_term)
-    else
-        drawFooter(win, autoscroll, show_help);
+    if (draw_footer) {
+        if (imode)
+            drawInterceptBar(win, iterm)
+        else if (search_mode or search_term.len > 0)
+            drawSearchBar(win, search_mode, search_term)
+        else
+            drawFooter(win, autoscroll, show_help, has_cmd);
+    }
 }
 
 fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Entry, selected: bool) void {
@@ -1385,11 +1493,74 @@ fn drawSearchBar(win: vaxis.Window, search_mode: bool, search_term: []const u8) 
     }
 }
 
-fn drawFooter(win: vaxis.Window, _: bool, show_help: bool) void {
+fn drawFooter(win: vaxis.Window, _: bool, show_help: bool, has_cmd: bool) void {
     const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
     const footer_row = win.height -| 1;
-    printAt(win, 2, footer_row, "? help", .{ .fg = dim });
+    if (has_cmd) {
+        printAt(win, 2, footer_row, "? help  l: logs  tab: focus  R: restart", .{ .fg = dim });
+    } else {
+        printAt(win, 2, footer_row, "? help", .{ .fg = dim });
+    }
     if (show_help) drawHelpOverlay(win, .list);
+}
+
+fn drawBorder(win: vaxis.Window, y: u16, label: []const u8, focused: bool) void {
+    const color: vaxis.Color = if (focused)
+        .{ .rgb = .{ 0x5f, 0xaf, 0xff } }
+    else
+        .{ .rgb = .{ 0x4a, 0x4a, 0x4a } };
+
+    // Draw horizontal line
+    for (0..win.width) |x| {
+        writeAscii(win, @intCast(x), y, "-", .{ .fg = color });
+    }
+
+    // Draw centered label
+    if (label.len > 0 and win.width > label.len + 4) {
+        const label_x: u16 = @intCast((win.width - label.len) / 2);
+        writeAscii(win, label_x, y, label, .{ .fg = color, .bold = focused });
+    }
+}
+
+fn drawLogs(win: vaxis.Window, start_row: u16, pane_height: u16, logs_auto: bool, scroll: usize) void {
+    const dim_red: vaxis.Color = .{ .rgb = .{ 0xc9, 0x5f, 0x5f } };
+    const yellow: vaxis.Color = .{ .rgb = .{ 0xd2, 0x9e, 0x22 } };
+    const default_fg: vaxis.Color = .{ .rgb = .{ 0xc9, 0xd1, 0xd9 } };
+
+    const total_lines = subprocess.getLineCount();
+    if (total_lines == 0) {
+        printAt(win, 2, start_row, "no log output yet", .{ .fg = .{ .rgb = .{ 0x6e, 0x76, 0x81 } } });
+        return;
+    }
+
+    const visible = @min(pane_height, total_lines);
+
+    // Determine which lines to show
+    const display_start: usize = if (logs_auto)
+        total_lines -| visible
+    else
+        @min(scroll, total_lines -| visible);
+
+    var line_buf: [128]subprocess.LogLine = undefined;
+    const fetched = subprocess.copyRange(&line_buf, display_start, visible);
+
+    for (0..fetched) |i| {
+        const row = start_row + @as(u16, @intCast(i));
+        if (row >= win.height -| 1) break;
+
+        const line = &line_buf[i];
+        const text = line.bytes[0..line.len];
+        const truncated = text[0..@min(text.len, win.width -| 2)];
+
+        const style: vaxis.Style = if (line.synthetic)
+            .{ .fg = yellow, .bold = true }
+        else if (line.source == .stderr)
+            .{ .fg = dim_red }
+        else
+            .{ .fg = default_fg };
+
+        writeAscii(win, 2, row, truncated, style);
+    }
 }
 
 fn drawDetailFooter(win: vaxis.Window, scroll: usize, _: usize, total_lines: usize, _: bool, show_help: bool) void {
@@ -1427,7 +1598,7 @@ fn drawHelpOverlay(win: vaxis.Window, ctx: HelpContext) void {
         .{ .key = "c", .desc = "copy as curl" },
         .{ .key = "e", .desc = "edit request / response" },
         .{ .key = "r", .desc = "edit & replay" },
-        .{ .key = "R", .desc = "quick replay" },
+        .{ .key = "R", .desc = "replay / restart (focus)" },
         .{ .key = "E", .desc = "export HAR" },
         .{ .key = "?", .desc = "close help" },
     };
@@ -1439,6 +1610,8 @@ fn drawHelpOverlay(win: vaxis.Window, ctx: HelpContext) void {
         .{ .key = "C", .desc = "clear all" },
         .{ .key = "a", .desc = "accept held" },
         .{ .key = "A", .desc = "accept all held" },
+        .{ .key = "l", .desc = "toggle logs pane" },
+        .{ .key = "Tab", .desc = "switch focus (req/logs)" },
         .{ .key = "q", .desc = "quit" },
     };
 
