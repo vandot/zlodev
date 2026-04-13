@@ -1,6 +1,6 @@
 .{
     .name = .zlodev,
-    .version = "0.1.0",
+    .version = "0.3.0",
     .dependencies = .{
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis.git#41fff922316dcb8776332ec460e73eaf397d5033",
