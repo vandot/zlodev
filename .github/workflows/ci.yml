@@ -22,7 +22,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -80,7 +80,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set HostName to match LocalHostName
         run: sudo scutil --set HostName "$(scutil --get LocalHostName)"
@@ -131,7 +131,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
