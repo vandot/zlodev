@@ -16,6 +16,7 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 - **Multi-app routing** — route by subdomain (`api.dev.lo`) or path prefix (`/api`) to local ports or external hosts
 - **Custom DNS** — resolves `*.lo` to localhost, no `/etc/hosts` editing
 - **Terminal UI** — live request list with method, path, status, timing, and body size
+- **Dev server launcher** — run your dev server alongside zlodev and monitor its output in a split-pane TUI
 - **Request/response interception** — hold, inspect, edit, accept, or drop requests and responses with optional pattern matching
 - **Request replay** — re-send any completed request
 - **Copy as curl** — copy any request as a `curl` command
@@ -63,6 +64,20 @@ sudo setcap cap_net_bind_service=+eip zig-out/bin/zlodev
 ## Quick start
 
 ### macOS / Linux
+
+**Option 1: zlodev launches your dev server**
+
+```sh
+# 1. Install certificates and DNS resolver (one-time setup, requires sudo)
+zlodev install
+
+# 2. Start zlodev with your dev server integrated
+zlodev start --command="npm run dev"
+```
+
+Your app is now available at `https://dev.lo`. The TUI shows live traffic and your dev server logs side-by-side.
+
+**Option 2: Launch dev server separately (original workflow)**
 
 ```sh
 # 1. Install certificates and DNS resolver (one-time setup, requires sudo)
@@ -112,6 +127,7 @@ zlodev start --dns          start DNS server only (log mode)
 -p=PORT, --port=PORT       target port [auto-detect or 3000]
 -b=ADDR, --bind=ADDR       listen address [default 0.0.0.0]
 --route=PATTERN=PORT       route by subdomain or path (repeatable)
+--command=CMD              dev server command to launch and monitor
 -c=PATH, --config=PATH     config file path [default .zlodev]
 --max-body=SIZE            max request body size [default 10M]
 --no-tui                   disable TUI, log to stderr
@@ -132,13 +148,14 @@ port=3000
 bind=127.0.0.1
 route=api=3001
 route=/webhooks=8080
+command=npm run dev
 intercept=POST /api
 no-tui
 ```
 
 zlodev reads `.zlodev` from the current directory on `start`. Use `-c=PATH` to specify a different location. CLI arguments override config file values.
 
-Supported options: `port`, `p`, `bind`, `b`, `route`, `max-body`, `intercept`, `no-tui`, `local`, `l`, `dns`.
+Supported options: `port`, `p`, `bind`, `b`, `route`, `max-body`, `command`, `intercept`, `no-tui`, `local`, `l`, `dns`.
 
 ### Routing
 
@@ -175,6 +192,28 @@ Priority: subdomain match > longest path prefix > default port.
 External routes connect via TLS, rewrite the `Host` header to the upstream hostname, and rewrite `Set-Cookie` domain attributes to `dev.lo` so cookies work correctly in the browser. If no port is specified, defaults to 443.
 
 > **Note:** Subdomain routes are not supported in local mode (`-l`), since mDNS does not support arbitrary subdomains.
+
+### Dev server integration
+
+Launch your dev server alongside zlodev and monitor its output in the TUI:
+
+```sh
+# CLI
+zlodev start --command="npm run dev"
+
+# Or in .zlodev config
+command=npm run dev
+```
+
+The dev server starts when zlodev boots and appears in a split-pane below the request list. You can toggle the logs pane with `l`, switch focus between requests and logs with `Tab`, and restart the server with `R` (when focused on logs).
+
+Logs pane controls:
+- `l` — toggle logs pane visibility
+- `Tab` — switch focus between requests and logs
+- `j` / `k` — scroll focused pane
+- `g` / `G` — jump to top / bottom of focused pane
+- `s` — toggle autoscroll for focused pane
+- `R` — restart dev server (when focused on logs) or replay request (when focused on requests)
 
 ### Port auto-detection
 
@@ -227,7 +266,7 @@ intercept=resp:POST /api
 
 ## TUI keybindings
 
-### List view
+### List view (requests pane)
 
 | Key | Action |
 |-----|--------|
@@ -235,6 +274,8 @@ intercept=resp:POST /api
 | `G` | Go to end |
 | `g` | Go to top |
 | `s` | Toggle autoscroll |
+| `l` | Toggle logs pane (if dev server configured) |
+| `Tab` | Switch focus between requests and logs |
 | `Enter` | Open detail view |
 | `/` | Search / filter by path |
 | `Esc` | Clear filter |
@@ -246,11 +287,22 @@ intercept=resp:POST /api
 | `c` | Copy request as curl command |
 | `e` | Edit request / response |
 | `r` | Edit & replay request |
-| `R` | Quick replay (no edit) |
+| `R` | Quick replay (no edit) or restart dev server (when focused on logs) |
 | `E` | Export traffic as HAR file |
 | `C` | Clear all requests |
 | `?` | Toggle help overlay |
 | `q` | Quit |
+
+### Logs pane (when dev server is running)
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Scroll up / down |
+| `G` | Go to end |
+| `g` | Go to top |
+| `s` | Toggle autoscroll |
+| `R` | Restart dev server |
+| `Tab` | Switch focus to requests |
 
 ### Detail view
 
@@ -270,6 +322,8 @@ intercept=resp:POST /api
 3. **Proxy** — An HTTPS reverse proxy accepts connections on port 443, terminates TLS, and forwards plain HTTP to your dev server. Responses are relayed back over TLS.
 
 4. **HTTP server** — A plain HTTP server on port 80 serves the CA certificate download page (for mobile devices) and redirects other requests to HTTPS.
+
+5. **Dev server integration** — When `--command` is provided, zlodev spawns a shell process running your dev server command. stdout and stderr are captured into a bounded ring buffer and displayed in a split-pane logs view. The dev server restarts when you press `R` in the logs pane, or shuts down cleanly when you quit zlodev.
 
 ## Troubleshooting
 

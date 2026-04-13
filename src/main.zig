@@ -9,6 +9,7 @@ const sys = @import("sys.zig");
 const tui = @import("tui.zig");
 const shutdown = @import("shutdown.zig");
 const intercept = @import("intercept.zig");
+const subprocess = @import("subprocess.zig");
 const build_options = @import("build_options");
 
 const version = build_options.version;
@@ -51,6 +52,8 @@ pub fn main() !void {
         if (route.hostname) |h| allocator.free(h);
     };
     var config_path: ?[]const u8 = null;
+    var command_str: ?[]const u8 = null;
+    var command_set = false;
 
     var args = if (builtin.os.tag == .windows)
         try std.process.argsWithAllocator(std.heap.page_allocator)
@@ -96,6 +99,9 @@ pub fn main() !void {
             cert_only = true;
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
             force = true;
+        } else if (flagValue(arg, null, "--command")) |val| {
+            command_str = val;
+            command_set = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
             std.debug.print("zlodev-{s}\n", .{version});
             return;
@@ -127,6 +133,9 @@ pub fn main() !void {
             if (cfg.local) local = true;
             if (cfg.dns) dns_only = true;
             if (cfg.intercept_pattern) |pat| intercept.enableWithPattern(pat);
+            if (!command_set) if (cfg.command) |c| {
+                command_str = c;
+            };
         } else |_| {
             if (config_path != null) {
                 std.debug.print("config file not found: {s}\n", .{cfg_path});
@@ -139,6 +148,23 @@ pub fn main() !void {
     if (command == .start and dns_only) {
         if (port_set or bind_set or no_tui_set or max_body_set or route_count > 0) {
             std.debug.print("--dns cannot be combined with other start options\n", .{});
+            std.process.exit(1);
+        }
+    }
+
+    // Validate command option
+    if (command_str) |cmd| {
+        const trimmed = std.mem.trim(u8, cmd, " \t");
+        if (trimmed.len == 0) {
+            std.debug.print("--command value cannot be empty\n", .{});
+            std.process.exit(1);
+        }
+        if (dns_only) {
+            std.debug.print("--command cannot be combined with --dns\n", .{});
+            std.process.exit(1);
+        }
+        if (no_tui) {
+            std.debug.print("--command cannot be combined with --no-tui\n", .{});
             std.process.exit(1);
         }
     }
@@ -189,7 +215,7 @@ pub fn main() !void {
             if (dns_only) {
                 try doStartDns(tld);
             } else {
-                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, no_tui, max_body, routes[0..route_count]);
+                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, no_tui, max_body, routes[0..route_count], command_str);
             }
         },
         .uninstall => {
@@ -335,6 +361,7 @@ fn doStart(
     no_tui: bool,
     max_request_body: usize,
     routes: []const proxy.Route,
+    command: ?[]const u8,
 ) !void {
     // Check if another instance is already running
     if (isPortListening(bind_addr, 443)) {
@@ -436,6 +463,13 @@ fn doStart(
         }
     }.run, .{&config});
 
+    // Start subprocess if command is configured
+    if (command) |cmd| {
+        subprocess.start(allocator, cmd) catch |e| {
+            log.err("component=subprocess op=start error={any}", .{e});
+        };
+    }
+
     if (no_tui) {
         log.info("component=main op=running domain={s} target=127.0.0.1:{d} routes={d}", .{ full_domain, target_port, routes.len });
         for (routes) |route| {
@@ -447,7 +481,7 @@ fn doStart(
         }
     } else {
         // Run TUI on main thread (blocks until user quits)
-        tui.run(allocator, full_domain, target_port, routes) catch |e| {
+        tui.run(allocator, full_domain, target_port, routes, command != null) catch |e| {
             log.unmute();
             log.err("component=tui op=start error={any}", .{e});
         };
@@ -457,6 +491,7 @@ fn doStart(
 
     // Signal all server loops to stop and wait for them
     shutdown.requestShutdown();
+    if (command != null) subprocess.stop();
     proxy_thread.join();
     http_thread.join();
     if (dns_thread) |dt| dt.join();
@@ -516,6 +551,7 @@ fn printHelp() void {
         \\  --route=PATTERN=TARGET     route by subdomain or path (repeatable)
         \\  -c=PATH, --config=PATH     config file path [default .zlodev]
         \\  --max-body=SIZE            max request body size [default 10M]
+        \\  --command=CMD              run CMD as subprocess (stopped on exit)
         \\  --no-tui                   disable TUI, log to stderr
         \\  -l, --local                use .local domain (mDNS)
         \\  --dns                      DNS only (install/uninstall/start)
@@ -531,6 +567,7 @@ fn printHelp() void {
         \\    route=api=3001
         \\    route=/api=3000
         \\    intercept=POST /api
+        \\    command=npm run dev
         \\    no-tui
         \\  CLI arguments override config file values.
         \\
@@ -733,6 +770,7 @@ const ConfigResult = struct {
     local: bool = false,
     dns: bool = false,
     intercept_pattern: ?[]const u8 = null,
+    command: ?[]const u8 = null,
 };
 
 fn readConfigFile(
@@ -780,6 +818,17 @@ fn readConfigFile(
             result.dns = true;
         } else if (lineValue(line, "intercept")) |val| {
             result.intercept_pattern = allocator.dupe(u8, val) catch null;
+        } else if (lineValue(line, "command")) |val| {
+            if (result.command != null) {
+                std.debug.print("config: duplicate command option\n", .{});
+                std.process.exit(1);
+            }
+            const trimmed = std.mem.trim(u8, val, " \t");
+            if (trimmed.len == 0) {
+                std.debug.print("config: empty command value\n", .{});
+                std.process.exit(1);
+            }
+            result.command = allocator.dupe(u8, trimmed) catch null;
         } else {
             std.debug.print("config: unknown option: {s}\n", .{line});
             std.process.exit(1);
