@@ -822,18 +822,18 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
             filtered_count = raw_count;
         }
 
-        if (req_autoscroll and current_count > last_count and filtered_count > 0) {
-            cursor = filtered_count - 1;
-            if (view == .detail) detail_scroll = 0;
-        }
-        last_count = current_count;
-
-        // Clamp cursor to filtered list
+        // Clamp cursor to filtered list (before any event handlers access filter_map[cursor])
         if (filtered_count > 0) {
             if (cursor >= filtered_count) cursor = filtered_count - 1;
         } else {
             cursor = 0;
         }
+
+        if (req_autoscroll and current_count > last_count and filtered_count > 0) {
+            cursor = filtered_count - 1;
+            if (view == .detail) detail_scroll = 0;
+        }
+        last_count = current_count;
 
         switch (view) {
             .list => {
