@@ -431,10 +431,8 @@ fn stopChild() void {
         // Send SIGTERM (on Unix) / terminate (on Windows)
         const pid = child.id;
         if (builtin.os.tag == .windows) {
-            if (child.id != 0) {
-                const w = std.os.windows;
-                _ = w.kernel32.TerminateProcess(child.id, 1);
-            }
+            const w = std.os.windows;
+            _ = w.kernel32.TerminateProcess(child.id, 1);
         } else {
             std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
         }
