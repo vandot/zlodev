@@ -3,7 +3,9 @@ const requests = @import("requests.zig");
 
 /// Copy a request as a curl command to the clipboard.
 pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) void {
-    const entry = requests.getOne(logical) orelse return;
+    var entry_copy: requests.Entry = undefined;
+    if (!requests.copyEntry(logical, &entry_copy)) return;
+    const entry = &entry_copy;
 
     var buf: [65536]u8 = undefined;
     var pos: usize = 0;

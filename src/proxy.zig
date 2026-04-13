@@ -438,17 +438,25 @@ fn handleConnection(
                     intercept.release(s);
 
                     if (decision == .drop) {
-                        const drop_entry = requests.getByBackingIndex(intercept_backing_idx);
-                        drop_entry.state = .dropped;
                         const drop_elapsed = std.time.milliTimestamp() - start_time;
-                        drop_entry.duration_ms = if (drop_elapsed > 0) @intCast(drop_elapsed) else 0;
+                        {
+                            requests.lock();
+                            defer requests.unlock();
+                            const drop_entry = requests.getByBackingIndex(intercept_backing_idx);
+                            drop_entry.state = .dropped;
+                            drop_entry.duration_ms = if (drop_elapsed > 0) @intCast(drop_elapsed) else 0;
+                        }
                         requests.unpin(intercept_backing_idx);
                         sslSendError(ssl, 502, "Dropped by intercept");
                         return;
                     }
 
                     // Accept — update state and continue to upstream
-                    requests.getByBackingIndex(intercept_backing_idx).state = .accepted;
+                    {
+                        requests.lock();
+                        defer requests.unlock();
+                        requests.getByBackingIndex(intercept_backing_idx).state = .accepted;
+                    }
                 }
             }
         }
@@ -565,6 +573,8 @@ fn handleConnection(
         setSocketTimeout(upstream_sock, .send, 30);
 
         // If intercepted and edited, re-read the (possibly modified) entry data
+        // Safe: TUI edits intercepted entries only while waiting on intercept.acquire().
+        // By the time the intercept event fires (s.event.wait() returned), the TUI is done editing.
         const fwd_entry = if (was_intercepted) requests.getByBackingIndex(intercept_backing_idx) else &entry;
 
         // Forward request line (use entry data which may have been edited)
@@ -802,10 +812,14 @@ fn handleConnection(
 
             if (maybe_resp_idx != null) {
                 // Response entry was pushed but intercept was skipped — clean up
-                const e = requests.getByBackingIndex(resp_intercept_idx);
-                e.state = .normal;
-                e.resp_intercepted = false;
-                e.duration_ms = req_dur;
+                {
+                    requests.lock();
+                    defer requests.unlock();
+                    const e = requests.getByBackingIndex(resp_intercept_idx);
+                    e.state = .normal;
+                    e.resp_intercepted = false;
+                    e.duration_ms = req_dur;
+                }
                 requests.unpin(resp_intercept_idx);
             }
 
@@ -1260,6 +1274,11 @@ fn chunkedStep(
                     state.* = .parse_error;
                     return;
                 };
+                // Guard against maliciously long hex strings overflowing usize
+                if (size_val.* > std.math.maxInt(usize) / 16) {
+                    state.* = .parse_error;
+                    return;
+                }
                 size_val.* = size_val.* * 16 + digit;
             }
         },

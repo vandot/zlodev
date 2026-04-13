@@ -62,6 +62,7 @@ fn parseQuestion(data: []const u8) ?DnsQuestion {
     while (pos < data.len and data[pos] != 0) {
         const label_len = @as(usize, data[pos]);
         if (label_len >= 0xC0) return null; // compression pointer — not supported
+        if (label_len > 63) return null; // RFC 1035: labels must be <= 63 bytes
         pos += 1 + label_len;
         if (pos >= data.len) return null;
     }
@@ -116,6 +117,9 @@ fn buildResponse(
 
     // Copy question section (shared by all response types)
     const question_len = question.name_end - question.name_start + 4; // +4 for QTYPE and QCLASS
+
+    // Guard: worst case response is 12 (header) + question_len + 16 (A record answer)
+    if (12 + question_len + 16 > buf.len) return 0;
 
     if (!is_valid_domain) {
         // NXDOMAIN response
