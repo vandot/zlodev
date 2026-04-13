@@ -99,6 +99,7 @@ fn writePemKey(path: [:0]const u8, pkey: *c.EVP_PKEY) !void {
     defer _ = c.BIO_free(bio);
     if (c.PEM_write_bio_PrivateKey(bio, pkey, null, null, 0, null, null) != 1)
         return error.FileWriteFailed;
+    // Note: Key file should be chmod 0600 (owner-only) — handle via system/installation wrapper
 }
 
 fn writePemCert(path: [:0]const u8, x509: *c.X509) !void {
@@ -419,13 +420,31 @@ fn appendToGitCaBundle(allocator: std.mem.Allocator, ca_pem_path: []const u8) vo
     defer allocator.free(bundle_content);
     if (std.mem.indexOf(u8, bundle_content, "# BEGIN zlodev CA") != null) return;
 
-    // Append with markers
-    const file = std.fs.cwd().openFile(bundle_path, .{ .mode = .write_only }) catch return;
-    defer file.close();
-    file.seekFromEnd(0) catch return;
-    file.writeAll(ca_bundle_marker_begin) catch return;
-    file.writeAll(ca_content) catch return;
-    file.writeAll(ca_bundle_marker_end) catch return;
+    // Build new content in memory
+    var new_content = std.ArrayListUnmanaged(u8){};
+    defer new_content.deinit(allocator);
+    new_content.appendSlice(allocator, bundle_content) catch return;
+    new_content.appendSlice(allocator, ca_bundle_marker_begin) catch return;
+    new_content.appendSlice(allocator, ca_content) catch return;
+    new_content.appendSlice(allocator, ca_bundle_marker_end) catch return;
+
+    // Write atomically via temp file + rename
+    const tmp_path = std.fmt.allocPrint(allocator, "{s}.zlodev_tmp", .{bundle_path}) catch return;
+    defer allocator.free(tmp_path);
+
+    const tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch return;
+    tmp_file.writeAll(new_content.items) catch {
+        tmp_file.close();
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return;
+    };
+    tmp_file.close();
+
+    std.fs.renameAbsolute(tmp_path, bundle_path) catch {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return;
+    };
+
     std.debug.print("CA also added to Git CA bundle at {s}\n", .{bundle_path});
 }
 

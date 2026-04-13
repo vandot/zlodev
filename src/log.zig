@@ -2,16 +2,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
 
-var muted: bool = false;
+var muted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var log_file: ?std.fs.File = null;
 var log_mutex: std.Thread.Mutex = .{};
 
 pub fn mute() void {
-    muted = true;
+    muted.store(true, .release);
 }
 
 pub fn unmute() void {
-    muted = false;
+    muted.store(false, .release);
 }
 
 fn getHomeDir() ?[]const u8 {
@@ -46,7 +46,7 @@ pub fn deinitLogFile() void {
 }
 
 pub fn info(comptime fmt: []const u8, args: anytype) void {
-    if (muted) return;
+    if (muted.load(.acquire)) return;
     var buf: [20]u8 = undefined;
     const ts = timestamp(&buf);
     std.debug.print("[{s}] INFO " ++ fmt ++ "\n", .{ts} ++ args);
@@ -55,7 +55,7 @@ pub fn info(comptime fmt: []const u8, args: anytype) void {
 pub fn err(comptime fmt: []const u8, args: anytype) void {
     var buf: [20]u8 = undefined;
     const ts = timestamp(&buf);
-    if (muted) {
+    if (muted.load(.acquire)) {
         // Write to log file when TUI is active
         if (log_file) |f| {
             var line_buf: [4096]u8 = undefined;

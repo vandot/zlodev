@@ -370,6 +370,16 @@ fn spawnChild() !void {
 
     // Spawn reader threads
     stdout_thread = try std.Thread.spawn(.{}, readerThread, .{ child.stdout.?, .stdout });
+    errdefer {
+        // stderr_thread spawn failed — clean up child and stdout reader
+        if (builtin.os.tag != .windows) {
+            std.posix.kill(-@as(i32, @intCast(child.id)), std.posix.SIG.KILL) catch {};
+        }
+        if (stdout_thread) |t| t.join();
+        stdout_thread = null;
+        child_process = null;
+        process_running.store(false, .release);
+    }
     stderr_thread = try std.Thread.spawn(.{}, readerThread, .{ child.stderr.?, .stderr });
 }
 
