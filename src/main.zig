@@ -848,7 +848,7 @@ fn lineValue(line: []const u8, key: []const u8) ?[]const u8 {
 fn runCmdOutput(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     var child = std.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
     try child.spawn();
     const stdout_file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;

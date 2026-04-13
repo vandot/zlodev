@@ -357,6 +357,11 @@ fn spawnChild() !void {
     child.stderr_behavior = .Pipe;
 
     try child.spawn();
+    if (builtin.os.tag != .windows) {
+        // Make child its own process group leader so we can signal
+        // the entire group (including grandchildren like npm workers)
+        std.posix.setpgid(@intCast(child.id), @intCast(child.id)) catch {};
+    }
     child_process = child;
     process_running.store(true, .release);
     readerDoneCount.store(0, .release);
@@ -434,7 +439,7 @@ fn stopChild() void {
             const w = std.os.windows;
             _ = w.kernel32.TerminateProcess(child.id, 1);
         } else {
-            std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
+            std.posix.kill(-@as(i32, @intCast(pid)), std.posix.SIG.TERM) catch {};
         }
 
         // Wait up to 3 seconds for exit
@@ -446,7 +451,7 @@ fn stopChild() void {
         // Force kill if still running
         if (process_running.load(.acquire)) {
             if (builtin.os.tag != .windows) {
-                std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
+                std.posix.kill(-@as(i32, @intCast(pid)), std.posix.SIG.KILL) catch {};
             }
         }
 
