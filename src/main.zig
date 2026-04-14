@@ -123,9 +123,16 @@ pub fn main() !void {
                 target_port = p;
                 port_set = true;
             };
-            if (!bind_set) if (cfg.bind) |b| {
-                bind_addr = b;
-            };
+            if (!bind_set) {
+                if (cfg.bind) |b| {
+                    bind_addr = b;
+                }
+            } else {
+                // CLI override used — free config bind if allocated
+                if (cfg.bind) |b| {
+                    allocator.free(b);
+                }
+            }
             if (!no_tui_set and cfg.no_tui) no_tui = true;
             if (!max_body_set) if (cfg.max_body) |mb| {
                 max_body = mb;

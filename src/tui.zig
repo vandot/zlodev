@@ -341,8 +341,6 @@ const EditState = struct {
     fn moveDown(self: *EditState) void {
         const slice = self.activeSlice();
         const len = self.activeLen();
-        const rc = self.cursorRowCol();
-        _ = rc;
         // Find end of current line (\n or end of buffer)
         var pos = self.cursor;
         while (pos < len and slice[pos] != '\n') : (pos += 1) {}

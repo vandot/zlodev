@@ -1293,6 +1293,10 @@ fn chunkedStep(
             if (byte == '\r') state.* = .size_cr;
         },
         .size_cr => {
+            if (byte != '\n') {
+                state.* = .parse_error;
+                return;
+            }
             chunk_remaining.* = size_val.*;
             size_val.* = 0;
             if (chunk_remaining.* == 0) {
@@ -1312,9 +1316,17 @@ fn chunkedStep(
             }
         },
         .data_cr => {
+            if (byte != '\r') {
+                state.* = .parse_error;
+                return;
+            }
             state.* = .data_lf;
         },
         .data_lf => {
+            if (byte != '\n') {
+                state.* = .parse_error;
+                return;
+            }
             state.* = .size;
         },
         .trailer_start => {

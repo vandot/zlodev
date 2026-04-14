@@ -38,12 +38,16 @@ pub fn isEnabled() bool {
 }
 
 pub fn toggle() void {
-    const current = enabled.load(.acquire);
-    if (current) {
-        // Disabling — clear pattern and phase
-        setPattern("");
+    var current = enabled.load(.acquire);
+    while (true) {
+        if (current) {
+            // Disabling — clear pattern and phase
+            setPattern("");
+        }
+        if (enabled.cmpxchgWeak(current, !current, .acq_rel, .acquire)) |actual| {
+            current = actual;
+        } else break;
     }
-    enabled.store(!current, .release);
 }
 
 /// Enable intercept with a specific pattern. Empty pattern = match all.
