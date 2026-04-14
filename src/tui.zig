@@ -1627,7 +1627,7 @@ fn drawHelpOverlay(win: vaxis.Window, ctx: HelpContext) void {
     const total = common_keys.len + ctx_keys.len;
 
     // Calculate overlay dimensions
-    const box_w: u16 = 36;
+    const box_w: u16 = 44;
     const box_h: u16 = @intCast(@min(total + 2, win.height -| 2)); // +2 for top border + bottom border
     const start_x: u16 = if (win.width > box_w) (win.width - box_w) / 2 else 0;
     const start_y: u16 = if (win.height > box_h) (win.height - box_h) / 2 else 0;
@@ -1661,13 +1661,13 @@ fn drawHelpOverlay(win: vaxis.Window, ctx: HelpContext) void {
     for (&common_keys) |entry| {
         if (row >= start_y + box_h - 1) break;
         writeAscii(win, start_x + 2, row, entry.key, .{ .fg = white, .bg = bg, .bold = true });
-        writeAscii(win, start_x + 14, row, entry.desc, .{ .fg = dim, .bg = bg });
+        writeAscii(win, start_x + 9, row, entry.desc, .{ .fg = dim, .bg = bg });
         row += 1;
     }
     for (ctx_keys) |entry| {
         if (row >= start_y + box_h - 1) break;
         writeAscii(win, start_x + 2, row, entry.key, .{ .fg = white, .bg = bg, .bold = true });
-        writeAscii(win, start_x + 14, row, entry.desc, .{ .fg = dim, .bg = bg });
+        writeAscii(win, start_x + 9, row, entry.desc, .{ .fg = dim, .bg = bg });
         row += 1;
     }
 
