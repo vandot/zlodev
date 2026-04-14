@@ -563,6 +563,15 @@ fn handleConnection(
                     return;
                 }
                 upstream_ssl_obj = us;
+            } else {
+                // client_ctx is null — SSL_CTX allocation failed at startup
+                log.err("component=proxy conn={d} op=external_tls error=no_client_ctx", .{conn_id});
+                compat.closeSocket(upstream_sock);
+                if (was_intercepted) {
+                    requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
+                }
+                sslSendError(ssl, 502, "Bad Gateway");
+                return;
             }
         }
         const upstream = UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
@@ -1070,11 +1079,9 @@ pub fn replay(source: *const requests.Entry) void {
             sslWriteAll(ssl, "\r\n");
         }
     }
-    if (body.len > 0) {
-        var cl_buf: [64]u8 = undefined;
-        const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch return;
-        sslWriteAll(ssl, cl_hdr);
-    }
+    var cl_buf: [64]u8 = undefined;
+    const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch return;
+    sslWriteAll(ssl, cl_hdr);
     sslWriteAll(ssl, "Connection: close\r\n");
     sslWriteAll(ssl, "\r\n");
 
