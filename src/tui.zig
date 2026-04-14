@@ -501,7 +501,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                         if (!logs_visible) focus = .requests;
                         continue;
                     }
-                    if (key.matches(vaxis.Key.tab, .{}) and logs_visible) {
+                    if (key.matches(vaxis.Key.tab, .{}) and logs_visible and view != .edit) {
                         focus = if (focus == .requests) .logs else .requests;
                         continue;
                     }
@@ -840,15 +840,13 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                 const body_h = if (win.height > header_rows + footer_h) win.height - header_rows - footer_h else 1;
 
                 if (logs_visible) {
-                    // Split layout: 60% requests, 40% logs, 2 rows for borders
-                    const border_rows: u16 = 2;
+                    // Split layout: 60% requests, 40% logs, 1 row for border between panes
+                    const border_rows: u16 = 1;
                     const usable = if (body_h > border_rows) body_h - border_rows else 1;
                     const req_h: u16 = @max(1, usable * 60 / 100);
                     const logs_h: u16 = if (usable > req_h) usable - req_h else 1;
 
-                    // Requests border + pane
-                    drawBorder(win, header_rows, "", focus == .requests);
-                    const req_start = header_rows + 1;
+                    const req_start = header_rows;
 
                     // Create a child window for the requests pane so drawRequests is clipped
                     const req_win = win.child(.{
