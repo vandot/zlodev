@@ -835,7 +835,8 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
 
         switch (view) {
             .list => {
-                const header_rows = drawHeader(win, domain, proxy_text, ca_text, raw_count, req_autoscroll, routes);
+                const req_focused = !logs_visible or focus == .requests;
+                const header_rows = drawHeader(win, domain, proxy_text, ca_text, raw_count, req_autoscroll, routes, req_focused);
                 const footer_h: u16 = 2; // footer + search/intercept bar
                 const body_h = if (win.height > header_rows + footer_h) win.height - header_rows - footer_h else 1;
 
@@ -923,7 +924,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     }
 }
 
-fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_text: []const u8, req_count: usize, autoscroll: bool, routes: []const proxy.Route) u16 {
+fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_text: []const u8, req_count: usize, autoscroll: bool, routes: []const proxy.Route, req_focused: bool) u16 {
     const green: vaxis.Color = .{ .rgb = .{ 0x3f, 0xb9, 0x50 } };
     const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
     const white: vaxis.Color = .{ .rgb = .{ 0xe1, 0xe4, 0xe8 } };
@@ -1011,11 +1012,15 @@ fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_
     printAt(win, 36, row, "PATH", .{ .fg = dim });
     row += 1;
 
-    // Separator
+    // Separator — focus color when requests pane is active
     if (row < win.height) {
+        const sep_color: vaxis.Color = if (req_focused)
+            .{ .rgb = .{ 0x5f, 0xaf, 0xff } }
+        else
+            .{ .rgb = .{ 0x4a, 0x4a, 0x4a } };
         const sep_width = win.width -| 2;
         for (0..sep_width) |i| {
-            writeAscii(win, 2 + @as(u16, @intCast(i)), row, "-", .{ .fg = .{ .rgb = .{ 0x30, 0x36, 0x3d } } });
+            writeAscii(win, 2 + @as(u16, @intCast(i)), row, "-", .{ .fg = sep_color });
         }
         row += 1;
     }
