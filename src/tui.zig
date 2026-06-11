@@ -20,6 +20,8 @@ const View = enum { list, detail, edit };
 
 const EditField = enum(u8) { method = 0, path = 1, headers = 2, body = 3 };
 
+const CommitOutcome = enum { accepted, replayed, failed };
+
 const EditState = struct {
     active: bool = false,
     field: EditField = .method,
@@ -278,6 +280,62 @@ const EditState = struct {
             @memcpy(self.body_buf[0..entry.resp_body_len], raw_body);
         }
         self.active = true;
+    }
+
+    /// Open the editor for the entry at `logical` (the `e` action). Resolves the
+    /// index, classifies the phase, snapshots the held entry off the lock, and loads
+    /// it in request- or response-edit mode. Returns false (caller stays in list) for
+    /// a missing entry or a completed response, which can't be edited.
+    fn open(self: *EditState, alloc: std.mem.Allocator, logical: usize) bool {
+        const backing = requests.logicalToBackingIndex(logical) orelse return false;
+        const ph = requests.phaseOf(backing);
+        if (ph == .response_done) return false;
+        var snap: requests.Entry = undefined;
+        requests.snapshotByBackingIndex(backing, &snap);
+        switch (ph) {
+            .response_held => self.loadResponseFromEntry(alloc, &snap, backing),
+            .request_held => self.loadFromEntry(alloc, &snap, backing, true),
+            .request => self.loadFromEntry(alloc, &snap, backing, false),
+            .response_done => unreachable,
+        }
+        return true;
+    }
+
+    /// Open the editor in replay mode (the `r` action): only plain request entries
+    /// qualify. Returns false for anything held or response-oriented.
+    fn openForReplay(self: *EditState, alloc: std.mem.Allocator, logical: usize) bool {
+        const backing = requests.logicalToBackingIndex(logical) orelse return false;
+        if (requests.phaseOf(backing) != .request) return false;
+        var snap: requests.Entry = undefined;
+        requests.snapshotByBackingIndex(backing, &snap);
+        self.loadFromEntry(alloc, &snap, backing, false);
+        return true;
+    }
+
+    /// Commit the edit (Ctrl-S). Intercepted entries are written back and accepted;
+    /// completed entries are replayed with the edited values on a detached thread.
+    fn commit(self: *const EditState, alloc: std.mem.Allocator) CommitOutcome {
+        if (self.intercepted) {
+            self.applyToEntry(alloc);
+            intercept.resolve(self.backing_idx, .accept);
+            return .accepted;
+        }
+        const replay_entry = std.heap.page_allocator.create(requests.Entry) catch return .failed;
+        replay_entry.* = requests.Entry{ .timestamp = 0 };
+        @memcpy(replay_entry.method[0..self.method_len], self.method_buf[0..self.method_len]);
+        replay_entry.method_len = @intCast(self.method_len);
+        @memcpy(replay_entry.path[0..self.path_len], self.path_buf[0..self.path_len]);
+        replay_entry.path_len = @intCast(self.path_len);
+        @memcpy(replay_entry.req_headers[0..self.headers_len], self.headers_buf[0..self.headers_len]);
+        replay_entry.req_headers_len = @intCast(self.headers_len);
+        @memcpy(replay_entry.req_body[0..self.body_len], self.body_buf[0..self.body_len]);
+        replay_entry.req_body_len = @intCast(self.body_len);
+        const thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, proxy.replay, .{replay_entry}) catch {
+            std.heap.page_allocator.destroy(replay_entry);
+            return .failed;
+        };
+        thread.detach();
+        return .replayed;
     }
 
     /// Get cursor row and column from byte offset in a multi-line buffer
@@ -590,14 +648,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 flash_time = std.time.milliTimestamp();
                             }
                             if (key.matches('r', .{}) and filtered_count > 0) {
-                                // Open edit view in replay mode (only plain request entries)
-                                const real_idx = filter_map[cursor];
-                                const backing_idx = requests.logicalToBackingIndex(real_idx) orelse continue;
-                                if (requests.phaseOf(backing_idx) != .request) continue;
-                                var snap: requests.Entry = undefined;
-                                requests.snapshotByBackingIndex(backing_idx, &snap);
-                                edit_state.loadFromEntry(alloc, &snap, backing_idx, false);
-                                view = .edit;
+                                if (edit_state.openForReplay(alloc, filter_map[cursor])) view = .edit;
                             }
                             if (key.matches('R', .{})) {
                                 if (focus == .logs and logs_visible and has_command) {
@@ -615,19 +666,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 }
                             }
                             if (key.matches('e', .{}) and filtered_count > 0) {
-                                const real_idx = filter_map[cursor];
-                                const backing_idx = requests.logicalToBackingIndex(real_idx) orelse continue;
-                                const ph = requests.phaseOf(backing_idx);
-                                if (ph == .response_done) continue; // completed response — can't edit
-                                var snap: requests.Entry = undefined;
-                                requests.snapshotByBackingIndex(backing_idx, &snap);
-                                switch (ph) {
-                                    .response_held => edit_state.loadResponseFromEntry(alloc, &snap, backing_idx),
-                                    .request_held => edit_state.loadFromEntry(alloc, &snap, backing_idx, true),
-                                    .request => edit_state.loadFromEntry(alloc, &snap, backing_idx, false),
-                                    .response_done => unreachable,
-                                }
-                                view = .edit;
+                                if (edit_state.open(alloc, filter_map[cursor])) view = .edit;
                             }
                         },
                         .detail => {
@@ -670,14 +709,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 flash_len = msg.len;
                                 flash_time = std.time.milliTimestamp();
                             } else if (key.matches('r', .{})) {
-                                // Open edit view in replay mode (only plain request entries)
-                                const backing_idx = requests.logicalToBackingIndex(detail_index) orelse continue;
-                                if (requests.phaseOf(backing_idx) == .request) {
-                                    var snap: requests.Entry = undefined;
-                                    requests.snapshotByBackingIndex(backing_idx, &snap);
-                                    edit_state.loadFromEntry(alloc, &snap, backing_idx, false);
-                                    view = .edit;
-                                }
+                                if (edit_state.openForReplay(alloc, detail_index)) view = .edit;
                             } else if (key.matches('R', .{})) {
                                 replayEntry(detail_index);
                                 const msg = "Replayed!";
@@ -688,18 +720,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 show_body = !show_body;
                                 detail_scroll = 0;
                             } else if (key.matches('e', .{})) {
-                                const backing_idx = requests.logicalToBackingIndex(detail_index) orelse continue;
-                                const ph = requests.phaseOf(backing_idx);
-                                if (ph == .response_done) continue; // completed response — can't edit
-                                var snap: requests.Entry = undefined;
-                                requests.snapshotByBackingIndex(backing_idx, &snap);
-                                switch (ph) {
-                                    .response_held => edit_state.loadResponseFromEntry(alloc, &snap, backing_idx),
-                                    .request_held => edit_state.loadFromEntry(alloc, &snap, backing_idx, true),
-                                    .request => edit_state.loadFromEntry(alloc, &snap, backing_idx, false),
-                                    .response_done => unreachable,
-                                }
-                                view = .edit;
+                                if (edit_state.open(alloc, detail_index)) view = .edit;
                             }
                         },
                         .edit => {
@@ -708,29 +729,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 edit_state.active = false;
                                 view = .list;
                             } else if (key.matches('s', .{ .ctrl = true })) {
-                                if (edit_state.intercepted) {
-                                    // Intercepted: apply edits to entry and accept
-                                    edit_state.applyToEntry(alloc);
-                                    intercept.resolve(edit_state.backing_idx, .accept);
-                                } else {
-                                    // Completed: replay with edited values
-                                    const replay_entry = std.heap.page_allocator.create(requests.Entry) catch break;
-                                    replay_entry.* = requests.Entry{ .timestamp = 0 };
-                                    @memcpy(replay_entry.method[0..edit_state.method_len], edit_state.method_buf[0..edit_state.method_len]);
-                                    replay_entry.method_len = @intCast(edit_state.method_len);
-                                    @memcpy(replay_entry.path[0..edit_state.path_len], edit_state.path_buf[0..edit_state.path_len]);
-                                    replay_entry.path_len = @intCast(edit_state.path_len);
-                                    @memcpy(replay_entry.req_headers[0..edit_state.headers_len], edit_state.headers_buf[0..edit_state.headers_len]);
-                                    replay_entry.req_headers_len = @intCast(edit_state.headers_len);
-                                    @memcpy(replay_entry.req_body[0..edit_state.body_len], edit_state.body_buf[0..edit_state.body_len]);
-                                    replay_entry.req_body_len = @intCast(edit_state.body_len);
-                                    const thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, proxy.replay, .{
-                                        replay_entry,
-                                    }) catch {
-                                        std.heap.page_allocator.destroy(replay_entry);
-                                        break;
-                                    };
-                                    thread.detach();
+                                if (edit_state.commit(alloc) == .replayed) {
                                     const msg = "Replayed!";
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
