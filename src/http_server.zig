@@ -66,7 +66,7 @@ fn detectPlatform(headers: []const u8) Platform {
     // Scan User-Agent header
     var iter = std.mem.splitSequence(u8, headers, "\r\n");
     while (iter.next()) |line| {
-        if (startsWithIgnoreCase(line, "user-agent:")) {
+        if (std.ascii.startsWithIgnoreCase(line, "user-agent:")) {
             const ua = line["user-agent:".len..];
             if (std.mem.indexOf(u8, ua, "iPhone") != null or
                 std.mem.indexOf(u8, ua, "iPad") != null or
@@ -78,14 +78,6 @@ fn detectPlatform(headers: []const u8) Platform {
         }
     }
     return .desktop;
-}
-
-fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (haystack.len < needle.len) return false;
-    for (haystack[0..needle.len], needle) |h, n| {
-        if (std.ascii.toLower(h) != std.ascii.toLower(n)) return false;
-    }
-    return true;
 }
 
 fn handleRequest(stream: compat.SocketStream, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {

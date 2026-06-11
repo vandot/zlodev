@@ -63,10 +63,10 @@ pub fn setPattern(pat: []const u8) void {
     // Parse phase prefix
     var actual_pat = pat;
     var p: Phase = .both;
-    if (startsWithIgnoreCase(pat, "req:")) {
+    if (std.ascii.startsWithIgnoreCase(pat, "req:")) {
         p = .request;
         actual_pat = pat[4..];
-    } else if (startsWithIgnoreCase(pat, "resp:")) {
+    } else if (std.ascii.startsWithIgnoreCase(pat, "resp:")) {
         p = .response;
         actual_pat = pat[5..];
     }
@@ -74,14 +74,6 @@ pub fn setPattern(pat: []const u8) void {
     const len = @min(actual_pat.len, max_pattern_len);
     @memcpy(pattern_buf[0..len], actual_pat[0..len]);
     pattern_len = len;
-}
-
-fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (haystack.len < needle.len) return false;
-    for (0..needle.len) |i| {
-        if (std.ascii.toLower(haystack[i]) != std.ascii.toLower(needle[i])) return false;
-    }
-    return true;
 }
 
 pub fn getPattern(buf: *[max_pattern_len]u8) []const u8 {
@@ -121,8 +113,8 @@ fn matchesPattern(method: []const u8, path: []const u8) bool {
 
     const pat = pattern_buf[0..pattern_len];
 
-    if (containsIgnoreCase(method, pat)) return true;
-    if (containsIgnoreCase(path, pat)) return true;
+    if (std.ascii.indexOfIgnoreCase(method, pat) != null) return true;
+    if (std.ascii.indexOfIgnoreCase(path, pat) != null) return true;
 
     // Build "METHOD PATH" for combined match
     var combined: [520]u8 = undefined;
@@ -131,26 +123,9 @@ fn matchesPattern(method: []const u8, path: []const u8) bool {
         combined[method.len] = ' ';
         @memcpy(combined[method.len + 1 ..][0..path.len], path);
         const full = combined[0 .. method.len + 1 + path.len];
-        if (containsIgnoreCase(full, pat)) return true;
+        if (std.ascii.indexOfIgnoreCase(full, pat) != null) return true;
     }
 
-    return false;
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    if (needle.len == 0) return true;
-    const end = haystack.len - needle.len + 1;
-    for (0..end) |i| {
-        var match = true;
-        for (0..needle.len) |j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
-                match = false;
-                break;
-            }
-        }
-        if (match) return true;
-    }
     return false;
 }
 

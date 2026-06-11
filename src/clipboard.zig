@@ -102,19 +102,7 @@ pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) 
 }
 
 pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    const end = haystack.len - needle.len + 1;
-    for (0..end) |i| {
-        var match = true;
-        for (0..needle.len) |j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
-                match = false;
-                break;
-            }
-        }
-        if (match) return true;
-    }
-    return false;
+    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
 }
 
 // --- Unit Tests ---

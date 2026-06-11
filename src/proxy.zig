@@ -580,10 +580,10 @@ fn handleConnection(
             var header_iter = std.mem.splitSequence(u8, fwd_headers, "\r\n");
             while (header_iter.next()) |header| {
                 if (header.len == 0) continue;
-                if (http_wire.startsWithIgnoreCase(header, "cache-control:")) continue;
-                if (http_wire.startsWithIgnoreCase(header, "content-length:")) continue;
+                if (std.ascii.startsWithIgnoreCase(header, "cache-control:")) continue;
+                if (std.ascii.startsWithIgnoreCase(header, "content-length:")) continue;
                 // For external routes, replace Host header with upstream hostname
-                if (is_external and http_wire.startsWithIgnoreCase(header, "host:")) continue;
+                if (is_external and std.ascii.startsWithIgnoreCase(header, "host:")) continue;
                 upstream.writeAll(header) catch return;
                 upstream.writeAll("\r\n") catch return;
             }
@@ -799,8 +799,8 @@ fn handleConnection(
         var resp_header_iter = std.mem.splitSequence(u8, resp_headers_section, "\r\n");
         while (resp_header_iter.next()) |header| {
             if (header.len == 0) continue;
-            if (http_wire.startsWithIgnoreCase(header, "connection:")) continue;
-            if (is_external and http_wire.startsWithIgnoreCase(header, "set-cookie:")) {
+            if (std.ascii.startsWithIgnoreCase(header, "connection:")) continue;
+            if (is_external and std.ascii.startsWithIgnoreCase(header, "set-cookie:")) {
                 rewriteCookieDomain(ssl, header, config.domain);
                 sslWriteAll(ssl, "\r\n");
                 continue;
@@ -906,10 +906,10 @@ fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_extern
         var header_iter = std.mem.splitSequence(u8, resp_hdrs, "\r\n");
         while (header_iter.next()) |header| {
             if (header.len == 0) continue;
-            if (http_wire.startsWithIgnoreCase(header, "connection:")) continue;
-            if (http_wire.startsWithIgnoreCase(header, "content-length:")) continue;
-            if (http_wire.startsWithIgnoreCase(header, "transfer-encoding:")) continue;
-            if (is_external and http_wire.startsWithIgnoreCase(header, "set-cookie:")) {
+            if (std.ascii.startsWithIgnoreCase(header, "connection:")) continue;
+            if (std.ascii.startsWithIgnoreCase(header, "content-length:")) continue;
+            if (std.ascii.startsWithIgnoreCase(header, "transfer-encoding:")) continue;
+            if (is_external and std.ascii.startsWithIgnoreCase(header, "set-cookie:")) {
                 rewriteCookieDomain(ssl, header, domain);
                 sslWriteAll(ssl, "\r\n");
                 continue;
@@ -1026,8 +1026,8 @@ pub fn replay(source: *const requests.Entry) void {
         var hdr_iter = std.mem.splitSequence(u8, req_hdrs, "\r\n");
         while (hdr_iter.next()) |header| {
             if (header.len == 0) continue;
-            if (http_wire.startsWithIgnoreCase(header, "content-length:")) continue;
-            if (http_wire.startsWithIgnoreCase(header, "connection:")) continue;
+            if (std.ascii.startsWithIgnoreCase(header, "content-length:")) continue;
+            if (std.ascii.startsWithIgnoreCase(header, "connection:")) continue;
             sslWriteAll(ssl, header);
             sslWriteAll(ssl, "\r\n");
         }
@@ -1077,7 +1077,7 @@ fn rewriteCookieDomain(ssl: *ssl_c.SSL, header: []const u8, domain: []const u8) 
     const attr_start = if (std.mem.indexOfScalar(u8, header, ';')) |pos| pos else header.len;
     var i: usize = attr_start;
     while (i + 7 <= header.len) : (i += 1) {
-        if (http_wire.startsWithIgnoreCase(header[i..], "domain=")) {
+        if (std.ascii.startsWithIgnoreCase(header[i..], "domain=")) {
             // Found Domain= at position i
             // Write everything before "Domain="
             sslWriteAll(ssl, header[0..i]);

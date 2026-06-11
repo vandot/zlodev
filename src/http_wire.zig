@@ -20,18 +20,10 @@ pub const ChunkState = enum {
     parse_error,
 };
 
-pub fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (haystack.len < needle.len) return false;
-    for (haystack[0..needle.len], needle) |h, n| {
-        if (std.ascii.toLower(h) != std.ascii.toLower(n)) return false;
-    }
-    return true;
-}
-
 pub fn getHeaderValue(headers: []const u8, comptime name: []const u8) ?[]const u8 {
     var iter = std.mem.splitSequence(u8, headers, "\r\n");
     while (iter.next()) |line| {
-        if (startsWithIgnoreCase(line, name)) {
+        if (std.ascii.startsWithIgnoreCase(line, name)) {
             return std.mem.trim(u8, line[name.len..], " \t");
         }
     }
@@ -41,10 +33,10 @@ pub fn getHeaderValue(headers: []const u8, comptime name: []const u8) ?[]const u
 pub fn getConnectionHeader(headers: []const u8) ConnectionHeader {
     var iter = std.mem.splitSequence(u8, headers, "\r\n");
     while (iter.next()) |line| {
-        if (startsWithIgnoreCase(line, "connection:")) {
+        if (std.ascii.startsWithIgnoreCase(line, "connection:")) {
             const value = std.mem.trim(u8, line["connection:".len..], " \t");
-            if (startsWithIgnoreCase(value, "close")) return .close;
-            if (startsWithIgnoreCase(value, "keep-alive")) return .keep_alive;
+            if (std.ascii.startsWithIgnoreCase(value, "close")) return .close;
+            if (std.ascii.startsWithIgnoreCase(value, "keep-alive")) return .keep_alive;
         }
     }
     return .none;
@@ -53,7 +45,7 @@ pub fn getConnectionHeader(headers: []const u8) ConnectionHeader {
 pub fn getContentLength(headers: []const u8) ?usize {
     var iter = std.mem.splitSequence(u8, headers, "\r\n");
     while (iter.next()) |line| {
-        if (startsWithIgnoreCase(line, "content-length:")) {
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
             const value = std.mem.trim(u8, line["content-length:".len..], " \t");
             return std.fmt.parseInt(usize, value, 10) catch null;
         }
@@ -64,12 +56,12 @@ pub fn getContentLength(headers: []const u8) ?usize {
 pub fn isChunkedEncoding(headers: []const u8) bool {
     var iter = std.mem.splitSequence(u8, headers, "\r\n");
     while (iter.next()) |header| {
-        if (startsWithIgnoreCase(header, "transfer-encoding:")) {
+        if (std.ascii.startsWithIgnoreCase(header, "transfer-encoding:")) {
             const value = std.mem.trimLeft(u8, header["transfer-encoding:".len..], " ");
             var token_iter = std.mem.splitScalar(u8, value, ',');
             while (token_iter.next()) |token| {
                 const trimmed = std.mem.trim(u8, token, " ");
-                if (trimmed.len == 7 and startsWithIgnoreCase(trimmed, "chunked")) return true;
+                if (trimmed.len == 7 and std.ascii.startsWithIgnoreCase(trimmed, "chunked")) return true;
             }
         }
     }
@@ -79,9 +71,9 @@ pub fn isChunkedEncoding(headers: []const u8) bool {
 pub fn isWebSocketUpgrade(headers: []const u8) bool {
     var iter = std.mem.splitSequence(u8, headers, "\r\n");
     while (iter.next()) |header| {
-        if (startsWithIgnoreCase(header, "upgrade:")) {
+        if (std.ascii.startsWithIgnoreCase(header, "upgrade:")) {
             const value = std.mem.trimLeft(u8, header["upgrade:".len..], " ");
-            if (startsWithIgnoreCase(value, "websocket")) return true;
+            if (std.ascii.startsWithIgnoreCase(value, "websocket")) return true;
         }
     }
     return false;
@@ -208,32 +200,6 @@ pub fn chunkedStep(
 // --- Unit Tests ---
 
 const testing = std.testing;
-
-test "startsWithIgnoreCase exact match" {
-    try testing.expect(startsWithIgnoreCase("Content-Type:", "content-type:"));
-    try testing.expect(startsWithIgnoreCase("content-type:", "content-type:"));
-    try testing.expect(startsWithIgnoreCase("CONTENT-TYPE:", "content-type:"));
-}
-
-test "startsWithIgnoreCase prefix match" {
-    try testing.expect(startsWithIgnoreCase("Content-Type: text/html", "content-type:"));
-    try testing.expect(startsWithIgnoreCase("Host: dev.lo", "host:"));
-}
-
-test "startsWithIgnoreCase no match" {
-    try testing.expect(!startsWithIgnoreCase("Accept: */*", "content-type:"));
-    try testing.expect(!startsWithIgnoreCase("X-Real-IP: 1.2.3.4", "content-length:"));
-}
-
-test "startsWithIgnoreCase haystack shorter than needle" {
-    try testing.expect(!startsWithIgnoreCase("Hi", "content-type:"));
-    try testing.expect(!startsWithIgnoreCase("", "a"));
-}
-
-test "startsWithIgnoreCase empty needle" {
-    try testing.expect(startsWithIgnoreCase("anything", ""));
-    try testing.expect(startsWithIgnoreCase("", ""));
-}
 
 test "getContentLength present" {
     try testing.expectEqual(@as(?usize, 42), getContentLength("Content-Length: 42\r\nHost: dev.lo\r\n"));
