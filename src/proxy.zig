@@ -4,6 +4,7 @@ const posix = std.posix;
 const log = @import("log.zig");
 const requests = @import("requests.zig");
 const intercept = @import("intercept.zig");
+const hold = @import("hold.zig");
 const shutdown = @import("shutdown.zig");
 const compat = @import("compat.zig");
 
@@ -415,39 +416,21 @@ fn handleConnection(
         var intercept_backing_idx: usize = 0;
         if (intercept.shouldInterceptRequest(method, uri)) {
             entry.state = .intercepted;
-            const maybe_idx = requests.pushAndPin(entry);
-            if (maybe_idx == null) {
-                // All slots pinned — skip intercept, continue normally
-                entry.state = .normal;
-            } else {
-                intercept_backing_idx = maybe_idx.?;
+            if (hold.begin(&entry, false, start_time)) |h| {
                 was_intercepted = true;
-
-                const slot = intercept.acquire();
-                if (slot == null) {
-                    // All intercept slots full — unpin and continue normally
-                    requests.unpin(intercept_backing_idx);
-                    requests.releaseHold(intercept_backing_idx);
-                    was_intercepted = false;
-                } else {
-                    const s = slot.?;
-                    s.backing_index = intercept_backing_idx;
-                    s.event.wait();
-                    const decision = intercept.getDecision(s);
-                    s.event.reset();
-                    intercept.release(s);
-
-                    if (decision == .drop) {
-                        const drop_elapsed = std.time.milliTimestamp() - start_time;
-                        requests.markDropped(intercept_backing_idx, if (drop_elapsed > 0) @intCast(drop_elapsed) else 0);
-                        requests.unpin(intercept_backing_idx);
+                intercept_backing_idx = h.index();
+                switch (h.awaitDecision()) {
+                    .drop => {
+                        h.drop();
                         sslSendError(ssl, 502, "Dropped by intercept");
                         return;
-                    }
-
-                    // Accept — update state and continue to upstream
-                    requests.markAccepted(intercept_backing_idx);
+                    },
+                    else => h.accept(), // continue to upstream
                 }
+            } else {
+                // Ring full of pins, or all intercept slots busy — begin restored the
+                // ring entry to normal; continue as an un-intercepted request.
+                entry.state = .normal;
             }
         }
 
@@ -568,11 +551,9 @@ fn handleConnection(
         setSocketTimeout(upstream_sock, .recv, 30);
         setSocketTimeout(upstream_sock, .send, 30);
 
-        // If intercepted and edited, re-read the (possibly modified) entry data
-        // Safe: TUI edits intercepted entries only while waiting on intercept.acquire().
-        // By the time the intercept event fires (s.event.wait() returned), the TUI is done editing.
-        // Forward the (possibly TUI-edited) request. For intercepted entries the edits
-        // live in the ring, so snapshot the held entry off the lock rather than read it live.
+        // Forward the (possibly TUI-edited) request. The TUI edits a held entry only
+        // while the proxy is blocked in hold.awaitDecision(); once that returns the edit
+        // is done, so we snapshot the held entry off the lock rather than read it live.
         var fwd_snapshot: ?*requests.Entry = null;
         defer if (fwd_snapshot) |s| std.heap.page_allocator.destroy(s);
         const fwd_entry: *const requests.Entry = if (was_intercepted) blk: {
@@ -765,66 +746,43 @@ fn handleConnection(
             entry.state = .intercepted;
             entry.resp_intercepted = true;
             entry.timestamp = resp_received_time;
-            var resp_intercept_idx: usize = 0;
-            const maybe_resp_idx = requests.pushAndPin(entry);
-            if (maybe_resp_idx == null) {
-                // All slots pinned — skip intercept, forward normally
-                entry.state = .normal;
-                entry.resp_intercepted = false;
-            } else {
-                resp_intercept_idx = maybe_resp_idx.?;
-                const slot = intercept.acquire();
-                if (slot == null) {
-                    // All intercept slots full — unpin and forward normally
-                    requests.unpin(resp_intercept_idx);
-                    requests.releaseResponseHold(resp_intercept_idx, 0);
-                } else {
-                    const s = slot.?;
-                    s.backing_index = resp_intercept_idx;
-                    s.event.wait();
-                    const decision = intercept.getDecision(s);
-                    s.event.reset();
-                    intercept.release(s);
-
-                    if (decision == .drop) {
-                        const drop_elapsed = std.time.milliTimestamp() - resp_received_time;
-                        requests.markDropped(resp_intercept_idx, if (drop_elapsed > 0) @intCast(drop_elapsed) else 0);
-                        requests.unpin(resp_intercept_idx);
+            if (hold.begin(&entry, true, resp_received_time)) |h| {
+                switch (h.awaitDecision()) {
+                    .drop => {
+                        h.drop();
                         sslSendError(ssl, 502, "Dropped by intercept");
                         return;
-                    }
+                    },
+                    else => {
+                        // Accept — forward the (possibly TUI-edited) response, read off the lock.
+                        h.accept();
+                        const resp_snap = std.heap.page_allocator.create(requests.Entry) catch {
+                            requests.finishResponseIntercept(h.index(), 0);
+                            sslSendError(ssl, 502, "Out of memory");
+                            return;
+                        };
+                        defer std.heap.page_allocator.destroy(resp_snap);
+                        requests.snapshotByBackingIndex(h.index(), resp_snap);
+                        forwardResponseFromEntry(ssl, resp_snap, is_external, config.domain, must_close);
 
-                    // Accept — forward the (possibly TUI-edited) response, read off the lock.
-                    requests.markAccepted(resp_intercept_idx);
-                    const resp_snap = std.heap.page_allocator.create(requests.Entry) catch {
-                        requests.finishResponseIntercept(resp_intercept_idx, 0);
-                        sslSendError(ssl, 502, "Out of memory");
-                        return;
-                    };
-                    defer std.heap.page_allocator.destroy(resp_snap);
-                    requests.snapshotByBackingIndex(resp_intercept_idx, resp_snap);
-                    forwardResponseFromEntry(ssl, resp_snap, is_external, config.domain, must_close);
+                        // Duration = hold time only
+                        const hold_elapsed = std.time.milliTimestamp() - resp_received_time;
+                        requests.finishResponseIntercept(h.index(), if (hold_elapsed > 0) @intCast(hold_elapsed) else 0);
 
-                    // Duration = hold time only
-                    const hold_elapsed = std.time.milliTimestamp() - resp_received_time;
-                    const hold_dur: u64 = if (hold_elapsed > 0) @intCast(hold_elapsed) else 0;
-                    requests.finishResponseIntercept(resp_intercept_idx, hold_dur);
-
-                    if (must_close) return;
-                    setSocketTimeout(stream.handle, .recv, 15);
-                    continue;
+                        if (must_close) return;
+                        setSocketTimeout(stream.handle, .recv, 15);
+                        continue;
+                    },
                 }
+            } else {
+                // Ring full of pins, or all slots busy — begin restored any pushed
+                // entry to a normal capture; forward the buffered response untouched.
+                entry.state = .normal;
+                entry.resp_intercepted = false;
             }
 
-            // Fell through: intercept skipped, forward buffered response normally
-            // Request entry was already pushed/finished above
+            // Fell through: intercept skipped, forward buffered response normally.
             forwardResponseFromEntry(ssl, &entry, is_external, config.domain, must_close);
-
-            if (maybe_resp_idx != null) {
-                // Response entry was pushed but intercept was skipped — clean up
-                requests.releaseResponseHold(resp_intercept_idx, req_dur);
-                requests.unpin(resp_intercept_idx);
-            }
 
             if (must_close) return;
             setSocketTimeout(stream.handle, .recv, 15);

@@ -711,8 +711,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 if (edit_state.intercepted) {
                                     // Intercepted: apply edits to entry and accept
                                     edit_state.applyToEntry(alloc);
-                                    const slot = intercept.findByBackingIndex(edit_state.backing_idx);
-                                    if (slot) |s| intercept.setDecision(s, .accept);
+                                    intercept.resolve(edit_state.backing_idx, .accept);
                                 } else {
                                     // Completed: replay with edited values
                                     const replay_entry = std.heap.page_allocator.create(requests.Entry) catch break;
@@ -1755,18 +1754,14 @@ fn acceptEntry(logical: usize) void {
         .request_held, .response_held => {},
         else => return,
     }
-    const slot = intercept.findByBackingIndex(backing_idx) orelse return;
-    intercept.setDecision(slot, .accept);
+    intercept.resolve(backing_idx, .accept);
 }
 
 /// Drop an intercepted request or delete a completed request at the given logical index.
 fn dropOrDeleteEntry(logical: usize) void {
     const backing_idx = requests.logicalToBackingIndex(logical) orelse return;
     switch (requests.phaseOf(backing_idx)) {
-        .request_held, .response_held => {
-            const slot = intercept.findByBackingIndex(backing_idx) orelse return;
-            intercept.setDecision(slot, .drop);
-        },
+        .request_held, .response_held => intercept.resolve(backing_idx, .drop),
         // remove() no-ops on already-deleted entries.
         else => requests.remove(backing_idx),
     }

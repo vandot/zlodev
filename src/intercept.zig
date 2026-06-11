@@ -154,8 +154,9 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Acquire a free intercept slot. Returns null if all slots are occupied.
-pub fn acquire() ?*PendingEntry {
+/// Acquire a free intercept slot and register it to a ring backing index.
+/// Returns null if all slots are occupied.
+pub fn acquire(backing_idx: usize) ?*PendingEntry {
     mutex.lock();
     defer mutex.unlock();
     for (&slots) |*slot| {
@@ -163,6 +164,7 @@ pub fn acquire() ?*PendingEntry {
             slot.active = true;
             slot.decision = std.atomic.Value(u8).init(0);
             slot.event = .{};
+            slot.backing_index = backing_idx;
             return slot;
         }
     }
@@ -177,13 +179,30 @@ pub fn release(slot: *PendingEntry) void {
     slot.backing_index = 0;
 }
 
+/// Block until a decision is stored on the slot, then reset the event and
+/// release the slot. The single proxy-side entry point for waiting on a hold.
+pub fn awaitAndRelease(slot: *PendingEntry) Decision {
+    slot.event.wait();
+    const d = getDecision(slot);
+    slot.event.reset();
+    release(slot);
+    return d;
+}
+
+/// Resolve a held entry by backing index from the UI side: store the decision
+/// and wake the blocked proxy thread. No-op if no active slot matches.
+pub fn resolve(backing_idx: usize, d: Decision) void {
+    const slot = findByBackingIndex(backing_idx) orelse return;
+    setDecision(slot, d);
+}
+
 /// Store a decision and wake the blocked proxy thread.
-pub fn setDecision(slot: *PendingEntry, d: Decision) void {
+fn setDecision(slot: *PendingEntry, d: Decision) void {
     slot.decision.store(@intFromEnum(d), .release);
     slot.event.set();
 }
 
-pub fn getDecision(slot: *PendingEntry) Decision {
+fn getDecision(slot: *PendingEntry) Decision {
     const val = slot.decision.load(.acquire);
     return @enumFromInt(val);
 }
@@ -225,7 +244,7 @@ pub fn getPendingCount() usize {
 }
 
 /// Find the intercept slot for a given backing index. Returns null if not found.
-pub fn findByBackingIndex(backing_idx: usize) ?*PendingEntry {
+fn findByBackingIndex(backing_idx: usize) ?*PendingEntry {
     mutex.lock();
     defer mutex.unlock();
     for (&slots) |*slot| {
@@ -262,7 +281,7 @@ test "toggle enables and disables" {
 
 test "acquire and release slot" {
     releaseAll();
-    const slot = acquire() orelse return error.TestUnexpectedResult;
+    const slot = acquire(0) orelse return error.TestUnexpectedResult;
     try testing.expect(slot.active);
     try testing.expectEqual(Decision.pending, getDecision(slot));
     try testing.expectEqual(@as(usize, 1), getPendingCount());
@@ -276,16 +295,16 @@ test "acquire returns null when all slots full" {
     releaseAll();
     // Fill all slots
     for (0..max_pending) |_| {
-        _ = acquire();
+        _ = acquire(0);
     }
-    try testing.expect(acquire() == null);
+    try testing.expect(acquire(0) == null);
     try testing.expectEqual(@as(usize, max_pending), getPendingCount());
     releaseAll();
 }
 
 test "setDecision and getDecision" {
     releaseAll();
-    const slot = acquire() orelse return error.TestUnexpectedResult;
+    const slot = acquire(0) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(Decision.pending, getDecision(slot));
 
     setDecision(slot, .accept);
@@ -296,7 +315,7 @@ test "setDecision and getDecision" {
 
 test "setDecision drop" {
     releaseAll();
-    const slot = acquire() orelse return error.TestUnexpectedResult;
+    const slot = acquire(0) orelse return error.TestUnexpectedResult;
     setDecision(slot, .drop);
     try testing.expectEqual(Decision.drop, getDecision(slot));
     release(slot);
@@ -304,8 +323,8 @@ test "setDecision drop" {
 
 test "acceptAll wakes all pending" {
     releaseAll();
-    const s1 = acquire() orelse return error.TestUnexpectedResult;
-    const s2 = acquire() orelse return error.TestUnexpectedResult;
+    const s1 = acquire(0) orelse return error.TestUnexpectedResult;
+    const s2 = acquire(0) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 2), getPendingCount());
 
     acceptAll();
@@ -318,8 +337,7 @@ test "acceptAll wakes all pending" {
 
 test "findByBackingIndex" {
     releaseAll();
-    const slot = acquire() orelse return error.TestUnexpectedResult;
-    slot.backing_index = 42;
+    const slot = acquire(42) orelse return error.TestUnexpectedResult;
 
     const found = findByBackingIndex(42) orelse return error.TestUnexpectedResult;
     try testing.expect(found == slot);
@@ -424,8 +442,7 @@ test "multiple acquire and release cycle" {
     releaseAll();
     var acquired: [4]*PendingEntry = undefined;
     for (0..4) |i| {
-        acquired[i] = acquire() orelse return error.TestUnexpectedResult;
-        acquired[i].backing_index = i;
+        acquired[i] = acquire(i) orelse return error.TestUnexpectedResult;
     }
     try testing.expectEqual(@as(usize, 4), getPendingCount());
 
@@ -435,7 +452,7 @@ test "multiple acquire and release cycle" {
     try testing.expectEqual(@as(usize, 2), getPendingCount());
 
     // Re-acquire should succeed
-    const new_slot = acquire() orelse return error.TestUnexpectedResult;
+    const new_slot = acquire(0) orelse return error.TestUnexpectedResult;
     try testing.expect(new_slot.active);
     release(new_slot);
     release(acquired[0]);
@@ -444,7 +461,7 @@ test "multiple acquire and release cycle" {
 
 test "dropAll signals all active slots" {
     releaseAll();
-    const s = acquire().?;
+    const s = acquire(0).?;
     try std.testing.expect(s.active);
     try std.testing.expectEqual(@as(usize, 1), getPendingCount());
 
