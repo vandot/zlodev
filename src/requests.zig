@@ -19,6 +19,15 @@ pub const EntryState = enum(u8) {
     deleted = 4,
 };
 
+/// Classification of an entry by intercept phase + hold state. Derived from the
+/// (state, resp_intercepted) pair so callers don't re-derive it inline. See phaseOf.
+pub const Phase = enum {
+    request, // request capture, not held
+    request_held, // held at the request phase, awaiting a decision
+    response_held, // held at the response phase, awaiting a decision
+    response_done, // settled response capture (read-only)
+};
+
 pub const Entry = struct {
     method: [7]u8 = .{0} ** 7,
     method_len: u8 = 0,
@@ -130,20 +139,10 @@ pub fn pushAndPin(entry: Entry) ?usize {
     return idx;
 }
 
-/// Direct access by backing array index (for updating entries in-place).
-pub fn getByBackingIndex(idx: usize) *Entry {
+/// Direct access by backing array index. Internal: callers mutate ring-resident
+/// entries only through the transition/edit ops, and read them via phaseOf/snapshot.
+fn getByBackingIndex(idx: usize) *Entry {
     return &entries_backing[idx];
-}
-
-/// Lock the entries mutex. Must be paired with unlock().
-/// Use for external code that needs to modify entries in-place.
-pub fn lock() void {
-    mutex.lock();
-}
-
-/// Unlock the entries mutex.
-pub fn unlock() void {
-    mutex.unlock();
 }
 
 /// Update a pinned entry in-place (thread-safe) and unpin it.
@@ -178,6 +177,118 @@ pub fn unpin(idx: usize) void {
     mutex.lock();
     defer mutex.unlock();
     if (!entries_backing[idx].starred) entries_backing[idx].pinned = false;
+}
+
+/// Classify a ring-resident entry by phase + hold state (locked read).
+/// The read counterpart to the transition ops below.
+pub fn phaseOf(idx: usize) Phase {
+    mutex.lock();
+    defer mutex.unlock();
+    return phaseOfEntry(&entries_backing[idx]);
+}
+
+fn phaseOfEntry(e: *const Entry) Phase {
+    if (e.resp_intercepted) {
+        return if (e.state == .intercepted) .response_held else .response_done;
+    }
+    return if (e.state == .intercepted) .request_held else .request;
+}
+
+/// Current status of a ring-resident entry (locked read).
+pub fn statusOf(idx: usize) u16 {
+    mutex.lock();
+    defer mutex.unlock();
+    return entries_backing[idx].status;
+}
+
+/// Copy a ring-resident entry (by backing index) into caller storage, under the mutex.
+/// Used where a held entry must be read off the lock (e.g. forwarding, TUI edit load).
+pub fn snapshotByBackingIndex(idx: usize, dest: *Entry) void {
+    mutex.lock();
+    defer mutex.unlock();
+    dest.* = entries_backing[idx];
+}
+
+/// Mark a held entry accepted. The pin is kept until a finish op runs.
+pub fn markAccepted(idx: usize) void {
+    mutex.lock();
+    defer mutex.unlock();
+    entries_backing[idx].state = .accepted;
+}
+
+/// Mark a held entry dropped and record how long it was held.
+pub fn markDropped(idx: usize, duration_ms: u64) void {
+    mutex.lock();
+    defer mutex.unlock();
+    const e = &entries_backing[idx];
+    e.state = .dropped;
+    e.duration_ms = duration_ms;
+}
+
+/// Release a request-phase hold back to a normal capture (intercept skipped/declined).
+pub fn releaseHold(idx: usize) void {
+    mutex.lock();
+    defer mutex.unlock();
+    entries_backing[idx].state = .normal;
+}
+
+/// Release a response-phase entry back to a normal capture (intercept skipped).
+pub fn releaseResponseHold(idx: usize, duration_ms: u64) void {
+    mutex.lock();
+    defer mutex.unlock();
+    const e = &entries_backing[idx];
+    e.state = .normal;
+    e.resp_intercepted = false;
+    e.duration_ms = duration_ms;
+}
+
+/// Finish an entry that was accepted but left dangling on an error exit:
+/// only acts if still pinned (not starred) and in the accepted state.
+pub fn finishIfDangling(idx: usize, status: u16, duration_ms: u64) void {
+    mutex.lock();
+    defer mutex.unlock();
+    const e = &entries_backing[idx];
+    if (e.pinned and !e.starred and e.state == .accepted) {
+        e.status = status;
+        e.duration_ms = duration_ms;
+        e.resp_headers_len = 0;
+        e.resp_body_len = 0;
+        e.pinned = false;
+    }
+}
+
+/// Apply edited request fields to a held entry (TUI request editor). Slices are clamped.
+pub fn applyRequestEdit(idx: usize, method: []const u8, path: []const u8, headers: []const u8, body: []const u8) void {
+    mutex.lock();
+    defer mutex.unlock();
+    const e = &entries_backing[idx];
+    const m = @min(method.len, e.method.len);
+    @memcpy(e.method[0..m], method[0..m]);
+    e.method_len = @intCast(m);
+    const p = @min(path.len, e.path.len);
+    @memcpy(e.path[0..p], path[0..p]);
+    e.path_len = @intCast(p);
+    const h = @min(headers.len, max_header_len);
+    @memcpy(e.req_headers[0..h], headers[0..h]);
+    e.req_headers_len = @intCast(h);
+    const b = @min(body.len, max_body_len);
+    @memcpy(e.req_body[0..b], body[0..b]);
+    e.req_body_len = @intCast(b);
+}
+
+/// Apply edited response fields to a held entry (TUI response editor). Slices are clamped.
+pub fn applyResponseEdit(idx: usize, status: u16, headers: []const u8, body: []const u8) void {
+    mutex.lock();
+    defer mutex.unlock();
+    const e = &entries_backing[idx];
+    e.status = status;
+    const h = @min(headers.len, max_header_len);
+    @memcpy(e.resp_headers[0..h], headers[0..h]);
+    e.resp_headers_len = @intCast(h);
+    const b = @min(body.len, max_body_len);
+    @memcpy(e.resp_body[0..b], body[0..b]);
+    e.resp_body_len = @intCast(b);
+    e.resp_body_truncated = false;
 }
 
 /// Toggle the starred flag on an entry. Starred entries are pinned to survive ring buffer overflow.
@@ -765,4 +876,57 @@ test "unpin preserves pinned flag on starred entries" {
     // Unstar, then unpin should clear pinned
     toggleStar(idx);
     try testing.expect(!entry.pinned);
+}
+
+test "phaseOf classifies the (state, resp_intercepted) pair" {
+    const cases = [_]struct { state: EntryState, resp: bool, want: Phase }{
+        .{ .state = .normal, .resp = false, .want = .request },
+        .{ .state = .accepted, .resp = false, .want = .request },
+        .{ .state = .dropped, .resp = false, .want = .request },
+        .{ .state = .intercepted, .resp = false, .want = .request_held },
+        .{ .state = .intercepted, .resp = true, .want = .response_held },
+        .{ .state = .normal, .resp = true, .want = .response_done },
+        .{ .state = .accepted, .resp = true, .want = .response_done },
+    };
+    for (cases) |c| {
+        var e = Entry{};
+        e.state = c.state;
+        e.resp_intercepted = c.resp;
+        try testing.expectEqual(c.want, phaseOfEntry(&e));
+    }
+}
+
+test "transition ops set the consistent pair" {
+    clearAll();
+    const idx = pushAndPin(Entry{ .timestamp = 1 }).?;
+
+    markAccepted(idx);
+    try testing.expectEqual(EntryState.accepted, getByBackingIndex(idx).state);
+
+    markDropped(idx, 42);
+    try testing.expectEqual(EntryState.dropped, getByBackingIndex(idx).state);
+    try testing.expectEqual(@as(u64, 42), getByBackingIndex(idx).duration_ms);
+
+    // Response hold release clears both the state and the resp marker atomically.
+    getByBackingIndex(idx).state = .intercepted;
+    getByBackingIndex(idx).resp_intercepted = true;
+    releaseResponseHold(idx, 7);
+    try testing.expectEqual(EntryState.normal, getByBackingIndex(idx).state);
+    try testing.expect(!getByBackingIndex(idx).resp_intercepted);
+    try testing.expectEqual(@as(u64, 7), getByBackingIndex(idx).duration_ms);
+}
+
+test "finishIfDangling only finishes accepted, pinned, unstarred entries" {
+    clearAll();
+    const idx = pushAndPin(Entry{ .timestamp = 1 }).?;
+
+    // Not accepted yet → no-op, still pinned.
+    finishIfDangling(idx, 502, 1);
+    try testing.expect(getByBackingIndex(idx).pinned);
+
+    // Accepted + pinned → finishes (status set, unpinned).
+    markAccepted(idx);
+    finishIfDangling(idx, 502, 1);
+    try testing.expectEqual(@as(u16, 502), getByBackingIndex(idx).status);
+    try testing.expect(!getByBackingIndex(idx).pinned);
 }

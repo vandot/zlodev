@@ -234,37 +234,18 @@ const EditState = struct {
     }
 
     fn applyToEntry(self: *const EditState, alloc: std.mem.Allocator) void {
-        requests.lock();
-        defer requests.unlock();
-        const entry = requests.getByBackingIndex(self.backing_idx);
+        // Compact the (pretty-printed) body once, into a temp; ring ops do the locked write.
+        var body_tmp: [requests.max_body_len]u8 = undefined;
+        const body_slice: []const u8 = if (compactJson(alloc, self.body_buf[0..self.body_len], &body_tmp)) |len|
+            body_tmp[0..len]
+        else
+            self.body_buf[0..self.body_len];
         if (self.resp_edit) {
-            // Apply response edits: method_buf holds status code string
-            const status_str = self.method_buf[0..self.method_len];
-            entry.status = std.fmt.parseInt(u16, status_str, 10) catch entry.status;
-            @memcpy(entry.resp_headers[0..self.headers_len], self.headers_buf[0..self.headers_len]);
-            entry.resp_headers_len = @intCast(self.headers_len);
-            // Compact JSON body to remove pretty-print whitespace
-            if (compactJson(alloc, self.body_buf[0..self.body_len], &entry.resp_body)) |len| {
-                entry.resp_body_len = @intCast(len);
-            } else {
-                @memcpy(entry.resp_body[0..self.body_len], self.body_buf[0..self.body_len]);
-                entry.resp_body_len = @intCast(self.body_len);
-            }
-            entry.resp_body_truncated = false;
+            // method_buf holds the status code string; keep the current status if unparseable.
+            const status = std.fmt.parseInt(u16, self.method_buf[0..self.method_len], 10) catch requests.statusOf(self.backing_idx);
+            requests.applyResponseEdit(self.backing_idx, status, self.headers_buf[0..self.headers_len], body_slice);
         } else {
-            @memcpy(entry.method[0..self.method_len], self.method_buf[0..self.method_len]);
-            entry.method_len = @intCast(self.method_len);
-            @memcpy(entry.path[0..self.path_len], self.path_buf[0..self.path_len]);
-            entry.path_len = @intCast(self.path_len);
-            @memcpy(entry.req_headers[0..self.headers_len], self.headers_buf[0..self.headers_len]);
-            entry.req_headers_len = @intCast(self.headers_len);
-            // Compact JSON body to remove pretty-print whitespace
-            if (compactJson(alloc, self.body_buf[0..self.body_len], &entry.req_body)) |len| {
-                entry.req_body_len = @intCast(len);
-            } else {
-                @memcpy(entry.req_body[0..self.body_len], self.body_buf[0..self.body_len]);
-                entry.req_body_len = @intCast(self.body_len);
-            }
+            requests.applyRequestEdit(self.backing_idx, self.method_buf[0..self.method_len], self.path_buf[0..self.path_len], self.headers_buf[0..self.headers_len], body_slice);
         }
     }
 
@@ -609,12 +590,13 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 flash_time = std.time.milliTimestamp();
                             }
                             if (key.matches('r', .{}) and filtered_count > 0) {
-                                // Open edit view in replay mode (not for intercepted or response entries)
+                                // Open edit view in replay mode (only plain request entries)
                                 const real_idx = filter_map[cursor];
                                 const backing_idx = requests.logicalToBackingIndex(real_idx) orelse continue;
-                                const e = requests.getByBackingIndex(backing_idx);
-                                if (e.state == .intercepted or e.resp_intercepted) continue;
-                                edit_state.loadFromEntry(alloc, e, backing_idx, false);
+                                if (requests.phaseOf(backing_idx) != .request) continue;
+                                var snap: requests.Entry = undefined;
+                                requests.snapshotByBackingIndex(backing_idx, &snap);
+                                edit_state.loadFromEntry(alloc, &snap, backing_idx, false);
                                 view = .edit;
                             }
                             if (key.matches('R', .{})) {
@@ -635,13 +617,15 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             if (key.matches('e', .{}) and filtered_count > 0) {
                                 const real_idx = filter_map[cursor];
                                 const backing_idx = requests.logicalToBackingIndex(real_idx) orelse continue;
-                                const e = requests.getByBackingIndex(backing_idx);
-                                // Block edit on completed response entries (can't replay a response)
-                                if (e.resp_intercepted and e.state != .intercepted) continue;
-                                if (e.state == .intercepted and e.resp_intercepted) {
-                                    edit_state.loadResponseFromEntry(alloc, e, backing_idx);
-                                } else {
-                                    edit_state.loadFromEntry(alloc, e, backing_idx, e.state == .intercepted);
+                                const ph = requests.phaseOf(backing_idx);
+                                if (ph == .response_done) continue; // completed response — can't edit
+                                var snap: requests.Entry = undefined;
+                                requests.snapshotByBackingIndex(backing_idx, &snap);
+                                switch (ph) {
+                                    .response_held => edit_state.loadResponseFromEntry(alloc, &snap, backing_idx),
+                                    .request_held => edit_state.loadFromEntry(alloc, &snap, backing_idx, true),
+                                    .request => edit_state.loadFromEntry(alloc, &snap, backing_idx, false),
+                                    .response_done => unreachable,
                                 }
                                 view = .edit;
                             }
@@ -686,11 +670,12 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 flash_len = msg.len;
                                 flash_time = std.time.milliTimestamp();
                             } else if (key.matches('r', .{})) {
-                                // Open edit view in replay mode (not for intercepted or response entries)
+                                // Open edit view in replay mode (only plain request entries)
                                 const backing_idx = requests.logicalToBackingIndex(detail_index) orelse continue;
-                                const e = requests.getByBackingIndex(backing_idx);
-                                if (e.state != .intercepted and !e.resp_intercepted) {
-                                    edit_state.loadFromEntry(alloc, e, backing_idx, false);
+                                if (requests.phaseOf(backing_idx) == .request) {
+                                    var snap: requests.Entry = undefined;
+                                    requests.snapshotByBackingIndex(backing_idx, &snap);
+                                    edit_state.loadFromEntry(alloc, &snap, backing_idx, false);
                                     view = .edit;
                                 }
                             } else if (key.matches('R', .{})) {
@@ -704,12 +689,15 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 detail_scroll = 0;
                             } else if (key.matches('e', .{})) {
                                 const backing_idx = requests.logicalToBackingIndex(detail_index) orelse continue;
-                                const e = requests.getByBackingIndex(backing_idx);
-                                if (e.resp_intercepted and e.state != .intercepted) continue;
-                                if (e.state == .intercepted and e.resp_intercepted) {
-                                    edit_state.loadResponseFromEntry(alloc, e, backing_idx);
-                                } else {
-                                    edit_state.loadFromEntry(alloc, e, backing_idx, e.state == .intercepted);
+                                const ph = requests.phaseOf(backing_idx);
+                                if (ph == .response_done) continue; // completed response — can't edit
+                                var snap: requests.Entry = undefined;
+                                requests.snapshotByBackingIndex(backing_idx, &snap);
+                                switch (ph) {
+                                    .response_held => edit_state.loadResponseFromEntry(alloc, &snap, backing_idx),
+                                    .request_held => edit_state.loadFromEntry(alloc, &snap, backing_idx, true),
+                                    .request => edit_state.loadFromEntry(alloc, &snap, backing_idx, false),
+                                    .response_done => unreachable,
                                 }
                                 view = .edit;
                             }
@@ -1763,8 +1751,10 @@ fn grapheme(ch: u8) []const u8 {
 /// Accept an intercepted request at the given logical index.
 fn acceptEntry(logical: usize) void {
     const backing_idx = requests.logicalToBackingIndex(logical) orelse return;
-    const entry = requests.getByBackingIndex(backing_idx);
-    if (entry.state != .intercepted) return;
+    switch (requests.phaseOf(backing_idx)) {
+        .request_held, .response_held => {},
+        else => return,
+    }
     const slot = intercept.findByBackingIndex(backing_idx) orelse return;
     intercept.setDecision(slot, .accept);
 }
@@ -1772,12 +1762,13 @@ fn acceptEntry(logical: usize) void {
 /// Drop an intercepted request or delete a completed request at the given logical index.
 fn dropOrDeleteEntry(logical: usize) void {
     const backing_idx = requests.logicalToBackingIndex(logical) orelse return;
-    const entry = requests.getByBackingIndex(backing_idx);
-    if (entry.state == .intercepted) {
-        const slot = intercept.findByBackingIndex(backing_idx) orelse return;
-        intercept.setDecision(slot, .drop);
-    } else if (entry.state != .deleted) {
-        requests.remove(backing_idx);
+    switch (requests.phaseOf(backing_idx)) {
+        .request_held, .response_held => {
+            const slot = intercept.findByBackingIndex(backing_idx) orelse return;
+            intercept.setDecision(slot, .drop);
+        },
+        // remove() no-ops on already-deleted entries.
+        else => requests.remove(backing_idx),
     }
 }
 
