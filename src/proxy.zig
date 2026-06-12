@@ -556,65 +556,21 @@ fn handleConnection(
             break :blk s;
         } else &entry;
 
-        // Forward request line (use entry data which may have been edited)
-        upstream.writeAll(fwd_entry.getMethod()) catch return;
-        upstream.writeAll(" ") catch return;
-        upstream.writeAll(fwd_entry.getPath()) catch return;
-        upstream.writeAll(" HTTP/1.1\r\n") catch return;
-
-        // Forward headers from entry (may have been edited). For external routes,
-        // drop Host here — it is re-set to the upstream hostname just below.
-        const fwd_headers = fwd_entry.getReqHeaders();
-        if (fwd_headers.len > 0) {
-            const skip: []const []const u8 = if (is_external)
-                &.{ "cache-control:", "content-length:", "host:" }
-            else
-                &.{ "cache-control:", "content-length:" };
-            http_wire.forwardHeaders(fwd_headers, UpstreamSink{ .upstream = upstream }, .{ .skip = skip }, config.domain);
-        }
-
-        // For external routes, set Host to upstream and preserve original as X-Forwarded-Host
-        if (is_external) {
-            upstream.writeAll("Host: ") catch return;
-            upstream.writeAll(upstream_host) catch return;
-            upstream.writeAll("\r\n") catch return;
-            if (host.len > 0) {
-                upstream.writeAll("X-Forwarded-Host: ") catch return;
-                upstream.writeAll(host) catch return;
-                upstream.writeAll("\r\n") catch return;
-            }
-        }
-
-        // Add proxy headers
-        var ip_buf: [64]u8 = undefined;
-        const client_ip = formatAddress(client_addr, &ip_buf);
-        upstream.writeAll("X-Real-IP: ") catch return;
-        upstream.writeAll(client_ip) catch return;
-        upstream.writeAll("\r\n") catch return;
-        upstream.writeAll("X-Forwarded-Proto: https\r\n") catch return;
-        upstream.writeAll("Cache-Control: no-cache\r\n") catch return;
-        upstream.writeAll("Pragma: no-cache\r\n") catch return;
-
-        // Add correct Content-Length for the (possibly edited) body
-        const fwd_body = fwd_entry.getReqBody();
-
-        // If body was truncated, we can't forward it correctly — reject
+        // A truncated request body can't be forwarded with a correct Content-Length —
+        // reject before emitting anything to upstream.
         if (fwd_entry.req_body_truncated) {
             sslSendError(ssl, 413, "Request body too large for proxy buffer");
             return;
         }
 
-        {
-            var cl_buf: [64]u8 = undefined;
-            const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{fwd_body.len}) catch "";
-            upstream.writeAll(cl_hdr) catch return;
-        }
-        upstream.writeAll("\r\n") catch return;
-
-        // Forward request body from entry
-        if (fwd_body.len > 0) {
-            upstream.writeAll(fwd_body) catch return;
-        }
+        var ip_buf: [64]u8 = undefined;
+        forwardRequest(UpstreamSink{ .upstream = upstream }, fwd_entry, .{
+            .is_external = is_external,
+            .upstream_host = upstream_host,
+            .client_host = host,
+            .client_ip = formatAddress(client_addr, &ip_buf),
+            .domain = config.domain,
+        });
 
         // Read upstream response
         var resp_buf: [16384]u8 = undefined;
@@ -793,6 +749,68 @@ fn handleConnection(
         // Shorter idle timeout for subsequent requests on this connection
         setSocketTimeout(stream.handle, .recv, 15);
     }
+}
+
+/// Everything forwardRequest needs beyond the entry itself: routing target and the
+/// client identity to stamp into X-Forwarded-* / X-Real-IP headers.
+const RequestForward = struct {
+    is_external: bool,
+    upstream_host: []const u8,
+    client_host: []const u8, // original Host header, preserved as X-Forwarded-Host
+    client_ip: []const u8,
+    domain: []const u8,
+};
+
+/// Emit a (possibly TUI-edited) request entry to `sink` (`write([]const u8) void`):
+/// request line, forwarded request headers, the external Host rewrite, the proxy's
+/// own X-* headers, a recomputed Content-Length, and the body. The caller must
+/// reject a truncated request body before calling — the emitted Content-Length
+/// assumes the captured body is complete.
+fn forwardRequest(sink: anytype, e: *const requests.Entry, ctx: RequestForward) void {
+    // Request line (entry data may have been edited)
+    sink.write(e.getMethod());
+    sink.write(" ");
+    sink.write(e.getPath());
+    sink.write(" HTTP/1.1\r\n");
+
+    // Forwarded request headers. For external routes, drop Host here — it is
+    // re-set to the upstream hostname just below.
+    const headers = e.getReqHeaders();
+    if (headers.len > 0) {
+        const skip: []const []const u8 = if (ctx.is_external)
+            &.{ "cache-control:", "content-length:", "host:" }
+        else
+            &.{ "cache-control:", "content-length:" };
+        http_wire.forwardHeaders(headers, sink, .{ .skip = skip }, ctx.domain);
+    }
+
+    // For external routes, set Host to upstream and preserve original as X-Forwarded-Host
+    if (ctx.is_external) {
+        sink.write("Host: ");
+        sink.write(ctx.upstream_host);
+        sink.write("\r\n");
+        if (ctx.client_host.len > 0) {
+            sink.write("X-Forwarded-Host: ");
+            sink.write(ctx.client_host);
+            sink.write("\r\n");
+        }
+    }
+
+    // Proxy headers
+    sink.write("X-Real-IP: ");
+    sink.write(ctx.client_ip);
+    sink.write("\r\n");
+    sink.write("X-Forwarded-Proto: https\r\n");
+    sink.write("Cache-Control: no-cache\r\n");
+    sink.write("Pragma: no-cache\r\n");
+
+    // Recomputed Content-Length for the (possibly edited) body, then the body
+    const body = e.getReqBody();
+    var cl_buf: [64]u8 = undefined;
+    const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch "";
+    sink.write(cl_hdr);
+    sink.write("\r\n");
+    if (body.len > 0) sink.write(body);
 }
 
 /// Forward a buffered response from an entry to the client.
@@ -1223,4 +1241,85 @@ test "getContentLength detects values above default_max_request_body" {
     const cl = http_wire.getContentLength("Content-Length: 20971520\r\n");
     try testing.expect(cl != null);
     try testing.expect(cl.? > default_max_request_body);
+}
+
+/// Records bytes written to it, for asserting forwardRequest output without a socket.
+const TestSink = struct {
+    buf: []u8,
+    len: *usize,
+    pub fn write(self: TestSink, bytes: []const u8) void {
+        const n = @min(bytes.len, self.buf.len - self.len.*);
+        @memcpy(self.buf[self.len.*..][0..n], bytes[0..n]);
+        self.len.* += n;
+    }
+};
+
+fn buildEntry(method: []const u8, path: []const u8, headers: []const u8, body: []const u8) requests.Entry {
+    var e = requests.Entry{};
+    @memcpy(e.method[0..method.len], method);
+    e.method_len = @intCast(method.len);
+    @memcpy(e.path[0..path.len], path);
+    e.path_len = @intCast(path.len);
+    @memcpy(e.req_headers[0..headers.len], headers);
+    e.req_headers_len = @intCast(headers.len);
+    @memcpy(e.req_body[0..body.len], body);
+    e.req_body_len = @intCast(body.len);
+    return e;
+}
+
+test "forwardRequest emits a local request, dropping cache-control and content-length" {
+    const e = buildEntry("GET", "/api/x", "Host: dev.lo\r\nCache-Control: max-age=9\r\nContent-Length: 0\r\nAccept: */*\r\n", "");
+    var out: [512]u8 = undefined;
+    var len: usize = 0;
+    forwardRequest(TestSink{ .buf = &out, .len = &len }, &e, .{
+        .is_external = false,
+        .upstream_host = "127.0.0.1",
+        .client_host = "dev.lo",
+        .client_ip = "10.0.0.1",
+        .domain = "dev.lo",
+    });
+    try testing.expectEqualStrings(
+        "GET /api/x HTTP/1.1\r\n" ++
+            "Host: dev.lo\r\nAccept: */*\r\n" ++
+            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
+            "Content-Length: 0\r\n\r\n",
+        out[0..len],
+    );
+}
+
+test "forwardRequest rewrites Host and adds X-Forwarded-Host for external routes" {
+    const e = buildEntry("POST", "/login", "Host: dev.lo\r\nContent-Length: 2\r\n", "hi");
+    var out: [512]u8 = undefined;
+    var len: usize = 0;
+    forwardRequest(TestSink{ .buf = &out, .len = &len }, &e, .{
+        .is_external = true,
+        .upstream_host = "staging.example.com",
+        .client_host = "dev.lo",
+        .client_ip = "10.0.0.1",
+        .domain = "dev.lo",
+    });
+    try testing.expectEqualStrings(
+        "POST /login HTTP/1.1\r\n" ++
+            "Host: staging.example.com\r\nX-Forwarded-Host: dev.lo\r\n" ++
+            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
+            "Content-Length: 2\r\n\r\nhi",
+        out[0..len],
+    );
+}
+
+test "forwardRequest recomputes Content-Length from the body, ignoring the original" {
+    // Original header claims length 99; emitted Content-Length must match the body.
+    const e = buildEntry("PUT", "/x", "Content-Length: 99\r\n", "abcd");
+    var out: [512]u8 = undefined;
+    var len: usize = 0;
+    forwardRequest(TestSink{ .buf = &out, .len = &len }, &e, .{
+        .is_external = false,
+        .upstream_host = "127.0.0.1",
+        .client_host = "",
+        .client_ip = "10.0.0.1",
+        .domain = "dev.lo",
+    });
+    try testing.expect(std.mem.indexOf(u8, out[0..len], "Content-Length: 4\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out[0..len], "Content-Length: 99") == null);
+    try testing.expect(std.mem.endsWith(u8, out[0..len], "\r\n\r\nabcd"));
 }
