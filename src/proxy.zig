@@ -273,6 +273,88 @@ pub fn start(config: *const ProxyConfig) !void {
     }
 }
 
+/// Resolve, connect, and (for external routes) TLS-handshake an upstream connection.
+/// On any failure the specific cause is logged and `error.UpstreamUnavailable` is
+/// returned; the caller maps that to a single 502. Owns the resolved AddressList for
+/// its own lifetime and sets send/recv timeouts on the socket before returning.
+fn connectUpstream(
+    is_external: bool,
+    upstream_host: []const u8,
+    upstream_port: u16,
+    config: *const ProxyConfig,
+    client_ctx: ?*ssl_c.SSL_CTX,
+    conn_id: u64,
+) !UpstreamConn {
+    // Resolve upstream address — DNS for external, IP parse for local
+    var addr_list: ?*std.net.AddressList = null;
+    defer if (addr_list) |al| al.deinit();
+
+    const upstream_addr: std.net.Address = blk: {
+        if (is_external) {
+            const al = std.net.getAddressList(std.heap.page_allocator, upstream_host, upstream_port) catch {
+                log.err("component=proxy conn={d} op=dns_resolve host={s} error=failed", .{ conn_id, upstream_host });
+                return error.UpstreamUnavailable;
+            };
+            addr_list = al;
+            if (al.addrs.len == 0) {
+                log.err("component=proxy conn={d} op=dns_resolve host={s} error=no_addresses", .{ conn_id, upstream_host });
+                return error.UpstreamUnavailable;
+            }
+            break :blk al.addrs[0];
+        } else {
+            break :blk std.net.Address.parseIp(config.target_host, upstream_port) catch {
+                return error.UpstreamUnavailable;
+            };
+        }
+    };
+
+    const upstream_sock = posix.socket(upstream_addr.any.family, posix.SOCK.STREAM, 0) catch |e| {
+        log.err("component=proxy conn={d} op=upstream_socket error={any}", .{ conn_id, e });
+        return error.UpstreamUnavailable;
+    };
+    posix.connect(upstream_sock, &upstream_addr.any, upstream_addr.getOsSockLen()) catch |e| {
+        log.err("component=proxy conn={d} op=upstream_connect host={s} error={any}", .{ conn_id, upstream_host, e });
+        compat.closeSocket(upstream_sock);
+        return error.UpstreamUnavailable;
+    };
+
+    // Wrap in TLS for external upstreams; plain socket for local
+    var upstream_ssl_obj: ?*ssl_c.SSL = null;
+    if (is_external) {
+        const cctx = client_ctx orelse {
+            // client_ctx is null — SSL_CTX allocation failed at startup
+            log.err("component=proxy conn={d} op=external_tls error=no_client_ctx", .{conn_id});
+            compat.closeSocket(upstream_sock);
+            return error.UpstreamUnavailable;
+        };
+        const us = ssl_c.SSL_new(cctx) orelse {
+            log.err("component=proxy conn={d} op=upstream_ssl_new error=alloc_failed", .{conn_id});
+            compat.closeSocket(upstream_sock);
+            return error.UpstreamUnavailable;
+        };
+        _ = ssl_c.SSL_set_fd(us, compat.socketToFd(upstream_sock));
+        // Set SNI hostname
+        var sni_buf: [256]u8 = undefined;
+        if (upstream_host.len < sni_buf.len) {
+            @memcpy(sni_buf[0..upstream_host.len], upstream_host);
+            sni_buf[upstream_host.len] = 0;
+            _ = ssl_c.SSL_set_tlsext_host_name(us, &sni_buf);
+        }
+        if (ssl_c.SSL_connect(us) != 1) {
+            log.err("component=proxy conn={d} op=upstream_tls_handshake host={s} error=failed", .{ conn_id, upstream_host });
+            ssl_c.SSL_free(us);
+            compat.closeSocket(upstream_sock);
+            return error.UpstreamUnavailable;
+        }
+        upstream_ssl_obj = us;
+    }
+
+    const upstream = UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
+    setSocketTimeout(upstream_sock, .recv, 30);
+    setSocketTimeout(upstream_sock, .send, 30);
+    return upstream;
+}
+
 fn handleConnection(
     ssl: *ssl_c.SSL,
     stream: std.net.Stream,
@@ -448,109 +530,15 @@ fn handleConnection(
         const is_external = route_result.hostname != null;
         const upstream_host = route_result.hostname orelse config.target_host;
 
-        // Resolve upstream address — DNS for external, IP parse for local
-        var addr_list: ?*std.net.AddressList = null;
-        defer if (addr_list) |al| al.deinit();
-
-        const upstream_addr: std.net.Address = blk: {
-            if (is_external) {
-                const al = std.net.getAddressList(std.heap.page_allocator, upstream_host, upstream_port) catch {
-                    log.err("component=proxy conn={d} op=dns_resolve host={s} error=failed", .{ conn_id, upstream_host });
-                    if (was_intercepted) {
-                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                    }
-                    sslSendError(ssl, 502, "Bad Gateway");
-                    return;
-                };
-                addr_list = al;
-                if (al.addrs.len == 0) {
-                    log.err("component=proxy conn={d} op=dns_resolve host={s} error=no_addresses", .{ conn_id, upstream_host });
-                    if (was_intercepted) {
-                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                    }
-                    sslSendError(ssl, 502, "Bad Gateway");
-                    return;
-                }
-                break :blk al.addrs[0];
-            } else {
-                break :blk std.net.Address.parseIp(config.target_host, upstream_port) catch {
-                    if (was_intercepted) {
-                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                    }
-                    sslSendError(ssl, 502, "Bad Gateway");
-                    return;
-                };
-            }
-        };
-        const upstream_sock = posix.socket(upstream_addr.any.family, posix.SOCK.STREAM, 0) catch |e| {
-            log.err("component=proxy conn={d} op=upstream_socket error={any}", .{ conn_id, e });
+        const upstream = connectUpstream(is_external, upstream_host, upstream_port, config, client_ctx, conn_id) catch {
+            const dur = std.time.milliTimestamp() - start_time;
             if (was_intercepted) {
-                const dur = std.time.milliTimestamp() - start_time;
                 requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
             }
             sslSendError(ssl, 502, "Bad Gateway");
             return;
         };
-        posix.connect(upstream_sock, &upstream_addr.any, upstream_addr.getOsSockLen()) catch |e| {
-            log.err("component=proxy conn={d} op=upstream_connect host={s} error={any}", .{ conn_id, upstream_host, e });
-            compat.closeSocket(upstream_sock);
-            if (was_intercepted) {
-                const dur = std.time.milliTimestamp() - start_time;
-                requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
-            }
-            sslSendError(ssl, 502, "Bad Gateway");
-            return;
-        };
-
-        // Wrap in UpstreamConn — TLS for external, plain socket for local
-        var upstream_ssl_obj: ?*ssl_c.SSL = null;
-        if (is_external) {
-            if (client_ctx) |cctx| {
-                const us = ssl_c.SSL_new(cctx) orelse {
-                    log.err("component=proxy conn={d} op=upstream_ssl_new error=alloc_failed", .{conn_id});
-                    compat.closeSocket(upstream_sock);
-                    if (was_intercepted) {
-                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                    }
-                    sslSendError(ssl, 502, "Bad Gateway");
-                    return;
-                };
-                _ = ssl_c.SSL_set_fd(us, compat.socketToFd(upstream_sock));
-                // Set SNI hostname
-                var sni_buf: [256]u8 = undefined;
-                if (upstream_host.len < sni_buf.len) {
-                    @memcpy(sni_buf[0..upstream_host.len], upstream_host);
-                    sni_buf[upstream_host.len] = 0;
-                    _ = ssl_c.SSL_set_tlsext_host_name(us, &sni_buf);
-                }
-                if (ssl_c.SSL_connect(us) != 1) {
-                    log.err("component=proxy conn={d} op=upstream_tls_handshake host={s} error=failed", .{ conn_id, upstream_host });
-                    ssl_c.SSL_free(us);
-                    compat.closeSocket(upstream_sock);
-                    if (was_intercepted) {
-                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                    }
-                    sslSendError(ssl, 502, "Bad Gateway");
-                    return;
-                }
-                upstream_ssl_obj = us;
-            } else {
-                // client_ctx is null — SSL_CTX allocation failed at startup
-                log.err("component=proxy conn={d} op=external_tls error=no_client_ctx", .{conn_id});
-                compat.closeSocket(upstream_sock);
-                if (was_intercepted) {
-                    requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                }
-                sslSendError(ssl, 502, "Bad Gateway");
-                return;
-            }
-        }
-        const upstream = UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
         defer upstream.close();
-
-        // Set timeouts on upstream socket
-        setSocketTimeout(upstream_sock, .recv, 30);
-        setSocketTimeout(upstream_sock, .send, 30);
 
         // Forward the (possibly TUI-edited) request. The TUI edits a held entry only
         // while the proxy is blocked in hold.awaitDecision(); once that returns the edit
