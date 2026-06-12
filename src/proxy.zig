@@ -572,50 +572,25 @@ fn handleConnection(
             .domain = config.domain,
         });
 
-        // Read upstream response
+        // Read and parse the upstream response head
         var resp_buf: [16384]u8 = undefined;
-        var resp_total: usize = 0;
-        var resp_headers_end: ?usize = null;
-
-        while (resp_total < resp_buf.len) {
-            const n = upstream.read(resp_buf[resp_total..]) catch break;
-            if (n == 0) break;
-            resp_total += n;
-            if (std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n\r\n")) |pos| {
-                resp_headers_end = pos;
-                break;
-            }
-        }
-
-        if (resp_total == 0 or resp_headers_end == null) return;
-        const resp_hdr_end = resp_headers_end.?;
-
-        // Extract status line
-        const resp_first_line_end = std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n") orelse return;
-
-        // Extract status code (e.g. "HTTP/1.1 200 OK" -> 200)
-        const resp_line = resp_buf[0..resp_first_line_end];
-        var resp_parts = std.mem.splitScalar(u8, resp_line, ' ');
-        _ = resp_parts.next(); // skip HTTP version
-        if (resp_parts.next()) |status_str| {
-            entry.status = std.fmt.parseInt(u16, status_str, 10) catch 0;
-        }
+        const head = http_wire.readResponseHead(upstream, &resp_buf) orelse return;
+        entry.status = head.status;
 
         // Capture response headers
-        const resp_headers_section = resp_buf[resp_first_line_end + 2 .. resp_hdr_end];
+        const resp_headers_section = head.headers;
         const rsh_len = @min(resp_headers_section.len, requests.max_header_len);
         @memcpy(entry.resp_headers[0..rsh_len], resp_headers_section[0..rsh_len]);
         entry.resp_headers_len = @intCast(rsh_len);
 
         // Determine if we must close after this response
         const is_chunked = http_wire.isChunkedEncoding(resp_headers_section);
-        const resp_content_length = http_wire.getContentLength(resp_buf[0 .. resp_hdr_end + 4]);
+        const resp_content_length = http_wire.getContentLength(resp_headers_section);
         const upstream_conn = http_wire.getConnectionHeader(resp_headers_section);
         const response_has_defined_length = is_chunked or resp_content_length != null;
         const must_close = !keep_alive or upstream_conn == .close or !response_has_defined_length;
 
-        const resp_body_start = resp_hdr_end + 4;
-        const initial_body = if (resp_body_start < resp_total) resp_buf[resp_body_start..resp_total] else resp_buf[0..0];
+        const initial_body = head.initial_body;
 
         // Check if we should intercept the response
         const intercept_resp = intercept.shouldInterceptResponse(method, uri);
@@ -698,7 +673,7 @@ fn handleConnection(
 
         // Normal path: stream response to client as we read it
         // Forward response status line
-        sslWriteAll(ssl, resp_buf[0 .. resp_first_line_end + 2]);
+        sslWriteAll(ssl, head.status_line);
 
         // Forward response headers, dropping Connection (our decision is appended
         // below). For external routes, rewrite Set-Cookie Domain to proxy domain.

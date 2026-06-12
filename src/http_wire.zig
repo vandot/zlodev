@@ -255,6 +255,57 @@ pub fn pumpChunked(initial: []const u8, src: anytype, sink: anytype, body: []u8)
     return .{ .captured = captured, .state = state, .truncated = truncated };
 }
 
+/// The parsed head of an HTTP response. All slices point into the caller's read
+/// buffer, so it must outlive the ResponseHead.
+pub const ResponseHead = struct {
+    /// Parsed status code, or 0 if the status line was malformed.
+    status: u16,
+    /// The status line including its trailing CRLF (ready to relay verbatim).
+    status_line: []const u8,
+    /// The header block between the status line and the terminating CRLFCRLF.
+    headers: []const u8,
+    /// Body bytes that arrived in the same reads as the head.
+    initial_body: []const u8,
+};
+
+/// Read from `src` (`read([]u8) !usize`) into `buf` until the end of the response
+/// head (CRLFCRLF), then parse the status line and slice out the header block and
+/// any leftover body bytes. Returns null if the connection yielded nothing or no
+/// complete head fit in `buf`. The returned slices point into `buf`.
+pub fn readResponseHead(src: anytype, buf: []u8) ?ResponseHead {
+    var total: usize = 0;
+    var headers_end: ?usize = null;
+    while (total < buf.len) {
+        const n = src.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |pos| {
+            headers_end = pos;
+            break;
+        }
+    }
+    if (total == 0 or headers_end == null) return null;
+    const hdr_end = headers_end.?;
+
+    const first_line_end = std.mem.indexOf(u8, buf[0..total], "\r\n") orelse return null;
+    var status: u16 = 0;
+    var parts = std.mem.splitScalar(u8, buf[0..first_line_end], ' ');
+    _ = parts.next(); // skip HTTP version
+    if (parts.next()) |status_str| {
+        status = std.fmt.parseInt(u16, status_str, 10) catch 0;
+    }
+
+    const body_start = hdr_end + 4;
+    return .{
+        .status = status,
+        .status_line = buf[0 .. first_line_end + 2],
+        // A headerless response (status line immediately followed by CRLFCRLF) has
+        // first_line_end == hdr_end — yield an empty header block, not a bad slice.
+        .headers = if (first_line_end + 2 <= hdr_end) buf[first_line_end + 2 .. hdr_end] else buf[0..0],
+        .initial_body = if (body_start < total) buf[body_start..total] else buf[0..0],
+    };
+}
+
 pub const BodyResult = struct {
     /// Captured payload bytes landed in `body`.
     captured: usize,
@@ -651,6 +702,103 @@ test "streamBody stops reading once content-length is satisfied" {
     // initial already met content-length; the stream loop never reads.
     try testing.expectEqual(@as(usize, 0), reader.pos);
     try testing.expectEqualStrings("abc", body[0..r.captured]);
+}
+
+/// SliceReader variant that yields at most `chunk` bytes per read, to exercise
+/// callers across multiple reads (e.g. a head split over packet boundaries).
+const ChunkedReader = struct {
+    data: []const u8,
+    chunk: usize,
+    pos: usize = 0,
+    fn read(self: *ChunkedReader, buf: []u8) !usize {
+        const avail = self.data.len - self.pos;
+        const n = @min(@min(buf.len, self.chunk), avail);
+        @memcpy(buf[0..n], self.data[self.pos..][0..n]);
+        self.pos += n;
+        return n;
+    }
+};
+
+test "readResponseHead parses status, headers, and leftover body" {
+    var reader = SliceReader{ .data = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nServer: x\r\n\r\nhello" };
+    var buf: [256]u8 = undefined;
+
+    const head = readResponseHead(&reader, &buf).?;
+
+    try testing.expectEqual(@as(u16, 200), head.status);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", head.status_line);
+    try testing.expectEqualStrings("Content-Length: 5\r\nServer: x", head.headers);
+    try testing.expectEqualStrings("hello", head.initial_body);
+}
+
+test "readResponseHead reassembles a head split across reads" {
+    var reader = ChunkedReader{ .data = "HTTP/1.1 404 Not Found\r\nX: y\r\n\r\n", .chunk = 4 };
+    var buf: [256]u8 = undefined;
+
+    const head = readResponseHead(&reader, &buf).?;
+
+    try testing.expectEqual(@as(u16, 404), head.status);
+    try testing.expectEqualStrings("X: y", head.headers);
+    try testing.expectEqualStrings("", head.initial_body);
+}
+
+test "readResponseHead returns null when the connection yields nothing" {
+    var reader = SliceReader{ .data = "" };
+    var buf: [256]u8 = undefined;
+    try testing.expect(readResponseHead(&reader, &buf) == null);
+}
+
+test "readResponseHead reports status 0 for a malformed status line" {
+    var reader = SliceReader{ .data = "garbage\r\n\r\n" };
+    var buf: [256]u8 = undefined;
+    const head = readResponseHead(&reader, &buf).?;
+    try testing.expectEqual(@as(u16, 0), head.status);
+}
+
+test "readResponseHead handles a response with no headers" {
+    // Status line immediately followed by the terminating CRLFCRLF — must not
+    // produce an invalid header slice (regression: this panicked the proxy thread).
+    var reader = SliceReader{ .data = "HTTP/1.1 204 No Content\r\n\r\n" };
+    var buf: [256]u8 = undefined;
+    const head = readResponseHead(&reader, &buf).?;
+    try testing.expectEqual(@as(u16, 204), head.status);
+    try testing.expectEqualStrings("", head.headers);
+    try testing.expectEqualStrings("", head.initial_body);
+}
+
+// End-to-end: a fake upstream drives the real response read+capture path that the
+// socket-backed UpstreamConn drives in production — no socket, no TLS.
+
+test "upstream response path captures and forwards a content-length body" {
+    var reader = SliceReader{ .data = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello" };
+    var head_buf: [256]u8 = undefined;
+    const head = readResponseHead(&reader, &head_buf).?;
+
+    const cl = getContentLength(head.headers);
+    var fwd: [64]u8 = undefined;
+    var fwd_len: usize = 0;
+    var body: [64]u8 = undefined;
+    const r = streamBody(head.initial_body, &reader, CaptureSink{ .buf = &fwd, .len = &fwd_len }, cl, &body);
+
+    try testing.expectEqualStrings("hello", body[0..r.captured]);
+    try testing.expectEqualStrings("hello", fwd[0..fwd_len]);
+    try testing.expect(!r.truncated);
+}
+
+test "upstream response path captures and forwards a chunked body" {
+    var reader = SliceReader{ .data = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n" };
+    var head_buf: [256]u8 = undefined;
+    const head = readResponseHead(&reader, &head_buf).?;
+
+    try testing.expect(isChunkedEncoding(head.headers));
+    var fwd: [64]u8 = undefined;
+    var fwd_len: usize = 0;
+    var body: [64]u8 = undefined;
+    const r = pumpChunked(head.initial_body, &reader, CaptureSink{ .buf = &fwd, .len = &fwd_len }, &body);
+
+    try testing.expectEqual(ChunkState.done, r.state);
+    try testing.expectEqualStrings("Wiki", body[0..r.captured]);
+    try testing.expectEqualStrings("4\r\nWiki\r\n0\r\n\r\n", fwd[0..fwd_len]);
 }
 
 /// Run forwardHeaders into a fixed buffer and return the forwarded bytes.
