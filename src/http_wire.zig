@@ -106,9 +106,10 @@ pub fn reasonPhrase(status: u16) []const u8 {
 
 /// Advance the chunked-decoder one byte. Decoded body bytes are appended to `body`
 /// up to its length (`captured` tracks how many landed); excess is dropped but
-/// parsing continues. Invalid framing transitions to `.parse_error`; the terminal
-/// trailer transitions to `.done`. Callers drive this over their transport and stop
-/// on `.done` or `.parse_error`.
+/// parsing continues and `truncated` is set so the caller can flag the loss.
+/// Invalid framing transitions to `.parse_error`; the terminal trailer transitions
+/// to `.done`. Callers drive this over their transport and stop on `.done` or
+/// `.parse_error`. Prefer `pumpChunked` over driving this by hand.
 pub fn chunkedStep(
     byte: u8,
     state: *ChunkState,
@@ -116,6 +117,7 @@ pub fn chunkedStep(
     size_val: *usize,
     body: []u8,
     captured: *usize,
+    truncated: *bool,
 ) void {
     switch (state.*) {
         .size => {
@@ -156,6 +158,8 @@ pub fn chunkedStep(
             if (captured.* < body.len) {
                 body[captured.*] = byte;
                 captured.* += 1;
+            } else {
+                truncated.* = true;
             }
             chunk_remaining.* -= 1;
             if (chunk_remaining.* == 0) {
@@ -195,6 +199,60 @@ pub fn chunkedStep(
         .done => {},
         .parse_error => {},
     }
+}
+
+pub const PumpResult = struct {
+    /// Decoded payload bytes landed in `body`.
+    captured: usize,
+    /// Terminal decoder state: `.done` on a clean trailer, `.parse_error` on bad
+    /// framing, or a mid-stream state if the transport ended early.
+    state: ChunkState,
+    /// At least one decoded byte was dropped because `body` was full.
+    truncated: bool,
+};
+
+/// A sink that discards forwarded bytes — used by the capture-only path where the
+/// chunked body is decoded into an Entry but not relayed to a client.
+pub const NullSink = struct {
+    pub fn write(_: NullSink, _: []const u8) void {}
+};
+
+/// Decode a chunked transfer-encoded body in full: `initial` is the slice already
+/// read past the response headers, `src` supplies the rest (`read([]u8) !usize`),
+/// and `sink` receives the *raw* chunked bytes verbatim (`write([]const u8) void`)
+/// so a forwarding caller relays valid framing while `body` receives only the
+/// decoded payload. Pass `NullSink{}` to decode without forwarding. Stops at the
+/// terminal trailer (`.done`) or on invalid framing (`.parse_error`); a short read
+/// returns the mid-stream state. Owns its own read buffer.
+pub fn pumpChunked(initial: []const u8, src: anytype, sink: anytype, body: []u8) PumpResult {
+    var state: ChunkState = .size;
+    var chunk_remaining: usize = 0;
+    var size_val: usize = 0;
+    var captured: usize = 0;
+    var truncated = false;
+
+    if (initial.len > 0) {
+        sink.write(initial);
+        for (initial) |byte| {
+            chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured, &truncated);
+            if (state == .done or state == .parse_error)
+                return .{ .captured = captured, .state = state, .truncated = truncated };
+        }
+    }
+
+    var read_buf: [16384]u8 = undefined;
+    while (state != .done and state != .parse_error) {
+        const n = src.read(&read_buf) catch break;
+        if (n == 0) break;
+        sink.write(read_buf[0..n]);
+        for (read_buf[0..n]) |byte| {
+            chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured, &truncated);
+            if (state == .done or state == .parse_error)
+                return .{ .captured = captured, .state = state, .truncated = truncated };
+        }
+    }
+
+    return .{ .captured = captured, .state = state, .truncated = truncated };
 }
 
 // --- Unit Tests ---
@@ -297,17 +355,41 @@ test "getHeaderValue trims whitespace" {
 }
 
 /// Drive chunkedStep over a whole buffer; returns final state + bytes captured.
-fn decodeAll(input: []const u8, body: []u8) struct { state: ChunkState, captured: usize } {
+fn decodeAll(input: []const u8, body: []u8) struct { state: ChunkState, captured: usize, truncated: bool } {
     var state: ChunkState = .size;
     var chunk_remaining: usize = 0;
     var size_val: usize = 0;
     var captured: usize = 0;
+    var truncated = false;
     for (input) |b| {
-        chunkedStep(b, &state, &chunk_remaining, &size_val, body, &captured);
+        chunkedStep(b, &state, &chunk_remaining, &size_val, body, &captured, &truncated);
         if (state == .done or state == .parse_error) break;
     }
-    return .{ .state = state, .captured = captured };
+    return .{ .state = state, .captured = captured, .truncated = truncated };
 }
+
+/// Reader adapter over a fixed slice — feeds bytes to pumpChunked in one or more reads.
+const SliceReader = struct {
+    data: []const u8,
+    pos: usize = 0,
+    fn read(self: *SliceReader, buf: []u8) !usize {
+        const n = @min(buf.len, self.data.len - self.pos);
+        @memcpy(buf[0..n], self.data[self.pos..][0..n]);
+        self.pos += n;
+        return n;
+    }
+};
+
+/// Sink adapter that records the raw bytes forwarded, into a caller-owned buffer.
+const CaptureSink = struct {
+    buf: []u8,
+    len: *usize,
+    fn write(self: CaptureSink, bytes: []const u8) void {
+        const n = @min(bytes.len, self.buf.len - self.len.*);
+        @memcpy(self.buf[self.len.*..][0..n], bytes[0..n]);
+        self.len.* += n;
+    }
+};
 
 test "chunkedStep decodes a multi-chunk body" {
     var body: [64]u8 = undefined;
@@ -340,5 +422,66 @@ test "chunkedStep stops capturing at body capacity but keeps parsing" {
     const r = decodeAll("4\r\nWiki\r\n0\r\n\r\n", &body);
     try testing.expectEqual(ChunkState.done, r.state);
     try testing.expectEqual(@as(usize, 2), r.captured);
+    try testing.expect(r.truncated);
     try testing.expectEqualStrings("Wi", body[0..r.captured]);
+}
+
+test "pumpChunked forwards raw framing and captures decoded payload" {
+    var reader = SliceReader{ .data = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n" };
+    var fwd: [64]u8 = undefined;
+    var fwd_len: usize = 0;
+    var body: [64]u8 = undefined;
+
+    const r = pumpChunked("", &reader, CaptureSink{ .buf = &fwd, .len = &fwd_len }, &body);
+
+    try testing.expectEqual(ChunkState.done, r.state);
+    try testing.expect(!r.truncated);
+    try testing.expectEqualStrings("Wikipedia", body[0..r.captured]);
+    // Sink received the raw chunked stream verbatim, not the decoded body.
+    try testing.expectEqualStrings("4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n", fwd[0..fwd_len]);
+}
+
+test "pumpChunked decodes a prefix slice plus streamed remainder" {
+    const whole = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    var reader = SliceReader{ .data = whole[6..] }; // stream everything after "4\r\nWik"
+    var fwd: [64]u8 = undefined;
+    var fwd_len: usize = 0;
+    var body: [64]u8 = undefined;
+
+    const r = pumpChunked(whole[0..6], &reader, CaptureSink{ .buf = &fwd, .len = &fwd_len }, &body);
+
+    try testing.expectEqual(ChunkState.done, r.state);
+    try testing.expectEqualStrings("Wikipedia", body[0..r.captured]);
+    try testing.expectEqualStrings(whole, fwd[0..fwd_len]);
+}
+
+test "pumpChunked flags truncation when body buffer is too small" {
+    var reader = SliceReader{ .data = "9\r\nWikipedia\r\n0\r\n\r\n" };
+    var body: [4]u8 = undefined; // smaller than the 9-byte payload
+
+    const r = pumpChunked("", &reader, NullSink{}, &body);
+
+    try testing.expectEqual(ChunkState.done, r.state);
+    try testing.expect(r.truncated);
+    try testing.expectEqual(@as(usize, 4), r.captured);
+    try testing.expectEqualStrings("Wiki", body[0..r.captured]);
+}
+
+test "pumpChunked propagates parse_error on invalid framing" {
+    var reader = SliceReader{ .data = "zz\r\n" };
+    var body: [64]u8 = undefined;
+
+    const r = pumpChunked("", &reader, NullSink{}, &body);
+
+    try testing.expectEqual(ChunkState.parse_error, r.state);
+}
+
+test "pumpChunked with NullSink decodes without forwarding" {
+    var reader = SliceReader{ .data = "3\r\nabc\r\n0\r\n\r\n" };
+    var body: [64]u8 = undefined;
+
+    const r = pumpChunked("", &reader, NullSink{}, &body);
+
+    try testing.expectEqual(ChunkState.done, r.state);
+    try testing.expectEqualStrings("abc", body[0..r.captured]);
 }

@@ -124,7 +124,7 @@ const UpstreamConn = struct {
         }
     }
 
-    fn read(self: UpstreamConn, buf: []u8) !usize {
+    pub fn read(self: UpstreamConn, buf: []u8) !usize {
         if (self.ssl_conn) |s| {
             const n = ssl_c.SSL_read(s, @ptrCast(buf.ptr), @intCast(buf.len));
             if (n <= 0) return error.SslRead;
@@ -685,10 +685,9 @@ fn handleConnection(
             var resp_body_captured: usize = 0;
 
             if (is_chunked) {
-                resp_body_captured = bufferChunkedBody(upstream, initial_body, &entry.resp_body, &resp_buf);
-                if (resp_body_captured >= requests.max_body_len) {
-                    entry.resp_body_truncated = true;
-                }
+                const pr = http_wire.pumpChunked(initial_body, upstream, http_wire.NullSink{}, &entry.resp_body);
+                resp_body_captured = pr.captured;
+                if (pr.truncated) entry.resp_body_truncated = true;
             } else {
                 if (initial_body.len > 0) {
                     const cap = @min(initial_body.len, requests.max_body_len);
@@ -820,10 +819,9 @@ fn handleConnection(
         // Stream response body from upstream
         if (is_chunked) {
             // Chunked: forward raw bytes to client, decode chunks for capture
-            resp_body_captured = forwardChunkedBody(ssl, upstream, initial_body, &entry.resp_body, &resp_buf);
-            if (resp_body_captured >= requests.max_body_len) {
-                entry.resp_body_truncated = true;
-            }
+            const pr = http_wire.pumpChunked(initial_body, upstream, SslSink{ .ssl = ssl }, &entry.resp_body);
+            resp_body_captured = pr.captured;
+            if (pr.truncated) entry.resp_body_truncated = true;
         } else {
             // Forward initial body bytes
             if (initial_body.len > 0) {
@@ -938,32 +936,14 @@ fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_extern
     }
 }
 
-/// Buffer chunked response body from upstream into entry without forwarding to client.
-/// Returns total bytes captured into the body buffer.
-fn bufferChunkedBody(upstream: UpstreamConn, initial: []const u8, body: *[requests.max_body_len]u8, read_buf: *[16384]u8) usize {
-    var captured: usize = 0;
-    var state: http_wire.ChunkState = .size;
-    var chunk_remaining: usize = 0;
-    var size_val: usize = 0;
-
-    if (initial.len > 0) {
-        for (initial) |byte| {
-            http_wire.chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured);
-            if (state == .done or state == .parse_error) return captured;
-        }
+/// Forwarding sink for `http_wire.pumpChunked`: relays raw chunked bytes to the
+/// client over TLS while the pump decodes the payload into the entry.
+const SslSink = struct {
+    ssl: *ssl_c.SSL,
+    pub fn write(self: SslSink, bytes: []const u8) void {
+        sslWriteAll(self.ssl, bytes);
     }
-
-    while (state != .done and state != .parse_error) {
-        const n = upstream.read(read_buf) catch break;
-        if (n == 0) break;
-        for (read_buf.*[0..n]) |byte| {
-            http_wire.chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured);
-            if (state == .done or state == .parse_error) return captured;
-        }
-    }
-
-    return captured;
-}
+};
 
 /// Replay a stored request through the proxy's own TLS endpoint.
 /// Connects to 127.0.0.1:443 over TLS so the request goes through the full
@@ -1095,39 +1075,6 @@ fn rewriteCookieDomain(ssl: *ssl_c.SSL, header: []const u8, domain: []const u8) 
     }
     // No Domain= found, forward as-is
     sslWriteAll(ssl, header);
-}
-
-fn forwardChunkedBody(
-    ssl: *ssl_c.SSL,
-    upstream: UpstreamConn,
-    initial: []const u8,
-    resp_body: *[requests.max_body_len]u8,
-    read_buf: *[16384]u8,
-) usize {
-    var captured: usize = 0;
-    var state: http_wire.ChunkState = .size;
-    var chunk_remaining: usize = 0;
-    var size_val: usize = 0;
-
-    if (initial.len > 0) {
-        sslWriteAll(ssl, initial);
-        for (initial) |byte| {
-            http_wire.chunkedStep(byte, &state, &chunk_remaining, &size_val, resp_body, &captured);
-            if (state == .done or state == .parse_error) return captured;
-        }
-    }
-
-    while (state != .done and state != .parse_error) {
-        const n = upstream.read(read_buf) catch break;
-        if (n == 0) break;
-        sslWriteAll(ssl, read_buf.*[0..n]);
-        for (read_buf.*[0..n]) |byte| {
-            http_wire.chunkedStep(byte, &state, &chunk_remaining, &size_val, resp_body, &captured);
-            if (state == .done or state == .parse_error) return captured;
-        }
-    }
-
-    return captured;
 }
 
 fn handleWebSocket(
