@@ -255,6 +255,56 @@ pub fn pumpChunked(initial: []const u8, src: anytype, sink: anytype, body: []u8)
     return .{ .captured = captured, .state = state, .truncated = truncated };
 }
 
+pub const BodyResult = struct {
+    /// Captured payload bytes landed in `body`.
+    captured: usize,
+    /// At least one byte was dropped because `body` filled.
+    truncated: bool,
+};
+
+/// Copy `chunk` into `body` starting at `captured`, advancing it, and set
+/// `truncated` if any byte of `chunk` did not fit.
+fn captureInto(chunk: []const u8, body: []u8, captured: *usize, truncated: *bool) void {
+    const space = body.len - captured.*;
+    const n = @min(chunk.len, space);
+    if (n > 0) {
+        @memcpy(body[captured.*..][0..n], chunk[0..n]);
+        captured.* += n;
+    }
+    if (chunk.len > space) truncated.* = true;
+}
+
+/// Relay a non-chunked response body from `src` (`read([]u8) !usize`) to `sink`
+/// (`write([]const u8) void`) while capturing up to `body.len` bytes. `initial` is
+/// the slice already read past the headers. `content_length` bounds the read; null
+/// means read until `src` closes (0-length read). Sets `truncated` if a captured
+/// byte was dropped because `body` filled. Like the chunked forward path, each read
+/// is relayed to `sink` verbatim — pass `NullSink{}` to capture without forwarding.
+pub fn streamBody(initial: []const u8, src: anytype, sink: anytype, content_length: ?usize, body: []u8) BodyResult {
+    var captured: usize = 0;
+    var truncated = false;
+
+    if (initial.len > 0) {
+        sink.write(initial);
+        captureInto(initial, body, &captured, &truncated);
+    }
+
+    var read_total: usize = initial.len;
+    var read_buf: [16384]u8 = undefined;
+    while (true) {
+        if (content_length) |cl| {
+            if (read_total >= cl) break;
+        }
+        const n = src.read(&read_buf) catch break;
+        if (n == 0) break;
+        sink.write(read_buf[0..n]);
+        captureInto(read_buf[0..n], body, &captured, &truncated);
+        read_total += n;
+    }
+
+    return .{ .captured = captured, .truncated = truncated };
+}
+
 /// A header-forwarding policy: which header lines to drop, and whether to rewrite
 /// the Set-Cookie `Domain=` attribute to the proxy domain.
 pub const ForwardPolicy = struct {
@@ -542,6 +592,64 @@ test "pumpChunked with NullSink decodes without forwarding" {
     const r = pumpChunked("", &reader, NullSink{}, &body);
 
     try testing.expectEqual(ChunkState.done, r.state);
+    try testing.expectEqualStrings("abc", body[0..r.captured]);
+}
+
+test "streamBody captures and forwards a content-length body" {
+    var reader = SliceReader{ .data = "hello" };
+    var fwd: [32]u8 = undefined;
+    var fwd_len: usize = 0;
+    var body: [32]u8 = undefined;
+
+    const r = streamBody("", &reader, CaptureSink{ .buf = &fwd, .len = &fwd_len }, 5, &body);
+
+    try testing.expect(!r.truncated);
+    try testing.expectEqualStrings("hello", body[0..r.captured]);
+    try testing.expectEqualStrings("hello", fwd[0..fwd_len]);
+}
+
+test "streamBody reads until close when content-length is null" {
+    var reader = SliceReader{ .data = "world" };
+    var body: [32]u8 = undefined;
+
+    const r = streamBody("", &reader, NullSink{}, null, &body);
+
+    try testing.expect(!r.truncated);
+    try testing.expectEqualStrings("world", body[0..r.captured]);
+}
+
+test "streamBody captures the initial slice before the stream" {
+    var reader = SliceReader{ .data = "llo" };
+    var fwd: [32]u8 = undefined;
+    var fwd_len: usize = 0;
+    var body: [32]u8 = undefined;
+
+    const r = streamBody("he", &reader, CaptureSink{ .buf = &fwd, .len = &fwd_len }, 5, &body);
+
+    try testing.expectEqualStrings("hello", body[0..r.captured]);
+    try testing.expectEqualStrings("hello", fwd[0..fwd_len]);
+}
+
+test "streamBody flags truncation when body buffer fills" {
+    var reader = SliceReader{ .data = "hello" };
+    var body: [3]u8 = undefined;
+
+    const r = streamBody("", &reader, NullSink{}, 5, &body);
+
+    try testing.expect(r.truncated);
+    try testing.expectEqual(@as(usize, 3), r.captured);
+    try testing.expectEqualStrings("hel", body[0..r.captured]);
+}
+
+test "streamBody stops reading once content-length is satisfied" {
+    // Reader would yield more, but the first read already covers content-length.
+    var reader = SliceReader{ .data = "abcde" };
+    var body: [32]u8 = undefined;
+
+    const r = streamBody("abc", &reader, NullSink{}, 3, &body);
+
+    // initial already met content-length; the stream loop never reads.
+    try testing.expectEqual(@as(usize, 0), reader.pos);
     try testing.expectEqualStrings("abc", body[0..r.captured]);
 }
 

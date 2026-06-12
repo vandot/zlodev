@@ -673,42 +673,9 @@ fn handleConnection(
                 resp_body_captured = pr.captured;
                 if (pr.truncated) entry.resp_body_truncated = true;
             } else {
-                if (initial_body.len > 0) {
-                    const cap = @min(initial_body.len, requests.max_body_len);
-                    @memcpy(entry.resp_body[0..cap], initial_body[0..cap]);
-                    resp_body_captured = cap;
-                }
-                if (resp_content_length) |cl| {
-                    var body_read: usize = initial_body.len;
-                    while (body_read < cl) {
-                        const n = upstream.read(&resp_buf) catch break;
-                        if (n == 0) break;
-                        const space = requests.max_body_len -| resp_body_captured;
-                        const cap = @min(n, space);
-                        if (cap > 0) {
-                            @memcpy(entry.resp_body[resp_body_captured .. resp_body_captured + cap], resp_buf[0..cap]);
-                            resp_body_captured += cap;
-                        }
-                        body_read += n;
-                    }
-                    if (cl > requests.max_body_len) {
-                        entry.resp_body_truncated = true;
-                    }
-                } else {
-                    while (true) {
-                        const n = upstream.read(&resp_buf) catch break;
-                        if (n == 0) break;
-                        const space = requests.max_body_len -| resp_body_captured;
-                        const cap = @min(n, space);
-                        if (cap > 0) {
-                            @memcpy(entry.resp_body[resp_body_captured .. resp_body_captured + cap], resp_buf[0..cap]);
-                            resp_body_captured += cap;
-                        }
-                    }
-                    if (resp_body_captured >= requests.max_body_len) {
-                        entry.resp_body_truncated = true;
-                    }
-                }
+                const br = http_wire.streamBody(initial_body, upstream, http_wire.NullSink{}, resp_content_length, &entry.resp_body);
+                resp_body_captured = br.captured;
+                if (br.truncated) entry.resp_body_truncated = true;
             }
             entry.resp_body_len = @intCast(resp_body_captured);
 
@@ -799,48 +766,10 @@ fn handleConnection(
             resp_body_captured = pr.captured;
             if (pr.truncated) entry.resp_body_truncated = true;
         } else {
-            // Forward initial body bytes
-            if (initial_body.len > 0) {
-                sslWriteAll(ssl, initial_body);
-                const cap = @min(initial_body.len, requests.max_body_len);
-                @memcpy(entry.resp_body[0..cap], initial_body[0..cap]);
-                resp_body_captured = cap;
-            }
-
-            if (resp_content_length) |cl| {
-                var body_sent: usize = initial_body.len;
-                while (body_sent < cl) {
-                    const n = upstream.read(&resp_buf) catch break;
-                    if (n == 0) break;
-                    sslWriteAll(ssl, resp_buf[0..n]);
-                    const space = requests.max_body_len -| resp_body_captured;
-                    const cap = @min(n, space);
-                    if (cap > 0) {
-                        @memcpy(entry.resp_body[resp_body_captured .. resp_body_captured + cap], resp_buf[0..cap]);
-                        resp_body_captured += cap;
-                    }
-                    body_sent += n;
-                }
-                if (cl > requests.max_body_len) {
-                    entry.resp_body_truncated = true;
-                }
-            } else {
-                // No content-length: read until upstream closes
-                while (true) {
-                    const n = upstream.read(&resp_buf) catch break;
-                    if (n == 0) break;
-                    sslWriteAll(ssl, resp_buf[0..n]);
-                    const space = requests.max_body_len -| resp_body_captured;
-                    const cap = @min(n, space);
-                    if (cap > 0) {
-                        @memcpy(entry.resp_body[resp_body_captured .. resp_body_captured + cap], resp_buf[0..cap]);
-                        resp_body_captured += cap;
-                    }
-                }
-                if (resp_body_captured >= requests.max_body_len) {
-                    entry.resp_body_truncated = true;
-                }
-            }
+            // Stream raw bytes to client while decoding into the entry.
+            const br = http_wire.streamBody(initial_body, upstream, SslSink{ .ssl = ssl }, resp_content_length, &entry.resp_body);
+            resp_body_captured = br.captured;
+            if (br.truncated) entry.resp_body_truncated = true;
         }
         entry.resp_body_len = @intCast(resp_body_captured);
 
