@@ -257,38 +257,83 @@ pub fn finishIfDangling(idx: usize, status: u16, duration_ms: u64) void {
     }
 }
 
-/// Apply edited request fields to a held entry (TUI request editor). Slices are clamped.
-pub fn applyRequestEdit(idx: usize, method: []const u8, path: []const u8, headers: []const u8, body: []const u8) void {
-    mutex.lock();
-    defer mutex.unlock();
-    const e = &entries_backing[idx];
-    const m = @min(method.len, e.method.len);
-    @memcpy(e.method[0..m], method[0..m]);
-    e.method_len = @intCast(m);
-    const p = @min(path.len, e.path.len);
-    @memcpy(e.path[0..p], path[0..p]);
-    e.path_len = @intCast(p);
-    const h = @min(headers.len, max_header_len);
-    @memcpy(e.req_headers[0..h], headers[0..h]);
-    e.req_headers_len = @intCast(h);
-    const b = @min(body.len, max_body_len);
-    @memcpy(e.req_body[0..b], body[0..b]);
-    e.req_body_len = @intCast(b);
-}
+/// A handle to a ring entry opened for editing by the TUI. Bundles the backing
+/// index with the phase observed at open time, so the editor never passes a raw
+/// index around and every write re-checks, under the lock, that the entry is still
+/// held in the expected phase before touching it. Obtain one via `editHeld`.
+pub const EditableHold = struct {
+    idx: usize,
+    phase: Phase,
 
-/// Apply edited response fields to a held entry (TUI response editor). Slices are clamped.
-pub fn applyResponseEdit(idx: usize, status: u16, headers: []const u8, body: []const u8) void {
+    /// Copy the held entry into caller storage (locked), e.g. to load the editor.
+    pub fn snapshot(self: EditableHold, dest: *Entry) void {
+        snapshotByBackingIndex(self.idx, dest);
+    }
+
+    /// Status currently recorded on the entry — the response editor's fallback when
+    /// the typed status code is unparseable.
+    pub fn currentStatus(self: EditableHold) u16 {
+        return statusOf(self.idx);
+    }
+
+    /// Apply edited request fields, but only if the entry is still held at the
+    /// request phase. Slices are clamped. Returns false if the hold was resolved
+    /// since it was opened (in which case nothing is written).
+    pub fn commitRequest(self: EditableHold, method: []const u8, path: []const u8, headers: []const u8, body: []const u8) bool {
+        mutex.lock();
+        defer mutex.unlock();
+        const e = &entries_backing[self.idx];
+        if (e.state != .intercepted or e.resp_intercepted) return false;
+        const m = @min(method.len, e.method.len);
+        @memcpy(e.method[0..m], method[0..m]);
+        e.method_len = @intCast(m);
+        const p = @min(path.len, e.path.len);
+        @memcpy(e.path[0..p], path[0..p]);
+        e.path_len = @intCast(p);
+        const h = @min(headers.len, max_header_len);
+        @memcpy(e.req_headers[0..h], headers[0..h]);
+        e.req_headers_len = @intCast(h);
+        const b = @min(body.len, max_body_len);
+        @memcpy(e.req_body[0..b], body[0..b]);
+        e.req_body_len = @intCast(b);
+        return true;
+    }
+
+    /// Apply edited response fields, but only if the entry is still held at the
+    /// response phase. Slices are clamped. Returns false if the hold was resolved.
+    pub fn commitResponse(self: EditableHold, status: u16, headers: []const u8, body: []const u8) bool {
+        mutex.lock();
+        defer mutex.unlock();
+        const e = &entries_backing[self.idx];
+        if (e.state != .intercepted or !e.resp_intercepted) return false;
+        e.status = status;
+        const h = @min(headers.len, max_header_len);
+        @memcpy(e.resp_headers[0..h], headers[0..h]);
+        e.resp_headers_len = @intCast(h);
+        const b = @min(body.len, max_body_len);
+        @memcpy(e.resp_body[0..b], body[0..b]);
+        e.resp_body_len = @intCast(b);
+        e.resp_body_truncated = false;
+        return true;
+    }
+
+    /// Resolve the intercept hold with accept, releasing the blocked proxy thread.
+    pub fn accept(self: EditableHold) void {
+        intercept.resolve(self.idx, .accept);
+    }
+};
+
+/// Open an editable handle on the entry at a logical index. Returns null for a
+/// missing entry or a settled response (`response_done`, read-only). The phase is
+/// captured so the caller can pick request- vs response-edit mode and so commits can
+/// detect a hold that was resolved meanwhile.
+pub fn editHeld(logical: usize) ?EditableHold {
+    const idx = logicalToBackingIndex(logical) orelse return null;
     mutex.lock();
     defer mutex.unlock();
-    const e = &entries_backing[idx];
-    e.status = status;
-    const h = @min(headers.len, max_header_len);
-    @memcpy(e.resp_headers[0..h], headers[0..h]);
-    e.resp_headers_len = @intCast(h);
-    const b = @min(body.len, max_body_len);
-    @memcpy(e.resp_body[0..b], body[0..b]);
-    e.resp_body_len = @intCast(b);
-    e.resp_body_truncated = false;
+    const ph = phaseOfEntry(&entries_backing[idx]);
+    if (ph == .response_done) return null;
+    return EditableHold{ .idx = idx, .phase = ph };
 }
 
 /// Toggle the starred flag on an entry. Starred entries are pinned to survive ring buffer overflow.
@@ -929,4 +974,39 @@ test "finishIfDangling only finishes accepted, pinned, unstarred entries" {
     finishIfDangling(idx, 502, 1);
     try testing.expectEqual(@as(u16, 502), getByBackingIndex(idx).status);
     try testing.expect(!getByBackingIndex(idx).pinned);
+}
+
+test "EditableHold.commitRequest applies while held, no-ops once resolved" {
+    clearAll();
+    var e = Entry{ .timestamp = 1, .state = .intercepted };
+    @memcpy(e.method[0..3], "GET");
+    e.method_len = 3;
+    const idx = pushAndPin(e).?;
+    const hold = EditableHold{ .idx = idx, .phase = .request_held };
+
+    try testing.expect(hold.commitRequest("POST", "/x", "H: 1\r\n", "body"));
+    var snap: Entry = undefined;
+    hold.snapshot(&snap);
+    try testing.expectEqualStrings("POST", snap.getMethod());
+    try testing.expectEqualStrings("/x", snap.getPath());
+    try testing.expectEqualStrings("body", snap.getReqBody());
+
+    // Once the hold is resolved (no longer .intercepted), commits must not write.
+    markAccepted(idx);
+    try testing.expect(!hold.commitRequest("PUT", "/y", "", ""));
+    hold.snapshot(&snap);
+    try testing.expectEqualStrings("POST", snap.getMethod()); // unchanged
+}
+
+test "EditableHold commits are gated by request vs response phase" {
+    clearAll();
+    const rq_idx = pushAndPin(Entry{ .timestamp = 1, .state = .intercepted, .resp_intercepted = false }).?;
+    const rq_hold = EditableHold{ .idx = rq_idx, .phase = .request_held };
+    try testing.expect(rq_hold.commitRequest("POST", "/x", "", ""));
+    try testing.expect(!rq_hold.commitResponse(200, "", "")); // wrong phase, rejected
+
+    const rs_idx = pushAndPin(Entry{ .timestamp = 2, .state = .intercepted, .resp_intercepted = true }).?;
+    const rs_hold = EditableHold{ .idx = rs_idx, .phase = .response_held };
+    try testing.expect(rs_hold.commitResponse(404, "X: y\r\n", "nope"));
+    try testing.expect(!rs_hold.commitRequest("GET", "/", "", "")); // wrong phase, rejected
 }

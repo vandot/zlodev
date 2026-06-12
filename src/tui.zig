@@ -25,7 +25,7 @@ const CommitOutcome = enum { accepted, replayed, failed };
 const EditState = struct {
     active: bool = false,
     field: EditField = .method,
-    backing_idx: usize = 0,
+    hold: ?requests.EditableHold = null,
     // Editable buffers
     method_buf: [7]u8 = .{0} ** 7,
     method_len: usize = 0,
@@ -180,8 +180,8 @@ const EditState = struct {
         self.scroll = 0;
     }
 
-    fn loadFromEntry(self: *EditState, alloc: std.mem.Allocator, entry: *const requests.Entry, backing_idx: usize, is_intercepted: bool) void {
-        self.backing_idx = backing_idx;
+    fn loadFromEntry(self: *EditState, alloc: std.mem.Allocator, entry: *const requests.Entry, hold: requests.EditableHold, is_intercepted: bool) void {
+        self.hold = hold;
         self.intercepted = is_intercepted;
         self.resp_edit = false;
         self.field = .method;
@@ -235,7 +235,11 @@ const EditState = struct {
         return len;
     }
 
-    fn applyToEntry(self: *const EditState, alloc: std.mem.Allocator) void {
+    /// Write the edited buffers back to the held entry through the hold, which
+    /// re-checks the entry is still held before touching it. Returns false if the
+    /// hold was resolved out from under the editor (nothing written).
+    fn applyToEntry(self: *const EditState, alloc: std.mem.Allocator) bool {
+        const hold = self.hold orelse return false;
         // Compact the (pretty-printed) body once, into a temp; ring ops do the locked write.
         var body_tmp: [requests.max_body_len]u8 = undefined;
         const body_slice: []const u8 = if (compactJson(alloc, self.body_buf[0..self.body_len], &body_tmp)) |len|
@@ -244,15 +248,15 @@ const EditState = struct {
             self.body_buf[0..self.body_len];
         if (self.resp_edit) {
             // method_buf holds the status code string; keep the current status if unparseable.
-            const status = std.fmt.parseInt(u16, self.method_buf[0..self.method_len], 10) catch requests.statusOf(self.backing_idx);
-            requests.applyResponseEdit(self.backing_idx, status, self.headers_buf[0..self.headers_len], body_slice);
+            const status = std.fmt.parseInt(u16, self.method_buf[0..self.method_len], 10) catch hold.currentStatus();
+            return hold.commitResponse(status, self.headers_buf[0..self.headers_len], body_slice);
         } else {
-            requests.applyRequestEdit(self.backing_idx, self.method_buf[0..self.method_len], self.path_buf[0..self.path_len], self.headers_buf[0..self.headers_len], body_slice);
+            return hold.commitRequest(self.method_buf[0..self.method_len], self.path_buf[0..self.path_len], self.headers_buf[0..self.headers_len], body_slice);
         }
     }
 
-    fn loadResponseFromEntry(self: *EditState, alloc: std.mem.Allocator, entry: *const requests.Entry, backing_idx: usize) void {
-        self.backing_idx = backing_idx;
+    fn loadResponseFromEntry(self: *EditState, alloc: std.mem.Allocator, entry: *const requests.Entry, hold: requests.EditableHold) void {
+        self.hold = hold;
         self.intercepted = true;
         self.resp_edit = true;
         self.field = .method; // method_buf holds status code
@@ -287,16 +291,14 @@ const EditState = struct {
     /// it in request- or response-edit mode. Returns false (caller stays in list) for
     /// a missing entry or a completed response, which can't be edited.
     fn open(self: *EditState, alloc: std.mem.Allocator, logical: usize) bool {
-        const backing = requests.logicalToBackingIndex(logical) orelse return false;
-        const ph = requests.phaseOf(backing);
-        if (ph == .response_done) return false;
+        const hold = requests.editHeld(logical) orelse return false; // missing or response_done
         var snap: requests.Entry = undefined;
-        requests.snapshotByBackingIndex(backing, &snap);
-        switch (ph) {
-            .response_held => self.loadResponseFromEntry(alloc, &snap, backing),
-            .request_held => self.loadFromEntry(alloc, &snap, backing, true),
-            .request => self.loadFromEntry(alloc, &snap, backing, false),
-            .response_done => unreachable,
+        hold.snapshot(&snap);
+        switch (hold.phase) {
+            .response_held => self.loadResponseFromEntry(alloc, &snap, hold),
+            .request_held => self.loadFromEntry(alloc, &snap, hold, true),
+            .request => self.loadFromEntry(alloc, &snap, hold, false),
+            .response_done => unreachable, // editHeld returns null for this
         }
         return true;
     }
@@ -304,11 +306,11 @@ const EditState = struct {
     /// Open the editor in replay mode (the `r` action): only plain request entries
     /// qualify. Returns false for anything held or response-oriented.
     fn openForReplay(self: *EditState, alloc: std.mem.Allocator, logical: usize) bool {
-        const backing = requests.logicalToBackingIndex(logical) orelse return false;
-        if (requests.phaseOf(backing) != .request) return false;
+        const hold = requests.editHeld(logical) orelse return false;
+        if (hold.phase != .request) return false; // only plain request entries replay
         var snap: requests.Entry = undefined;
-        requests.snapshotByBackingIndex(backing, &snap);
-        self.loadFromEntry(alloc, &snap, backing, false);
+        hold.snapshot(&snap);
+        self.loadFromEntry(alloc, &snap, hold, false);
         return true;
     }
 
@@ -316,8 +318,11 @@ const EditState = struct {
     /// completed entries are replayed with the edited values on a detached thread.
     fn commit(self: *const EditState, alloc: std.mem.Allocator) CommitOutcome {
         if (self.intercepted) {
-            self.applyToEntry(alloc);
-            intercept.resolve(self.backing_idx, .accept);
+            // Accept only if the write landed; a false return means the hold was
+            // already resolved, so there is nothing left to accept.
+            if (self.applyToEntry(alloc)) {
+                if (self.hold) |h| h.accept();
+            }
             return .accepted;
         }
         const replay_entry = std.heap.page_allocator.create(requests.Entry) catch return .failed;
