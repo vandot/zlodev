@@ -574,19 +574,15 @@ fn handleConnection(
         upstream.writeAll(fwd_entry.getPath()) catch return;
         upstream.writeAll(" HTTP/1.1\r\n") catch return;
 
-        // Forward headers from entry (may have been edited)
+        // Forward headers from entry (may have been edited). For external routes,
+        // drop Host here — it is re-set to the upstream hostname just below.
         const fwd_headers = fwd_entry.getReqHeaders();
         if (fwd_headers.len > 0) {
-            var header_iter = std.mem.splitSequence(u8, fwd_headers, "\r\n");
-            while (header_iter.next()) |header| {
-                if (header.len == 0) continue;
-                if (std.ascii.startsWithIgnoreCase(header, "cache-control:")) continue;
-                if (std.ascii.startsWithIgnoreCase(header, "content-length:")) continue;
-                // For external routes, replace Host header with upstream hostname
-                if (is_external and std.ascii.startsWithIgnoreCase(header, "host:")) continue;
-                upstream.writeAll(header) catch return;
-                upstream.writeAll("\r\n") catch return;
-            }
+            const skip: []const []const u8 = if (is_external)
+                &.{ "cache-control:", "content-length:", "host:" }
+            else
+                &.{ "cache-control:", "content-length:" };
+            http_wire.forwardHeaders(fwd_headers, UpstreamSink{ .upstream = upstream }, .{ .skip = skip }, config.domain);
         }
 
         // For external routes, set Host to upstream and preserve original as X-Forwarded-Host
@@ -793,20 +789,12 @@ fn handleConnection(
         // Forward response status line
         sslWriteAll(ssl, resp_buf[0 .. resp_first_line_end + 2]);
 
-        // Forward response headers, replacing Connection header with our decision
-        // For external routes, rewrite Set-Cookie Domain to proxy domain
-        var resp_header_iter = std.mem.splitSequence(u8, resp_headers_section, "\r\n");
-        while (resp_header_iter.next()) |header| {
-            if (header.len == 0) continue;
-            if (std.ascii.startsWithIgnoreCase(header, "connection:")) continue;
-            if (is_external and std.ascii.startsWithIgnoreCase(header, "set-cookie:")) {
-                rewriteCookieDomain(ssl, header, config.domain);
-                sslWriteAll(ssl, "\r\n");
-                continue;
-            }
-            sslWriteAll(ssl, header);
-            sslWriteAll(ssl, "\r\n");
-        }
+        // Forward response headers, dropping Connection (our decision is appended
+        // below). For external routes, rewrite Set-Cookie Domain to proxy domain.
+        http_wire.forwardHeaders(resp_headers_section, SslSink{ .ssl = ssl }, .{
+            .skip = &.{"connection:"},
+            .rewrite_set_cookie = is_external,
+        }, config.domain);
         if (must_close) {
             sslWriteAll(ssl, "Connection: close\r\n");
         } else {
@@ -898,24 +886,12 @@ fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_extern
     const status_line = std.fmt.bufPrint(&status_buf, "HTTP/1.1 {d} {s}\r\n", .{ e.status, http_wire.reasonPhrase(e.status) }) catch return;
     sslWriteAll(ssl, status_line);
 
-    // Forward response headers
-    const resp_hdrs = e.getRespHeaders();
-    if (resp_hdrs.len > 0) {
-        var header_iter = std.mem.splitSequence(u8, resp_hdrs, "\r\n");
-        while (header_iter.next()) |header| {
-            if (header.len == 0) continue;
-            if (std.ascii.startsWithIgnoreCase(header, "connection:")) continue;
-            if (std.ascii.startsWithIgnoreCase(header, "content-length:")) continue;
-            if (std.ascii.startsWithIgnoreCase(header, "transfer-encoding:")) continue;
-            if (is_external and std.ascii.startsWithIgnoreCase(header, "set-cookie:")) {
-                rewriteCookieDomain(ssl, header, domain);
-                sslWriteAll(ssl, "\r\n");
-                continue;
-            }
-            sslWriteAll(ssl, header);
-            sslWriteAll(ssl, "\r\n");
-        }
-    }
+    // Forward response headers. Connection, Content-Length, and Transfer-Encoding
+    // are dropped — Content-Length is recomputed below and Connection appended.
+    http_wire.forwardHeaders(e.getRespHeaders(), SslSink{ .ssl = ssl }, .{
+        .skip = &.{ "connection:", "content-length:", "transfer-encoding:" },
+        .rewrite_set_cookie = is_external,
+    }, domain);
 
     // Set Content-Length to match actual body (may have been edited)
     const body = e.getRespBody();
@@ -936,12 +912,23 @@ fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_extern
     }
 }
 
-/// Forwarding sink for `http_wire.pumpChunked`: relays raw chunked bytes to the
-/// client over TLS while the pump decodes the payload into the entry.
+/// Forwarding sink for `http_wire` over the client TLS connection — relays bytes
+/// to the browser (chunked body, response headers). Write failures are swallowed,
+/// matching `sslWriteAll`; the caller's next write detects the dead connection.
 const SslSink = struct {
     ssl: *ssl_c.SSL,
     pub fn write(self: SslSink, bytes: []const u8) void {
         sslWriteAll(self.ssl, bytes);
+    }
+};
+
+/// Forwarding sink for `http_wire.forwardHeaders` over the upstream connection.
+/// Write failures are swallowed; the request line/body writes that follow the
+/// header loop detect the dead connection and abort.
+const UpstreamSink = struct {
+    upstream: UpstreamConn,
+    pub fn write(self: UpstreamSink, bytes: []const u8) void {
+        self.upstream.writeAll(bytes) catch {};
     }
 };
 
@@ -1047,34 +1034,6 @@ fn sslSendError(ssl: *ssl_c.SSL, status: u16, message: []const u8) void {
         status, message, message.len, message,
     }) catch return;
     sslWriteAll(ssl, response);
-}
-
-/// Rewrite Domain= attribute in a Set-Cookie header to the proxy domain.
-/// Writes the full header (without trailing \r\n) to the SSL connection.
-fn rewriteCookieDomain(ssl: *ssl_c.SSL, header: []const u8, domain: []const u8) void {
-    // Find "Domain=" (case-insensitive) in the cookie attributes (after first ;)
-    // Skip the cookie value to avoid matching "domain=" inside it
-    const attr_start = if (std.mem.indexOfScalar(u8, header, ';')) |pos| pos else header.len;
-    var i: usize = attr_start;
-    while (i + 7 <= header.len) : (i += 1) {
-        if (std.ascii.startsWithIgnoreCase(header[i..], "domain=")) {
-            // Found Domain= at position i
-            // Write everything before "Domain="
-            sslWriteAll(ssl, header[0..i]);
-            // Write "Domain=.<proxy_domain>"
-            sslWriteAll(ssl, "Domain=.");
-            sslWriteAll(ssl, domain);
-            // Skip past the original domain value (until ; or end of header)
-            var j = i + 7;
-            if (j < header.len and header[j] == '.') j += 1; // skip leading dot
-            while (j < header.len and header[j] != ';') : (j += 1) {}
-            // Write the rest of the header
-            sslWriteAll(ssl, header[j..]);
-            return;
-        }
-    }
-    // No Domain= found, forward as-is
-    sslWriteAll(ssl, header);
 }
 
 fn handleWebSocket(

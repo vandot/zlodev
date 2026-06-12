@@ -255,6 +255,65 @@ pub fn pumpChunked(initial: []const u8, src: anytype, sink: anytype, body: []u8)
     return .{ .captured = captured, .state = state, .truncated = truncated };
 }
 
+/// A header-forwarding policy: which header lines to drop, and whether to rewrite
+/// the Set-Cookie `Domain=` attribute to the proxy domain.
+pub const ForwardPolicy = struct {
+    /// Lowercase header-name prefixes (including the trailing colon) to drop.
+    skip: []const []const u8 = &.{},
+    /// Rewrite the Domain= attribute of Set-Cookie headers to `domain`.
+    rewrite_set_cookie: bool = false,
+};
+
+fn matchesAnyPrefix(header: []const u8, prefixes: []const []const u8) bool {
+    for (prefixes) |p| {
+        if (std.ascii.startsWithIgnoreCase(header, p)) return true;
+    }
+    return false;
+}
+
+/// Forward CRLF-separated header lines to `sink` (`write([]const u8) void`),
+/// dropping any whose name matches a `policy.skip` prefix and, when
+/// `policy.rewrite_set_cookie`, rewriting Set-Cookie `Domain=` to `domain`. Each
+/// surviving header is written followed by CRLF. The caller owns the start line,
+/// any appended headers (Connection, Content-Length), and the terminating CRLF.
+pub fn forwardHeaders(headers: []const u8, sink: anytype, policy: ForwardPolicy, domain: []const u8) void {
+    var iter = std.mem.splitSequence(u8, headers, "\r\n");
+    while (iter.next()) |header| {
+        if (header.len == 0) continue;
+        if (matchesAnyPrefix(header, policy.skip)) continue;
+        if (policy.rewrite_set_cookie and std.ascii.startsWithIgnoreCase(header, "set-cookie:")) {
+            writeCookieWithDomain(sink, header, domain);
+            sink.write("\r\n");
+            continue;
+        }
+        sink.write(header);
+        sink.write("\r\n");
+    }
+}
+
+/// Write a Set-Cookie `header` to `sink`, replacing its `Domain=` attribute value
+/// with `.<domain>`. The search for `Domain=` begins after the first `;` so a
+/// `domain=` substring inside the cookie value is never matched. If no `Domain=`
+/// attribute is present the header is written unchanged. No trailing CRLF.
+pub fn writeCookieWithDomain(sink: anytype, header: []const u8, domain: []const u8) void {
+    const attr_start = if (std.mem.indexOfScalar(u8, header, ';')) |pos| pos else header.len;
+    var i: usize = attr_start;
+    while (i + 7 <= header.len) : (i += 1) {
+        if (std.ascii.startsWithIgnoreCase(header[i..], "domain=")) {
+            sink.write(header[0..i]);
+            sink.write("Domain=.");
+            sink.write(domain);
+            // Skip past the original domain value (until ; or end of header).
+            var j = i + 7;
+            if (j < header.len and header[j] == '.') j += 1; // skip leading dot
+            while (j < header.len and header[j] != ';') : (j += 1) {}
+            sink.write(header[j..]);
+            return;
+        }
+    }
+    sink.write(header);
+}
+
 // --- Unit Tests ---
 
 const testing = std.testing;
@@ -484,4 +543,57 @@ test "pumpChunked with NullSink decodes without forwarding" {
 
     try testing.expectEqual(ChunkState.done, r.state);
     try testing.expectEqualStrings("abc", body[0..r.captured]);
+}
+
+/// Run forwardHeaders into a fixed buffer and return the forwarded bytes.
+fn forwardInto(out: []u8, headers: []const u8, policy: ForwardPolicy, domain: []const u8) []const u8 {
+    var len: usize = 0;
+    forwardHeaders(headers, CaptureSink{ .buf = out, .len = &len }, policy, domain);
+    return out[0..len];
+}
+
+test "forwardHeaders drops skipped headers, keeps the rest" {
+    var out: [256]u8 = undefined;
+    const got = forwardInto(&out, "Host: dev.lo\r\nCache-Control: no-cache\r\nContent-Length: 5\r\nAccept: */*\r\n", .{ .skip = &.{ "cache-control:", "content-length:" } }, "dev.lo");
+    try testing.expectEqualStrings("Host: dev.lo\r\nAccept: */*\r\n", got);
+}
+
+test "forwardHeaders skip is case-insensitive" {
+    var out: [256]u8 = undefined;
+    const got = forwardInto(&out, "CONNECTION: keep-alive\r\nX-Trace: 1\r\n", .{ .skip = &.{"connection:"} }, "dev.lo");
+    try testing.expectEqualStrings("X-Trace: 1\r\n", got);
+}
+
+test "forwardHeaders leaves Set-Cookie untouched when rewrite off" {
+    var out: [256]u8 = undefined;
+    const got = forwardInto(&out, "Set-Cookie: id=abc; Domain=staging.example.com; Path=/\r\n", .{ .rewrite_set_cookie = false }, "dev.lo");
+    try testing.expectEqualStrings("Set-Cookie: id=abc; Domain=staging.example.com; Path=/\r\n", got);
+}
+
+test "forwardHeaders rewrites Set-Cookie Domain when policy set" {
+    var out: [256]u8 = undefined;
+    const got = forwardInto(&out, "Set-Cookie: id=abc; Domain=staging.example.com; Path=/\r\n", .{ .rewrite_set_cookie = true }, "dev.lo");
+    try testing.expectEqualStrings("Set-Cookie: id=abc; Domain=.dev.lo; Path=/\r\n", got);
+}
+
+test "writeCookieWithDomain strips a leading dot on the original domain" {
+    var out: [256]u8 = undefined;
+    var len: usize = 0;
+    writeCookieWithDomain(CaptureSink{ .buf = &out, .len = &len }, "Set-Cookie: id=abc; Domain=.staging.example.com; HttpOnly", "dev.lo");
+    try testing.expectEqualStrings("Set-Cookie: id=abc; Domain=.dev.lo; HttpOnly", out[0..len]);
+}
+
+test "writeCookieWithDomain ignores a domain= substring in the cookie value" {
+    var out: [256]u8 = undefined;
+    var len: usize = 0;
+    writeCookieWithDomain(CaptureSink{ .buf = &out, .len = &len }, "Set-Cookie: redirect=domain=evil; Path=/", "dev.lo");
+    // No Domain= attribute after the first ';' — header passes through unchanged.
+    try testing.expectEqualStrings("Set-Cookie: redirect=domain=evil; Path=/", out[0..len]);
+}
+
+test "writeCookieWithDomain passes through a cookie with no Domain attribute" {
+    var out: [256]u8 = undefined;
+    var len: usize = 0;
+    writeCookieWithDomain(CaptureSink{ .buf = &out, .len = &len }, "Set-Cookie: id=abc; Path=/; HttpOnly", "dev.lo");
+    try testing.expectEqualStrings("Set-Cookie: id=abc; Path=/; HttpOnly", out[0..len]);
 }
