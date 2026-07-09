@@ -4,6 +4,7 @@ const vaxis = @import("vaxis");
 const requests = @import("requests.zig");
 const intercept = @import("intercept.zig");
 const proxy = @import("proxy.zig");
+const jsonfmt = @import("jsonfmt.zig");
 const har = @import("har.zig");
 const clipboard = @import("clipboard.zig");
 const search = @import("search.zig");
@@ -25,7 +26,7 @@ const CommitOutcome = enum { accepted, replayed, failed };
 const EditState = struct {
     active: bool = false,
     field: EditField = .method,
-    backing_idx: usize = 0,
+    hold: ?requests.EditableHold = null,
     // Editable buffers
     method_buf: [7]u8 = .{0} ** 7,
     method_len: usize = 0,
@@ -180,8 +181,8 @@ const EditState = struct {
         self.scroll = 0;
     }
 
-    fn loadFromEntry(self: *EditState, alloc: std.mem.Allocator, entry: *const requests.Entry, backing_idx: usize, is_intercepted: bool) void {
-        self.backing_idx = backing_idx;
+    fn loadFromEntry(self: *EditState, alloc: std.mem.Allocator, entry: *const requests.Entry, hold: requests.EditableHold, is_intercepted: bool) void {
+        self.hold = hold;
         self.intercepted = is_intercepted;
         self.resp_edit = false;
         self.field = .method;
@@ -193,12 +194,9 @@ const EditState = struct {
         @memcpy(self.path_buf[0..entry.path_len], entry.path[0..entry.path_len]);
         self.headers_len = entry.req_headers_len;
         @memcpy(self.headers_buf[0..entry.req_headers_len], entry.req_headers[0..entry.req_headers_len]);
-        // Try to pretty-print JSON body
+        // Try to pretty-print JSON body, else load it raw.
         const raw_body = entry.req_body[0..entry.req_body_len];
-        if (prettyPrintJson(alloc, raw_body)) |pretty| {
-            defer alloc.free(pretty);
-            const len = @min(pretty.len, self.body_buf.len);
-            @memcpy(self.body_buf[0..len], pretty[0..len]);
+        if (jsonfmt.pretty(alloc, raw_body, &self.body_buf)) |len| {
             self.body_len = len;
         } else {
             self.body_len = entry.req_body_len;
@@ -207,52 +205,28 @@ const EditState = struct {
         self.active = true;
     }
 
-    fn prettyPrintJson(alloc: std.mem.Allocator, body: []const u8) ?[]const u8 {
-        if (body.len == 0) return null;
-        const first = for (body) |ch| {
-            if (ch != ' ' and ch != '\t' and ch != '\n' and ch != '\r') break ch;
-        } else return null;
-        if (first != '{' and first != '[') return null;
-        const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return null;
-        defer parsed.deinit();
-        return std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .whitespace = .indent_2 }) catch null;
-    }
-
-    /// Compact JSON by re-serializing without whitespace. Returns compacted length written
-    /// into dest, or null if body isn't valid JSON (in which case dest is untouched).
-    fn compactJson(alloc: std.mem.Allocator, src: []const u8, dest: []u8) ?usize {
-        if (src.len == 0) return null;
-        const first = for (src) |ch| {
-            if (ch != ' ' and ch != '\t' and ch != '\n' and ch != '\r') break ch;
-        } else return null;
-        if (first != '{' and first != '[') return null;
-        const parsed = std.json.parseFromSlice(std.json.Value, alloc, src, .{}) catch return null;
-        defer parsed.deinit();
-        const compact = std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .whitespace = .minified }) catch return null;
-        defer alloc.free(compact);
-        const len = @min(compact.len, dest.len);
-        @memcpy(dest[0..len], compact[0..len]);
-        return len;
-    }
-
-    fn applyToEntry(self: *const EditState, alloc: std.mem.Allocator) void {
+    /// Write the edited buffers back to the held entry through the hold, which
+    /// re-checks the entry is still held before touching it. Returns false if the
+    /// hold was resolved out from under the editor (nothing written).
+    fn applyToEntry(self: *const EditState, alloc: std.mem.Allocator) bool {
+        const hold = self.hold orelse return false;
         // Compact the (pretty-printed) body once, into a temp; ring ops do the locked write.
         var body_tmp: [requests.max_body_len]u8 = undefined;
-        const body_slice: []const u8 = if (compactJson(alloc, self.body_buf[0..self.body_len], &body_tmp)) |len|
+        const body_slice: []const u8 = if (jsonfmt.compact(alloc, self.body_buf[0..self.body_len], &body_tmp)) |len|
             body_tmp[0..len]
         else
             self.body_buf[0..self.body_len];
         if (self.resp_edit) {
             // method_buf holds the status code string; keep the current status if unparseable.
-            const status = std.fmt.parseInt(u16, self.method_buf[0..self.method_len], 10) catch requests.statusOf(self.backing_idx);
-            requests.applyResponseEdit(self.backing_idx, status, self.headers_buf[0..self.headers_len], body_slice);
+            const status = std.fmt.parseInt(u16, self.method_buf[0..self.method_len], 10) catch hold.currentStatus();
+            return hold.commitResponse(status, self.headers_buf[0..self.headers_len], body_slice);
         } else {
-            requests.applyRequestEdit(self.backing_idx, self.method_buf[0..self.method_len], self.path_buf[0..self.path_len], self.headers_buf[0..self.headers_len], body_slice);
+            return hold.commitRequest(self.method_buf[0..self.method_len], self.path_buf[0..self.path_len], self.headers_buf[0..self.headers_len], body_slice);
         }
     }
 
-    fn loadResponseFromEntry(self: *EditState, alloc: std.mem.Allocator, entry: *const requests.Entry, backing_idx: usize) void {
-        self.backing_idx = backing_idx;
+    fn loadResponseFromEntry(self: *EditState, alloc: std.mem.Allocator, entry: *const requests.Entry, hold: requests.EditableHold) void {
+        self.hold = hold;
         self.intercepted = true;
         self.resp_edit = true;
         self.field = .method; // method_buf holds status code
@@ -268,12 +242,9 @@ const EditState = struct {
         // Response headers
         self.headers_len = entry.resp_headers_len;
         @memcpy(self.headers_buf[0..entry.resp_headers_len], entry.resp_headers[0..entry.resp_headers_len]);
-        // Response body (try to pretty-print JSON)
+        // Response body (try to pretty-print JSON, else load it raw).
         const raw_body = entry.resp_body[0..entry.resp_body_len];
-        if (prettyPrintJson(alloc, raw_body)) |pretty| {
-            defer alloc.free(pretty);
-            const len = @min(pretty.len, self.body_buf.len);
-            @memcpy(self.body_buf[0..len], pretty[0..len]);
+        if (jsonfmt.pretty(alloc, raw_body, &self.body_buf)) |len| {
             self.body_len = len;
         } else {
             self.body_len = entry.resp_body_len;
@@ -287,16 +258,14 @@ const EditState = struct {
     /// it in request- or response-edit mode. Returns false (caller stays in list) for
     /// a missing entry or a completed response, which can't be edited.
     fn open(self: *EditState, alloc: std.mem.Allocator, logical: usize) bool {
-        const backing = requests.logicalToBackingIndex(logical) orelse return false;
-        const ph = requests.phaseOf(backing);
-        if (ph == .response_done) return false;
+        const hold = requests.editHeld(logical) orelse return false; // missing or response_done
         var snap: requests.Entry = undefined;
-        requests.snapshotByBackingIndex(backing, &snap);
-        switch (ph) {
-            .response_held => self.loadResponseFromEntry(alloc, &snap, backing),
-            .request_held => self.loadFromEntry(alloc, &snap, backing, true),
-            .request => self.loadFromEntry(alloc, &snap, backing, false),
-            .response_done => unreachable,
+        hold.snapshot(&snap);
+        switch (hold.phase) {
+            .response_held => self.loadResponseFromEntry(alloc, &snap, hold),
+            .request_held => self.loadFromEntry(alloc, &snap, hold, true),
+            .request => self.loadFromEntry(alloc, &snap, hold, false),
+            .response_done => unreachable, // editHeld returns null for this
         }
         return true;
     }
@@ -304,11 +273,11 @@ const EditState = struct {
     /// Open the editor in replay mode (the `r` action): only plain request entries
     /// qualify. Returns false for anything held or response-oriented.
     fn openForReplay(self: *EditState, alloc: std.mem.Allocator, logical: usize) bool {
-        const backing = requests.logicalToBackingIndex(logical) orelse return false;
-        if (requests.phaseOf(backing) != .request) return false;
+        const hold = requests.editHeld(logical) orelse return false;
+        if (hold.phase != .request) return false; // only plain request entries replay
         var snap: requests.Entry = undefined;
-        requests.snapshotByBackingIndex(backing, &snap);
-        self.loadFromEntry(alloc, &snap, backing, false);
+        hold.snapshot(&snap);
+        self.loadFromEntry(alloc, &snap, hold, false);
         return true;
     }
 
@@ -316,8 +285,11 @@ const EditState = struct {
     /// completed entries are replayed with the edited values on a detached thread.
     fn commit(self: *const EditState, alloc: std.mem.Allocator) CommitOutcome {
         if (self.intercepted) {
-            self.applyToEntry(alloc);
-            intercept.resolve(self.backing_idx, .accept);
+            // Accept only if the write landed; a false return means the hold was
+            // already resolved, so there is nothing left to accept.
+            if (self.applyToEntry(alloc)) {
+                if (self.hold) |h| h.accept();
+            }
             return .accepted;
         }
         const replay_entry = std.heap.page_allocator.create(requests.Entry) catch return .failed;
@@ -1228,7 +1200,7 @@ fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const reques
             line_count += 1;
             lines[line_count] = .{ .text = "REQUEST BODY", .style = .{ .fg = blue, .bold = true } };
             line_count += 1;
-            line_count = splitBodyLines(alloc, req_body, &lines, line_count, .{ .fg = white });
+            line_count = splitBodyLines(alloc, req_body, &req_body_scratch, &lines, line_count, .{ .fg = white });
         }
 
         const resp_body = e.getRespBody();
@@ -1237,7 +1209,7 @@ fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const reques
             line_count += 1;
             lines[line_count] = .{ .text = "RESPONSE BODY", .style = .{ .fg = blue, .bold = true } };
             line_count += 1;
-            line_count = splitBodyLines(alloc, resp_body, &lines, line_count, .{ .fg = white });
+            line_count = splitBodyLines(alloc, resp_body, &resp_body_scratch, &lines, line_count, .{ .fg = white });
         }
     }
 
@@ -1276,33 +1248,25 @@ fn splitHeaderLines(headers: []const u8, lines: []DetailLine, start: usize, styl
     return pos;
 }
 
-/// Static buffer to hold pretty-printed JSON between frames (lines reference into it).
-var json_pretty_buf: [requests.max_body_len * 2]u8 = .{0} ** (requests.max_body_len * 2);
-var json_pretty_len: usize = 0;
+/// Backing store for pretty-printed JSON whose lines a DetailLine slice references.
+/// Must outlive the draw, hence the fixed size; sized to hold an indented body.
+const BodyScratch = [requests.max_body_len * 2]u8;
 
-fn splitBodyLines(alloc: std.mem.Allocator, body: []const u8, lines: []DetailLine, start: usize, style: vaxis.Style) usize {
-    // Quick check: only try JSON parsing if body starts with { or [
-    const first = for (body) |ch| {
-        if (ch != ' ' and ch != '\t' and ch != '\n' and ch != '\r') break ch;
-    } else 0;
-    if (first != '{' and first != '[')
-        return splitRawBodyLines(body, lines, start, style);
+/// One scratch buffer per body pane, so the request and response bodies of the same
+/// entry can both be pretty-printed in a frame without sharing storage. Single TUI
+/// render thread, so no locking is needed.
+var req_body_scratch: BodyScratch = undefined;
+var resp_body_scratch: BodyScratch = undefined;
 
-    // Try JSON pretty-print using std.json
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
-        return splitRawBodyLines(body, lines, start, style);
-    defer parsed.deinit();
-
-    const pretty = std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .whitespace = .indent_2 }) catch
-        return splitRawBodyLines(body, lines, start, style);
-    defer alloc.free(pretty);
-
-    // Copy into static buffer so lines can reference it after this function returns
-    const len = @min(pretty.len, json_pretty_buf.len);
-    @memcpy(json_pretty_buf[0..len], pretty[0..len]);
-    json_pretty_len = len;
-
-    return splitRawBodyLines(json_pretty_buf[0..len], lines, start, style);
+/// Split a response/request body into DetailLines. JSON is pretty-printed into the
+/// caller-owned `scratch` (whose bytes the returned lines reference, so it must live
+/// until the lines are rendered); anything else is split raw. Taking `scratch` as a
+/// parameter — rather than a shared module buffer — lets the request and response
+/// panes be formatted in the same frame without one clobbering the other's lines.
+fn splitBodyLines(alloc: std.mem.Allocator, body: []const u8, scratch: []u8, lines: []DetailLine, start: usize, style: vaxis.Style) usize {
+    if (jsonfmt.pretty(alloc, body, scratch)) |len|
+        return splitRawBodyLines(scratch[0..len], lines, start, style);
+    return splitRawBodyLines(body, lines, start, style);
 }
 
 fn splitRawBodyLines(body: []const u8, lines: []DetailLine, start: usize, style: vaxis.Style) usize {

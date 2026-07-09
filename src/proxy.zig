@@ -124,7 +124,7 @@ const UpstreamConn = struct {
         }
     }
 
-    fn read(self: UpstreamConn, buf: []u8) !usize {
+    pub fn read(self: UpstreamConn, buf: []u8) !usize {
         if (self.ssl_conn) |s| {
             const n = ssl_c.SSL_read(s, @ptrCast(buf.ptr), @intCast(buf.len));
             if (n <= 0) return error.SslRead;
@@ -271,6 +271,88 @@ pub fn start(config: *const ProxyConfig) !void {
             conn.stream.close();
         };
     }
+}
+
+/// Resolve, connect, and (for external routes) TLS-handshake an upstream connection.
+/// On any failure the specific cause is logged and `error.UpstreamUnavailable` is
+/// returned; the caller maps that to a single 502. Owns the resolved AddressList for
+/// its own lifetime and sets send/recv timeouts on the socket before returning.
+fn connectUpstream(
+    is_external: bool,
+    upstream_host: []const u8,
+    upstream_port: u16,
+    config: *const ProxyConfig,
+    client_ctx: ?*ssl_c.SSL_CTX,
+    conn_id: u64,
+) !UpstreamConn {
+    // Resolve upstream address — DNS for external, IP parse for local
+    var addr_list: ?*std.net.AddressList = null;
+    defer if (addr_list) |al| al.deinit();
+
+    const upstream_addr: std.net.Address = blk: {
+        if (is_external) {
+            const al = std.net.getAddressList(std.heap.page_allocator, upstream_host, upstream_port) catch {
+                log.err("component=proxy conn={d} op=dns_resolve host={s} error=failed", .{ conn_id, upstream_host });
+                return error.UpstreamUnavailable;
+            };
+            addr_list = al;
+            if (al.addrs.len == 0) {
+                log.err("component=proxy conn={d} op=dns_resolve host={s} error=no_addresses", .{ conn_id, upstream_host });
+                return error.UpstreamUnavailable;
+            }
+            break :blk al.addrs[0];
+        } else {
+            break :blk std.net.Address.parseIp(config.target_host, upstream_port) catch {
+                return error.UpstreamUnavailable;
+            };
+        }
+    };
+
+    const upstream_sock = posix.socket(upstream_addr.any.family, posix.SOCK.STREAM, 0) catch |e| {
+        log.err("component=proxy conn={d} op=upstream_socket error={any}", .{ conn_id, e });
+        return error.UpstreamUnavailable;
+    };
+    posix.connect(upstream_sock, &upstream_addr.any, upstream_addr.getOsSockLen()) catch |e| {
+        log.err("component=proxy conn={d} op=upstream_connect host={s} error={any}", .{ conn_id, upstream_host, e });
+        compat.closeSocket(upstream_sock);
+        return error.UpstreamUnavailable;
+    };
+
+    // Wrap in TLS for external upstreams; plain socket for local
+    var upstream_ssl_obj: ?*ssl_c.SSL = null;
+    if (is_external) {
+        const cctx = client_ctx orelse {
+            // client_ctx is null — SSL_CTX allocation failed at startup
+            log.err("component=proxy conn={d} op=external_tls error=no_client_ctx", .{conn_id});
+            compat.closeSocket(upstream_sock);
+            return error.UpstreamUnavailable;
+        };
+        const us = ssl_c.SSL_new(cctx) orelse {
+            log.err("component=proxy conn={d} op=upstream_ssl_new error=alloc_failed", .{conn_id});
+            compat.closeSocket(upstream_sock);
+            return error.UpstreamUnavailable;
+        };
+        _ = ssl_c.SSL_set_fd(us, compat.socketToFd(upstream_sock));
+        // Set SNI hostname
+        var sni_buf: [256]u8 = undefined;
+        if (upstream_host.len < sni_buf.len) {
+            @memcpy(sni_buf[0..upstream_host.len], upstream_host);
+            sni_buf[upstream_host.len] = 0;
+            _ = ssl_c.SSL_set_tlsext_host_name(us, &sni_buf);
+        }
+        if (ssl_c.SSL_connect(us) != 1) {
+            log.err("component=proxy conn={d} op=upstream_tls_handshake host={s} error=failed", .{ conn_id, upstream_host });
+            ssl_c.SSL_free(us);
+            compat.closeSocket(upstream_sock);
+            return error.UpstreamUnavailable;
+        }
+        upstream_ssl_obj = us;
+    }
+
+    const upstream = UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
+    setSocketTimeout(upstream_sock, .recv, 30);
+    setSocketTimeout(upstream_sock, .send, 30);
+    return upstream;
 }
 
 fn handleConnection(
@@ -448,109 +530,15 @@ fn handleConnection(
         const is_external = route_result.hostname != null;
         const upstream_host = route_result.hostname orelse config.target_host;
 
-        // Resolve upstream address — DNS for external, IP parse for local
-        var addr_list: ?*std.net.AddressList = null;
-        defer if (addr_list) |al| al.deinit();
-
-        const upstream_addr: std.net.Address = blk: {
-            if (is_external) {
-                const al = std.net.getAddressList(std.heap.page_allocator, upstream_host, upstream_port) catch {
-                    log.err("component=proxy conn={d} op=dns_resolve host={s} error=failed", .{ conn_id, upstream_host });
-                    if (was_intercepted) {
-                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                    }
-                    sslSendError(ssl, 502, "Bad Gateway");
-                    return;
-                };
-                addr_list = al;
-                if (al.addrs.len == 0) {
-                    log.err("component=proxy conn={d} op=dns_resolve host={s} error=no_addresses", .{ conn_id, upstream_host });
-                    if (was_intercepted) {
-                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                    }
-                    sslSendError(ssl, 502, "Bad Gateway");
-                    return;
-                }
-                break :blk al.addrs[0];
-            } else {
-                break :blk std.net.Address.parseIp(config.target_host, upstream_port) catch {
-                    if (was_intercepted) {
-                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                    }
-                    sslSendError(ssl, 502, "Bad Gateway");
-                    return;
-                };
-            }
-        };
-        const upstream_sock = posix.socket(upstream_addr.any.family, posix.SOCK.STREAM, 0) catch |e| {
-            log.err("component=proxy conn={d} op=upstream_socket error={any}", .{ conn_id, e });
+        const upstream = connectUpstream(is_external, upstream_host, upstream_port, config, client_ctx, conn_id) catch {
+            const dur = std.time.milliTimestamp() - start_time;
             if (was_intercepted) {
-                const dur = std.time.milliTimestamp() - start_time;
                 requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
             }
             sslSendError(ssl, 502, "Bad Gateway");
             return;
         };
-        posix.connect(upstream_sock, &upstream_addr.any, upstream_addr.getOsSockLen()) catch |e| {
-            log.err("component=proxy conn={d} op=upstream_connect host={s} error={any}", .{ conn_id, upstream_host, e });
-            compat.closeSocket(upstream_sock);
-            if (was_intercepted) {
-                const dur = std.time.milliTimestamp() - start_time;
-                requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
-            }
-            sslSendError(ssl, 502, "Bad Gateway");
-            return;
-        };
-
-        // Wrap in UpstreamConn — TLS for external, plain socket for local
-        var upstream_ssl_obj: ?*ssl_c.SSL = null;
-        if (is_external) {
-            if (client_ctx) |cctx| {
-                const us = ssl_c.SSL_new(cctx) orelse {
-                    log.err("component=proxy conn={d} op=upstream_ssl_new error=alloc_failed", .{conn_id});
-                    compat.closeSocket(upstream_sock);
-                    if (was_intercepted) {
-                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                    }
-                    sslSendError(ssl, 502, "Bad Gateway");
-                    return;
-                };
-                _ = ssl_c.SSL_set_fd(us, compat.socketToFd(upstream_sock));
-                // Set SNI hostname
-                var sni_buf: [256]u8 = undefined;
-                if (upstream_host.len < sni_buf.len) {
-                    @memcpy(sni_buf[0..upstream_host.len], upstream_host);
-                    sni_buf[upstream_host.len] = 0;
-                    _ = ssl_c.SSL_set_tlsext_host_name(us, &sni_buf);
-                }
-                if (ssl_c.SSL_connect(us) != 1) {
-                    log.err("component=proxy conn={d} op=upstream_tls_handshake host={s} error=failed", .{ conn_id, upstream_host });
-                    ssl_c.SSL_free(us);
-                    compat.closeSocket(upstream_sock);
-                    if (was_intercepted) {
-                        requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                    }
-                    sslSendError(ssl, 502, "Bad Gateway");
-                    return;
-                }
-                upstream_ssl_obj = us;
-            } else {
-                // client_ctx is null — SSL_CTX allocation failed at startup
-                log.err("component=proxy conn={d} op=external_tls error=no_client_ctx", .{conn_id});
-                compat.closeSocket(upstream_sock);
-                if (was_intercepted) {
-                    requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                }
-                sslSendError(ssl, 502, "Bad Gateway");
-                return;
-            }
-        }
-        const upstream = UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
         defer upstream.close();
-
-        // Set timeouts on upstream socket
-        setSocketTimeout(upstream_sock, .recv, 30);
-        setSocketTimeout(upstream_sock, .send, 30);
 
         // Forward the (possibly TUI-edited) request. The TUI edits a held entry only
         // while the proxy is blocked in hold.awaitDecision(); once that returns the edit
@@ -568,114 +556,41 @@ fn handleConnection(
             break :blk s;
         } else &entry;
 
-        // Forward request line (use entry data which may have been edited)
-        upstream.writeAll(fwd_entry.getMethod()) catch return;
-        upstream.writeAll(" ") catch return;
-        upstream.writeAll(fwd_entry.getPath()) catch return;
-        upstream.writeAll(" HTTP/1.1\r\n") catch return;
-
-        // Forward headers from entry (may have been edited)
-        const fwd_headers = fwd_entry.getReqHeaders();
-        if (fwd_headers.len > 0) {
-            var header_iter = std.mem.splitSequence(u8, fwd_headers, "\r\n");
-            while (header_iter.next()) |header| {
-                if (header.len == 0) continue;
-                if (std.ascii.startsWithIgnoreCase(header, "cache-control:")) continue;
-                if (std.ascii.startsWithIgnoreCase(header, "content-length:")) continue;
-                // For external routes, replace Host header with upstream hostname
-                if (is_external and std.ascii.startsWithIgnoreCase(header, "host:")) continue;
-                upstream.writeAll(header) catch return;
-                upstream.writeAll("\r\n") catch return;
-            }
-        }
-
-        // For external routes, set Host to upstream and preserve original as X-Forwarded-Host
-        if (is_external) {
-            upstream.writeAll("Host: ") catch return;
-            upstream.writeAll(upstream_host) catch return;
-            upstream.writeAll("\r\n") catch return;
-            if (host.len > 0) {
-                upstream.writeAll("X-Forwarded-Host: ") catch return;
-                upstream.writeAll(host) catch return;
-                upstream.writeAll("\r\n") catch return;
-            }
-        }
-
-        // Add proxy headers
-        var ip_buf: [64]u8 = undefined;
-        const client_ip = formatAddress(client_addr, &ip_buf);
-        upstream.writeAll("X-Real-IP: ") catch return;
-        upstream.writeAll(client_ip) catch return;
-        upstream.writeAll("\r\n") catch return;
-        upstream.writeAll("X-Forwarded-Proto: https\r\n") catch return;
-        upstream.writeAll("Cache-Control: no-cache\r\n") catch return;
-        upstream.writeAll("Pragma: no-cache\r\n") catch return;
-
-        // Add correct Content-Length for the (possibly edited) body
-        const fwd_body = fwd_entry.getReqBody();
-
-        // If body was truncated, we can't forward it correctly — reject
+        // A truncated request body can't be forwarded with a correct Content-Length —
+        // reject before emitting anything to upstream.
         if (fwd_entry.req_body_truncated) {
             sslSendError(ssl, 413, "Request body too large for proxy buffer");
             return;
         }
 
-        {
-            var cl_buf: [64]u8 = undefined;
-            const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{fwd_body.len}) catch "";
-            upstream.writeAll(cl_hdr) catch return;
-        }
-        upstream.writeAll("\r\n") catch return;
+        var ip_buf: [64]u8 = undefined;
+        forwardRequest(UpstreamSink{ .upstream = upstream }, fwd_entry, .{
+            .is_external = is_external,
+            .upstream_host = upstream_host,
+            .client_host = host,
+            .client_ip = formatAddress(client_addr, &ip_buf),
+            .domain = config.domain,
+        });
 
-        // Forward request body from entry
-        if (fwd_body.len > 0) {
-            upstream.writeAll(fwd_body) catch return;
-        }
-
-        // Read upstream response
+        // Read and parse the upstream response head
         var resp_buf: [16384]u8 = undefined;
-        var resp_total: usize = 0;
-        var resp_headers_end: ?usize = null;
-
-        while (resp_total < resp_buf.len) {
-            const n = upstream.read(resp_buf[resp_total..]) catch break;
-            if (n == 0) break;
-            resp_total += n;
-            if (std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n\r\n")) |pos| {
-                resp_headers_end = pos;
-                break;
-            }
-        }
-
-        if (resp_total == 0 or resp_headers_end == null) return;
-        const resp_hdr_end = resp_headers_end.?;
-
-        // Extract status line
-        const resp_first_line_end = std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n") orelse return;
-
-        // Extract status code (e.g. "HTTP/1.1 200 OK" -> 200)
-        const resp_line = resp_buf[0..resp_first_line_end];
-        var resp_parts = std.mem.splitScalar(u8, resp_line, ' ');
-        _ = resp_parts.next(); // skip HTTP version
-        if (resp_parts.next()) |status_str| {
-            entry.status = std.fmt.parseInt(u16, status_str, 10) catch 0;
-        }
+        const head = http_wire.readResponseHead(upstream, &resp_buf) orelse return;
+        entry.status = head.status;
 
         // Capture response headers
-        const resp_headers_section = resp_buf[resp_first_line_end + 2 .. resp_hdr_end];
+        const resp_headers_section = head.headers;
         const rsh_len = @min(resp_headers_section.len, requests.max_header_len);
         @memcpy(entry.resp_headers[0..rsh_len], resp_headers_section[0..rsh_len]);
         entry.resp_headers_len = @intCast(rsh_len);
 
         // Determine if we must close after this response
         const is_chunked = http_wire.isChunkedEncoding(resp_headers_section);
-        const resp_content_length = http_wire.getContentLength(resp_buf[0 .. resp_hdr_end + 4]);
+        const resp_content_length = http_wire.getContentLength(resp_headers_section);
         const upstream_conn = http_wire.getConnectionHeader(resp_headers_section);
         const response_has_defined_length = is_chunked or resp_content_length != null;
         const must_close = !keep_alive or upstream_conn == .close or !response_has_defined_length;
 
-        const resp_body_start = resp_hdr_end + 4;
-        const initial_body = if (resp_body_start < resp_total) resp_buf[resp_body_start..resp_total] else resp_buf[0..0];
+        const initial_body = head.initial_body;
 
         // Check if we should intercept the response
         const intercept_resp = intercept.shouldInterceptResponse(method, uri);
@@ -685,47 +600,13 @@ fn handleConnection(
             var resp_body_captured: usize = 0;
 
             if (is_chunked) {
-                resp_body_captured = bufferChunkedBody(upstream, initial_body, &entry.resp_body, &resp_buf);
-                if (resp_body_captured >= requests.max_body_len) {
-                    entry.resp_body_truncated = true;
-                }
+                const pr = http_wire.pumpChunked(initial_body, upstream, http_wire.NullSink{}, &entry.resp_body);
+                resp_body_captured = pr.captured;
+                if (pr.truncated) entry.resp_body_truncated = true;
             } else {
-                if (initial_body.len > 0) {
-                    const cap = @min(initial_body.len, requests.max_body_len);
-                    @memcpy(entry.resp_body[0..cap], initial_body[0..cap]);
-                    resp_body_captured = cap;
-                }
-                if (resp_content_length) |cl| {
-                    var body_read: usize = initial_body.len;
-                    while (body_read < cl) {
-                        const n = upstream.read(&resp_buf) catch break;
-                        if (n == 0) break;
-                        const space = requests.max_body_len -| resp_body_captured;
-                        const cap = @min(n, space);
-                        if (cap > 0) {
-                            @memcpy(entry.resp_body[resp_body_captured .. resp_body_captured + cap], resp_buf[0..cap]);
-                            resp_body_captured += cap;
-                        }
-                        body_read += n;
-                    }
-                    if (cl > requests.max_body_len) {
-                        entry.resp_body_truncated = true;
-                    }
-                } else {
-                    while (true) {
-                        const n = upstream.read(&resp_buf) catch break;
-                        if (n == 0) break;
-                        const space = requests.max_body_len -| resp_body_captured;
-                        const cap = @min(n, space);
-                        if (cap > 0) {
-                            @memcpy(entry.resp_body[resp_body_captured .. resp_body_captured + cap], resp_buf[0..cap]);
-                            resp_body_captured += cap;
-                        }
-                    }
-                    if (resp_body_captured >= requests.max_body_len) {
-                        entry.resp_body_truncated = true;
-                    }
-                }
+                const br = http_wire.streamBody(initial_body, upstream, http_wire.NullSink{}, resp_content_length, &entry.resp_body);
+                resp_body_captured = br.captured;
+                if (br.truncated) entry.resp_body_truncated = true;
             }
             entry.resp_body_len = @intCast(resp_body_captured);
 
@@ -792,22 +673,14 @@ fn handleConnection(
 
         // Normal path: stream response to client as we read it
         // Forward response status line
-        sslWriteAll(ssl, resp_buf[0 .. resp_first_line_end + 2]);
+        sslWriteAll(ssl, head.status_line);
 
-        // Forward response headers, replacing Connection header with our decision
-        // For external routes, rewrite Set-Cookie Domain to proxy domain
-        var resp_header_iter = std.mem.splitSequence(u8, resp_headers_section, "\r\n");
-        while (resp_header_iter.next()) |header| {
-            if (header.len == 0) continue;
-            if (std.ascii.startsWithIgnoreCase(header, "connection:")) continue;
-            if (is_external and std.ascii.startsWithIgnoreCase(header, "set-cookie:")) {
-                rewriteCookieDomain(ssl, header, config.domain);
-                sslWriteAll(ssl, "\r\n");
-                continue;
-            }
-            sslWriteAll(ssl, header);
-            sslWriteAll(ssl, "\r\n");
-        }
+        // Forward response headers, dropping Connection (our decision is appended
+        // below). For external routes, rewrite Set-Cookie Domain to proxy domain.
+        http_wire.forwardHeaders(resp_headers_section, SslSink{ .ssl = ssl }, .{
+            .skip = &.{"connection:"},
+            .rewrite_set_cookie = is_external,
+        }, config.domain);
         if (must_close) {
             sslWriteAll(ssl, "Connection: close\r\n");
         } else {
@@ -820,53 +693,14 @@ fn handleConnection(
         // Stream response body from upstream
         if (is_chunked) {
             // Chunked: forward raw bytes to client, decode chunks for capture
-            resp_body_captured = forwardChunkedBody(ssl, upstream, initial_body, &entry.resp_body, &resp_buf);
-            if (resp_body_captured >= requests.max_body_len) {
-                entry.resp_body_truncated = true;
-            }
+            const pr = http_wire.pumpChunked(initial_body, upstream, SslSink{ .ssl = ssl }, &entry.resp_body);
+            resp_body_captured = pr.captured;
+            if (pr.truncated) entry.resp_body_truncated = true;
         } else {
-            // Forward initial body bytes
-            if (initial_body.len > 0) {
-                sslWriteAll(ssl, initial_body);
-                const cap = @min(initial_body.len, requests.max_body_len);
-                @memcpy(entry.resp_body[0..cap], initial_body[0..cap]);
-                resp_body_captured = cap;
-            }
-
-            if (resp_content_length) |cl| {
-                var body_sent: usize = initial_body.len;
-                while (body_sent < cl) {
-                    const n = upstream.read(&resp_buf) catch break;
-                    if (n == 0) break;
-                    sslWriteAll(ssl, resp_buf[0..n]);
-                    const space = requests.max_body_len -| resp_body_captured;
-                    const cap = @min(n, space);
-                    if (cap > 0) {
-                        @memcpy(entry.resp_body[resp_body_captured .. resp_body_captured + cap], resp_buf[0..cap]);
-                        resp_body_captured += cap;
-                    }
-                    body_sent += n;
-                }
-                if (cl > requests.max_body_len) {
-                    entry.resp_body_truncated = true;
-                }
-            } else {
-                // No content-length: read until upstream closes
-                while (true) {
-                    const n = upstream.read(&resp_buf) catch break;
-                    if (n == 0) break;
-                    sslWriteAll(ssl, resp_buf[0..n]);
-                    const space = requests.max_body_len -| resp_body_captured;
-                    const cap = @min(n, space);
-                    if (cap > 0) {
-                        @memcpy(entry.resp_body[resp_body_captured .. resp_body_captured + cap], resp_buf[0..cap]);
-                        resp_body_captured += cap;
-                    }
-                }
-                if (resp_body_captured >= requests.max_body_len) {
-                    entry.resp_body_truncated = true;
-                }
-            }
+            // Stream raw bytes to client while decoding into the entry.
+            const br = http_wire.streamBody(initial_body, upstream, SslSink{ .ssl = ssl }, resp_content_length, &entry.resp_body);
+            resp_body_captured = br.captured;
+            if (br.truncated) entry.resp_body_truncated = true;
         }
         entry.resp_body_len = @intCast(resp_body_captured);
 
@@ -892,6 +726,68 @@ fn handleConnection(
     }
 }
 
+/// Everything forwardRequest needs beyond the entry itself: routing target and the
+/// client identity to stamp into X-Forwarded-* / X-Real-IP headers.
+const RequestForward = struct {
+    is_external: bool,
+    upstream_host: []const u8,
+    client_host: []const u8, // original Host header, preserved as X-Forwarded-Host
+    client_ip: []const u8,
+    domain: []const u8,
+};
+
+/// Emit a (possibly TUI-edited) request entry to `sink` (`write([]const u8) void`):
+/// request line, forwarded request headers, the external Host rewrite, the proxy's
+/// own X-* headers, a recomputed Content-Length, and the body. The caller must
+/// reject a truncated request body before calling — the emitted Content-Length
+/// assumes the captured body is complete.
+fn forwardRequest(sink: anytype, e: *const requests.Entry, ctx: RequestForward) void {
+    // Request line (entry data may have been edited)
+    sink.write(e.getMethod());
+    sink.write(" ");
+    sink.write(e.getPath());
+    sink.write(" HTTP/1.1\r\n");
+
+    // Forwarded request headers. For external routes, drop Host here — it is
+    // re-set to the upstream hostname just below.
+    const headers = e.getReqHeaders();
+    if (headers.len > 0) {
+        const skip: []const []const u8 = if (ctx.is_external)
+            &.{ "cache-control:", "content-length:", "host:" }
+        else
+            &.{ "cache-control:", "content-length:" };
+        http_wire.forwardHeaders(headers, sink, .{ .skip = skip }, ctx.domain);
+    }
+
+    // For external routes, set Host to upstream and preserve original as X-Forwarded-Host
+    if (ctx.is_external) {
+        sink.write("Host: ");
+        sink.write(ctx.upstream_host);
+        sink.write("\r\n");
+        if (ctx.client_host.len > 0) {
+            sink.write("X-Forwarded-Host: ");
+            sink.write(ctx.client_host);
+            sink.write("\r\n");
+        }
+    }
+
+    // Proxy headers
+    sink.write("X-Real-IP: ");
+    sink.write(ctx.client_ip);
+    sink.write("\r\n");
+    sink.write("X-Forwarded-Proto: https\r\n");
+    sink.write("Cache-Control: no-cache\r\n");
+    sink.write("Pragma: no-cache\r\n");
+
+    // Recomputed Content-Length for the (possibly edited) body, then the body
+    const body = e.getReqBody();
+    var cl_buf: [64]u8 = undefined;
+    const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch "";
+    sink.write(cl_hdr);
+    sink.write("\r\n");
+    if (body.len > 0) sink.write(body);
+}
+
 /// Forward a buffered response from an entry to the client.
 /// Used after response intercept (accept) to send the (possibly edited) response.
 fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_external: bool, domain: []const u8, must_close: bool) void {
@@ -900,24 +796,12 @@ fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_extern
     const status_line = std.fmt.bufPrint(&status_buf, "HTTP/1.1 {d} {s}\r\n", .{ e.status, http_wire.reasonPhrase(e.status) }) catch return;
     sslWriteAll(ssl, status_line);
 
-    // Forward response headers
-    const resp_hdrs = e.getRespHeaders();
-    if (resp_hdrs.len > 0) {
-        var header_iter = std.mem.splitSequence(u8, resp_hdrs, "\r\n");
-        while (header_iter.next()) |header| {
-            if (header.len == 0) continue;
-            if (std.ascii.startsWithIgnoreCase(header, "connection:")) continue;
-            if (std.ascii.startsWithIgnoreCase(header, "content-length:")) continue;
-            if (std.ascii.startsWithIgnoreCase(header, "transfer-encoding:")) continue;
-            if (is_external and std.ascii.startsWithIgnoreCase(header, "set-cookie:")) {
-                rewriteCookieDomain(ssl, header, domain);
-                sslWriteAll(ssl, "\r\n");
-                continue;
-            }
-            sslWriteAll(ssl, header);
-            sslWriteAll(ssl, "\r\n");
-        }
-    }
+    // Forward response headers. Connection, Content-Length, and Transfer-Encoding
+    // are dropped — Content-Length is recomputed below and Connection appended.
+    http_wire.forwardHeaders(e.getRespHeaders(), SslSink{ .ssl = ssl }, .{
+        .skip = &.{ "connection:", "content-length:", "transfer-encoding:" },
+        .rewrite_set_cookie = is_external,
+    }, domain);
 
     // Set Content-Length to match actual body (may have been edited)
     const body = e.getRespBody();
@@ -938,32 +822,25 @@ fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_extern
     }
 }
 
-/// Buffer chunked response body from upstream into entry without forwarding to client.
-/// Returns total bytes captured into the body buffer.
-fn bufferChunkedBody(upstream: UpstreamConn, initial: []const u8, body: *[requests.max_body_len]u8, read_buf: *[16384]u8) usize {
-    var captured: usize = 0;
-    var state: http_wire.ChunkState = .size;
-    var chunk_remaining: usize = 0;
-    var size_val: usize = 0;
-
-    if (initial.len > 0) {
-        for (initial) |byte| {
-            http_wire.chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured);
-            if (state == .done or state == .parse_error) return captured;
-        }
+/// Forwarding sink for `http_wire` over the client TLS connection — relays bytes
+/// to the browser (chunked body, response headers). Write failures are swallowed,
+/// matching `sslWriteAll`; the caller's next write detects the dead connection.
+const SslSink = struct {
+    ssl: *ssl_c.SSL,
+    pub fn write(self: SslSink, bytes: []const u8) void {
+        sslWriteAll(self.ssl, bytes);
     }
+};
 
-    while (state != .done and state != .parse_error) {
-        const n = upstream.read(read_buf) catch break;
-        if (n == 0) break;
-        for (read_buf.*[0..n]) |byte| {
-            http_wire.chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured);
-            if (state == .done or state == .parse_error) return captured;
-        }
+/// Forwarding sink for `http_wire.forwardHeaders` over the upstream connection.
+/// Write failures are swallowed; the request line/body writes that follow the
+/// header loop detect the dead connection and abort.
+const UpstreamSink = struct {
+    upstream: UpstreamConn,
+    pub fn write(self: UpstreamSink, bytes: []const u8) void {
+        self.upstream.writeAll(bytes) catch {};
     }
-
-    return captured;
-}
+};
 
 /// Replay a stored request through the proxy's own TLS endpoint.
 /// Connects to 127.0.0.1:443 over TLS so the request goes through the full
@@ -1067,67 +944,6 @@ fn sslSendError(ssl: *ssl_c.SSL, status: u16, message: []const u8) void {
         status, message, message.len, message,
     }) catch return;
     sslWriteAll(ssl, response);
-}
-
-/// Rewrite Domain= attribute in a Set-Cookie header to the proxy domain.
-/// Writes the full header (without trailing \r\n) to the SSL connection.
-fn rewriteCookieDomain(ssl: *ssl_c.SSL, header: []const u8, domain: []const u8) void {
-    // Find "Domain=" (case-insensitive) in the cookie attributes (after first ;)
-    // Skip the cookie value to avoid matching "domain=" inside it
-    const attr_start = if (std.mem.indexOfScalar(u8, header, ';')) |pos| pos else header.len;
-    var i: usize = attr_start;
-    while (i + 7 <= header.len) : (i += 1) {
-        if (std.ascii.startsWithIgnoreCase(header[i..], "domain=")) {
-            // Found Domain= at position i
-            // Write everything before "Domain="
-            sslWriteAll(ssl, header[0..i]);
-            // Write "Domain=.<proxy_domain>"
-            sslWriteAll(ssl, "Domain=.");
-            sslWriteAll(ssl, domain);
-            // Skip past the original domain value (until ; or end of header)
-            var j = i + 7;
-            if (j < header.len and header[j] == '.') j += 1; // skip leading dot
-            while (j < header.len and header[j] != ';') : (j += 1) {}
-            // Write the rest of the header
-            sslWriteAll(ssl, header[j..]);
-            return;
-        }
-    }
-    // No Domain= found, forward as-is
-    sslWriteAll(ssl, header);
-}
-
-fn forwardChunkedBody(
-    ssl: *ssl_c.SSL,
-    upstream: UpstreamConn,
-    initial: []const u8,
-    resp_body: *[requests.max_body_len]u8,
-    read_buf: *[16384]u8,
-) usize {
-    var captured: usize = 0;
-    var state: http_wire.ChunkState = .size;
-    var chunk_remaining: usize = 0;
-    var size_val: usize = 0;
-
-    if (initial.len > 0) {
-        sslWriteAll(ssl, initial);
-        for (initial) |byte| {
-            http_wire.chunkedStep(byte, &state, &chunk_remaining, &size_val, resp_body, &captured);
-            if (state == .done or state == .parse_error) return captured;
-        }
-    }
-
-    while (state != .done and state != .parse_error) {
-        const n = upstream.read(read_buf) catch break;
-        if (n == 0) break;
-        sslWriteAll(ssl, read_buf.*[0..n]);
-        for (read_buf.*[0..n]) |byte| {
-            http_wire.chunkedStep(byte, &state, &chunk_remaining, &size_val, resp_body, &captured);
-            if (state == .done or state == .parse_error) return captured;
-        }
-    }
-
-    return captured;
 }
 
 fn handleWebSocket(
@@ -1400,4 +1216,85 @@ test "getContentLength detects values above default_max_request_body" {
     const cl = http_wire.getContentLength("Content-Length: 20971520\r\n");
     try testing.expect(cl != null);
     try testing.expect(cl.? > default_max_request_body);
+}
+
+/// Records bytes written to it, for asserting forwardRequest output without a socket.
+const TestSink = struct {
+    buf: []u8,
+    len: *usize,
+    pub fn write(self: TestSink, bytes: []const u8) void {
+        const n = @min(bytes.len, self.buf.len - self.len.*);
+        @memcpy(self.buf[self.len.*..][0..n], bytes[0..n]);
+        self.len.* += n;
+    }
+};
+
+fn buildEntry(method: []const u8, path: []const u8, headers: []const u8, body: []const u8) requests.Entry {
+    var e = requests.Entry{};
+    @memcpy(e.method[0..method.len], method);
+    e.method_len = @intCast(method.len);
+    @memcpy(e.path[0..path.len], path);
+    e.path_len = @intCast(path.len);
+    @memcpy(e.req_headers[0..headers.len], headers);
+    e.req_headers_len = @intCast(headers.len);
+    @memcpy(e.req_body[0..body.len], body);
+    e.req_body_len = @intCast(body.len);
+    return e;
+}
+
+test "forwardRequest emits a local request, dropping cache-control and content-length" {
+    const e = buildEntry("GET", "/api/x", "Host: dev.lo\r\nCache-Control: max-age=9\r\nContent-Length: 0\r\nAccept: */*\r\n", "");
+    var out: [512]u8 = undefined;
+    var len: usize = 0;
+    forwardRequest(TestSink{ .buf = &out, .len = &len }, &e, .{
+        .is_external = false,
+        .upstream_host = "127.0.0.1",
+        .client_host = "dev.lo",
+        .client_ip = "10.0.0.1",
+        .domain = "dev.lo",
+    });
+    try testing.expectEqualStrings(
+        "GET /api/x HTTP/1.1\r\n" ++
+            "Host: dev.lo\r\nAccept: */*\r\n" ++
+            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
+            "Content-Length: 0\r\n\r\n",
+        out[0..len],
+    );
+}
+
+test "forwardRequest rewrites Host and adds X-Forwarded-Host for external routes" {
+    const e = buildEntry("POST", "/login", "Host: dev.lo\r\nContent-Length: 2\r\n", "hi");
+    var out: [512]u8 = undefined;
+    var len: usize = 0;
+    forwardRequest(TestSink{ .buf = &out, .len = &len }, &e, .{
+        .is_external = true,
+        .upstream_host = "staging.example.com",
+        .client_host = "dev.lo",
+        .client_ip = "10.0.0.1",
+        .domain = "dev.lo",
+    });
+    try testing.expectEqualStrings(
+        "POST /login HTTP/1.1\r\n" ++
+            "Host: staging.example.com\r\nX-Forwarded-Host: dev.lo\r\n" ++
+            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
+            "Content-Length: 2\r\n\r\nhi",
+        out[0..len],
+    );
+}
+
+test "forwardRequest recomputes Content-Length from the body, ignoring the original" {
+    // Original header claims length 99; emitted Content-Length must match the body.
+    const e = buildEntry("PUT", "/x", "Content-Length: 99\r\n", "abcd");
+    var out: [512]u8 = undefined;
+    var len: usize = 0;
+    forwardRequest(TestSink{ .buf = &out, .len = &len }, &e, .{
+        .is_external = false,
+        .upstream_host = "127.0.0.1",
+        .client_host = "",
+        .client_ip = "10.0.0.1",
+        .domain = "dev.lo",
+    });
+    try testing.expect(std.mem.indexOf(u8, out[0..len], "Content-Length: 4\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out[0..len], "Content-Length: 99") == null);
+    try testing.expect(std.mem.endsWith(u8, out[0..len], "\r\n\r\nabcd"));
 }
