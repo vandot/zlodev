@@ -22,7 +22,7 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 - **Copy as curl** — copy any request as a `curl` command
 - **HAR export** — export captured traffic as HTTP Archive files
 - **Request starring** — star important requests so they survive ring buffer overflow
-- **Search/filter** — filter requests by path
+- **Search/filter** — filter requests by path, method, or status code
 - **WebSocket passthrough** — transparent proxying of WebSocket upgrades
 - **Cross-platform** — macOS, Linux, and Windows
 
@@ -38,7 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh
 
 ### Build from source
 
-Building from source requires [Zig](https://ziglang.org/download/) 0.15.1. No other dependencies — BoringSSL is compiled from source automatically.
+Building from source requires [Zig](https://ziglang.org/download/) 0.15.2. No other dependencies — BoringSSL is compiled from source automatically.
 
 ```sh
 git clone https://github.com/vandot/zlodev.git
@@ -60,6 +60,7 @@ sudo setcap cap_net_bind_service=+eip zig-out/bin/zlodev
 |--------|-------------|---------|
 | `-Dversion=STRING` | Version string | `dev` |
 | `-Dmax-entries=N` | Max request entries in ring buffer | `500` |
+| `-Dstrip=BOOL` | Strip debug info from the binary | `true` unless Debug build |
 
 ## Quick start
 
@@ -126,12 +127,14 @@ zlodev start --dns          start DNS server only (log mode)
 ```
 -p=PORT, --port=PORT       target port [auto-detect or 3000]
 -b=ADDR, --bind=ADDR       listen address [default 0.0.0.0]
---route=PATTERN=PORT       route by subdomain or path (repeatable)
+--route=PATTERN=TARGET     route by subdomain or path (repeatable)
 --command=CMD              dev server command to launch and monitor
 -c=PATH, --config=PATH     config file path [default .zlodev]
 --max-body=SIZE            max request body size [default 10M]
 --no-tui                   disable TUI, log to stderr
 -l, --local                use .local domain (mDNS)
+--dns                      DNS only (install/uninstall/start)
+--cert                     certificates only (install/uninstall)
 -f, --force                force reinstall
 -v, --version              show version
 -h, --help                 show help
@@ -270,14 +273,14 @@ intercept=resp:POST /api
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Scroll up / down |
+| `j` / `k` (or `↓` / `↑`) | Move down / up |
 | `G` | Go to end |
 | `g` | Go to top |
 | `s` | Toggle autoscroll |
 | `l` | Toggle logs pane (if dev server configured) |
 | `Tab` | Switch focus between requests and logs |
 | `Enter` | Open detail view |
-| `/` | Search / filter by path |
+| `/` | Search / filter by path, method, or status |
 | `Esc` | Clear filter |
 | `*` | Star / unstar request (survives buffer overflow) |
 | `i` | Intercept (prompts for pattern / toggles off) |
@@ -290,14 +293,14 @@ intercept=resp:POST /api
 | `R` | Quick replay (no edit) or restart dev server (when focused on logs) |
 | `E` | Export traffic as HAR file |
 | `C` | Clear all requests |
-| `?` | Toggle help overlay |
+| `?` | Toggle help overlay (`Esc` also closes it) |
 | `q` | Quit |
 
 ### Logs pane (when dev server is running)
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Scroll up / down |
+| `j` / `k` (or `↓` / `↑`) | Scroll down / up |
 | `G` | Go to end |
 | `g` | Go to top |
 | `s` | Toggle autoscroll |
@@ -308,10 +311,31 @@ intercept=resp:POST /api
 
 | Key | Action |
 |-----|--------|
-| `n` / `p` | Next / previous request |
+| `j` / `k` (or `↓` / `↑`) | Scroll down / up |
+| `G` / `g` | Scroll to bottom / top |
+| `n` / `p` (or `→` / `←`) | Next / previous request |
 | `b` | Toggle body display |
 | `a` | Accept held request |
+| `d` | Drop held request / delete completed request |
+| `*` | Star / unstar request |
+| `c` | Copy request as curl command |
+| `e` | Edit request / response |
+| `r` | Edit & replay request |
+| `R` | Quick replay (no edit) |
+| `i` | Intercept (prompts for pattern / toggles off) |
+| `s` | Toggle autoscroll |
 | `q` / `Esc` | Back to list |
+
+### Edit view
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift+Tab` | Next / previous field |
+| `←` / `→`, `Home` / `End` | Move cursor |
+| `↑` / `↓` | Move between lines (multiline fields) |
+| `Enter` | New line (multiline fields) or next field |
+| `Ctrl+S` | Save — accept held entry with edits, or replay edited request |
+| `Esc` | Cancel |
 
 ## How it works
 
@@ -370,7 +394,7 @@ Resolve-DnsName dev.lo
 
 If missing, reinstall DNS:
 ```sh
-zlodev install -d
+zlodev install --dns
 ```
 
 On Windows, make sure "Use secure DNS" is disabled in your browser — Chromium browsers bypass the system DNS resolver when this is enabled.
