@@ -22,7 +22,7 @@ jobs:
           - target: x86_64-windows
             artifact: zlodev-windows-amd64
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v7
@@ -57,7 +57,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
