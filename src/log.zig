@@ -1,4 +1,5 @@
 const std = @import("std");
+const sep = std.fs.path.sep_str;
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
 
@@ -24,13 +25,13 @@ fn getHomeDir() ?[]const u8 {
 pub fn initLogFile() void {
     const home = getHomeDir() orelse return;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path = std.fmt.bufPrint(&path_buf, "{s}/.zlodev", .{home}) catch return;
+    const dir_path = std.fmt.bufPrint(&path_buf, "{s}" ++ sep ++ ".zlodev", .{home}) catch return;
     std.fs.makeDirAbsolute(dir_path) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return,
     };
     var file_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const file_path = std.fmt.bufPrint(&file_buf, "{s}/.zlodev/zlodev.log", .{home}) catch return;
+    const file_path = std.fmt.bufPrint(&file_buf, "{s}" ++ sep ++ ".zlodev" ++ sep ++ "zlodev.log", .{home}) catch return;
     log_file = std.fs.createFileAbsolute(file_path, .{ .truncate = false }) catch return;
     // Seek to end for append
     if (log_file) |f| {

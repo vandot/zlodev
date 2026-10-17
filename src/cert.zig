@@ -1,4 +1,5 @@
 const std = @import("std");
+const sep = std.fs.path.sep_str;
 const builtin = @import("builtin");
 const log = @import("log.zig");
 const sys = @import("sys.zig");
@@ -19,20 +20,20 @@ pub fn getBasePath(buf: []u8) ![]const u8 {
     switch (builtin.os.tag) {
         .macos => {
             const home = compat.getenv("HOME") orelse return error.NoHomeDir;
-            return std.fmt.bufPrint(buf, "{s}/Library/Application Support/zlodev", .{home});
+            return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "Library/Application Support/zlodev", .{home});
         },
         .windows => {
             const local_env = compat.getenv("LocalAppData") orelse return error.NoLocalAppData;
-            return std.fmt.bufPrint(buf, "{s}/zlodev", .{local_env});
+            return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "zlodev", .{local_env});
         },
         else => {
             // Linux
             const xdg = compat.getenv("XDG_DATA_HOME");
             if (xdg) |data_home| {
-                return std.fmt.bufPrint(buf, "{s}/zlodev", .{data_home});
+                return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "zlodev", .{data_home});
             }
             const home = compat.getenv("HOME") orelse return error.NoHomeDir;
-            return std.fmt.bufPrint(buf, "{s}/.local/share/zlodev", .{home});
+            return std.fmt.bufPrint(buf, "{s}" ++ sep ++ ".local/share/zlodev", .{home});
         },
     }
 }
@@ -40,14 +41,14 @@ pub fn getBasePath(buf: []u8) ![]const u8 {
 pub fn getCertPath(buf: []u8, domain: []const u8) ![]const u8 {
     var base_buf: [std.fs.max_path_bytes]u8 = undefined;
     const base = try getBasePath(&base_buf);
-    return std.fmt.bufPrint(buf, "{s}/{s}", .{ base, domain });
+    return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "{s}", .{ base, domain });
 }
 
 pub fn getCert(cert_buf: []u8, key_buf: []u8, domain: []const u8) !struct { cert: []const u8, key: []const u8 } {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = try getCertPath(&path_buf, domain);
-    const cert_path = try std.fmt.bufPrint(cert_buf, "{s}/zlodev.crt", .{dir});
-    const key = try std.fmt.bufPrint(key_buf, "{s}/zlodev.key", .{dir});
+    const cert_path = try std.fmt.bufPrint(cert_buf, "{s}" ++ sep ++ "zlodev.crt", .{dir});
+    const key = try std.fmt.bufPrint(key_buf, "{s}" ++ sep ++ "zlodev.key", .{dir});
 
     // Check if files exist
     std.fs.accessAbsolute(cert_path, .{}) catch return error.CertNotFound;
@@ -60,7 +61,7 @@ pub fn caExists(domain: []const u8) bool {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = getCertPath(&path_buf, domain) catch return false;
     var ca_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const ca_path = std.fmt.bufPrint(&ca_buf, "{s}/zlodevCA.pem", .{dir}) catch return false;
+    const ca_path = std.fmt.bufPrint(&ca_buf, "{s}" ++ sep ++ "zlodevCA.pem", .{dir}) catch return false;
     std.fs.accessAbsolute(ca_path, .{}) catch return false;
     return true;
 }
@@ -68,13 +69,13 @@ pub fn caExists(domain: []const u8) bool {
 pub fn getCaPath(buf: []u8, domain: []const u8) ![]const u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = try getCertPath(&path_buf, domain);
-    return std.fmt.bufPrint(buf, "{s}/zlodevCA.pem", .{dir});
+    return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "zlodevCA.pem", .{dir});
 }
 
 pub fn getCaDerPath(buf: []u8, domain: []const u8) ![]const u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = try getCertPath(&path_buf, domain);
-    return std.fmt.bufPrint(buf, "{s}/zlodevCA.der", .{dir});
+    return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "zlodevCA.der", .{dir});
 }
 
 // --- OpenSSL C API helpers ---
@@ -191,11 +192,11 @@ fn generateCA(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []cons
     if (c.X509_sign(ca_cert, ca_key, c.EVP_sha256()) == 0) return error.SignFailed;
 
     // Write files directly to cert_dir
-    const ca_pem_path = try allocPrintZ(allocator, "{s}/zlodevCA.pem", .{cert_dir});
+    const ca_pem_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
     defer allocator.free(ca_pem_path);
-    const ca_key_path = try allocPrintZ(allocator, "{s}/zlodevCA.key", .{cert_dir});
+    const ca_key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.key", .{cert_dir});
     defer allocator.free(ca_key_path);
-    const ca_der_path = try allocPrintZ(allocator, "{s}/zlodevCA.der", .{cert_dir});
+    const ca_der_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.der", .{cert_dir});
     defer allocator.free(ca_der_path);
 
     try writePemCert(ca_pem_path, ca_cert);
@@ -265,9 +266,9 @@ fn generateDomainCert(allocator: std.mem.Allocator, domain: []const u8, ca_cert:
     if (c.X509_sign(domain_cert, ca_key, c.EVP_sha256()) == 0) return error.SignFailed;
 
     // Write files
-    const cert_path = try allocPrintZ(allocator, "{s}/zlodev.crt", .{cert_dir});
+    const cert_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.crt", .{cert_dir});
     defer allocator.free(cert_path);
-    const key_path = try allocPrintZ(allocator, "{s}/zlodev.key", .{cert_dir});
+    const key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.key", .{cert_dir});
     defer allocator.free(key_path);
 
     try writePemCert(cert_path, domain_cert);
@@ -293,7 +294,7 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
     try generateDomainCert(allocator, domain, ca.cert_x509, ca.key, cert_dir);
 
     // Install CA to system trust store
-    const ca_path = try std.fmt.allocPrint(allocator, "{s}/zlodevCA.pem", .{cert_dir});
+    const ca_path = try std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
     defer allocator.free(ca_path);
 
     switch (builtin.os.tag) {
@@ -327,8 +328,8 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
     }
 
     std.debug.print("CA added as trusted root and certificate generated\n", .{});
-    std.debug.print("certificate is located at {s}/zlodev.crt\n", .{cert_dir});
-    std.debug.print("key is located at {s}/zlodev.key\n", .{cert_dir});
+    std.debug.print("certificate is located at {s}" ++ sep ++ "zlodev.crt\n", .{cert_dir});
+    std.debug.print("key is located at {s}" ++ sep ++ "zlodev.key\n", .{cert_dir});
 }
 
 pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
@@ -383,7 +384,7 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
 
 fn removeFromKeychain(allocator: std.mem.Allocator, cert_dir: []const u8) void {
     var ca_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const ca_path = std.fmt.bufPrint(&ca_path_buf, "{s}/zlodevCA.pem", .{cert_dir}) catch {
+    const ca_path = std.fmt.bufPrint(&ca_path_buf, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir}) catch {
         std.debug.print("CA file path could not be determined, skipping keychain removal\n", .{});
         return;
     };
