@@ -50,6 +50,9 @@ jobs:
       - name: Test clipboard
         run: zig test src/clipboard.zig
 
+      - name: Test subprocess
+        run: zig test src/subprocess.zig
+
       - name: Test install/uninstall
         run: zig test tests/install.zig
 
@@ -111,6 +114,9 @@ jobs:
       - name: Test clipboard
         run: zig test src/clipboard.zig
 
+      - name: Test subprocess
+        run: zig test src/subprocess.zig
+
       - name: Test install/uninstall
         run: zig test tests/install.zig
 
@@ -158,6 +164,9 @@ jobs:
 
       - name: Test clipboard
         run: zig test src/clipboard.zig
+
+      - name: Test subprocess
+        run: zig test src/subprocess.zig
 
       - name: Test install/uninstall
         run: zig test tests/install.zig

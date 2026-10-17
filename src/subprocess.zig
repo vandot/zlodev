@@ -3,6 +3,64 @@ const log = @import("log.zig");
 const shutdown = @import("shutdown.zig");
 const builtin = @import("builtin");
 
+/// Win32 job object bindings (not in Zig's std).
+const win32 = struct {
+    const windows = std.os.windows;
+    const HANDLE = windows.HANDLE;
+    const BOOL = windows.BOOL;
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    const JobObjectExtendedLimitInformation: c_int = 9;
+
+    const BASIC_LIMIT_INFORMATION = extern struct {
+        PerProcessUserTimeLimit: i64 = 0,
+        PerJobUserTimeLimit: i64 = 0,
+        LimitFlags: u32 = 0,
+        MinimumWorkingSetSize: usize = 0,
+        MaximumWorkingSetSize: usize = 0,
+        ActiveProcessLimit: u32 = 0,
+        Affinity: usize = 0,
+        PriorityClass: u32 = 0,
+        SchedulingClass: u32 = 0,
+    };
+    const IO_COUNTERS = extern struct {
+        ReadOperationCount: u64 = 0,
+        WriteOperationCount: u64 = 0,
+        OtherOperationCount: u64 = 0,
+        ReadTransferCount: u64 = 0,
+        WriteTransferCount: u64 = 0,
+        OtherTransferCount: u64 = 0,
+    };
+    const EXTENDED_LIMIT_INFORMATION = extern struct {
+        BasicLimitInformation: BASIC_LIMIT_INFORMATION = .{},
+        IoInfo: IO_COUNTERS = .{},
+        ProcessMemoryLimit: usize = 0,
+        JobMemoryLimit: usize = 0,
+        PeakProcessMemoryUsed: usize = 0,
+        PeakJobMemoryUsed: usize = 0,
+    };
+
+    extern "kernel32" fn CreateJobObjectW(attrs: ?*anyopaque, name: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetInformationJobObject(job: HANDLE, class: c_int, info: *const anyopaque, len: u32) callconv(.winapi) BOOL;
+    extern "kernel32" fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn TerminateJobObject(job: HANDLE, exit_code: u32) callconv(.winapi) BOOL;
+
+    /// Put `process` into a new job that kills all its processes when closed
+    /// (including when zlodev exits). Returns null if any step fails.
+    fn assignToKillJob(process: HANDLE) ?HANDLE {
+        const job = CreateJobObjectW(null, null) orelse return null;
+        var info = EXTENDED_LIMIT_INFORMATION{};
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, @sizeOf(EXTENDED_LIMIT_INFORMATION)) == 0 or
+            AssignProcessToJobObject(job, process) == 0)
+        {
+            windows.CloseHandle(job);
+            return null;
+        }
+        return job;
+    }
+};
+
 const AnsiStripper = struct {
     state: enum { normal, esc, csi, osc, osc_esc } = .normal,
 
@@ -305,6 +363,9 @@ var process_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false)
 var has_allocator: bool = false;
 var stored_allocator: std.mem.Allocator = undefined;
 var readerDoneCount: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+// Windows job object holding the child tree; killing it takes grandchildren
+// (e.g. node under cmd.exe) down too. Unused on other platforms.
+var job_handle: ?std.os.windows.HANDLE = null;
 
 pub fn start(allocator: std.mem.Allocator, command: []const u8) !void {
     stored_allocator = allocator;
@@ -349,15 +410,21 @@ pub fn isRunning() bool {
 fn spawnChild() !void {
     const cmd = command_buf[0..command_len];
 
+    const argv: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "cmd.exe", "/c", cmd }
+    else
+        &.{ "/bin/sh", "-c", cmd };
     var child = std.process.Child.init(
-        &.{ "/bin/sh", "-c", cmd },
+        argv,
         if (has_allocator) stored_allocator else std.heap.page_allocator,
     );
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
     try child.spawn();
-    if (builtin.os.tag != .windows) {
+    if (builtin.os.tag == .windows) {
+        job_handle = win32.assignToKillJob(child.id);
+    } else {
         // Make child its own process group leader so we can signal
         // the entire group (including grandchildren like npm workers)
         std.posix.setpgid(@intCast(child.id), @intCast(child.id)) catch {};
@@ -446,8 +513,13 @@ fn stopChild() void {
         // Send SIGTERM (on Unix) / terminate (on Windows)
         const pid = child.id;
         if (builtin.os.tag == .windows) {
-            const w = std.os.windows;
-            _ = w.kernel32.TerminateProcess(child.id, 1);
+            // No graceful signal on Windows: terminate the whole job (cmd.exe
+            // and everything it spawned), falling back to the direct child.
+            if (job_handle) |job| {
+                _ = win32.TerminateJobObject(job, 1);
+            } else {
+                _ = std.os.windows.kernel32.TerminateProcess(child.id, 1);
+            }
         } else {
             std.posix.kill(-@as(i32, @intCast(pid)), std.posix.SIG.TERM) catch {};
         }
@@ -472,6 +544,10 @@ fn stopChild() void {
         stdout_thread = null;
         stderr_thread = null;
         child_process = null;
+        if (builtin.os.tag == .windows) {
+            if (job_handle) |job| std.os.windows.CloseHandle(job);
+            job_handle = null;
+        }
         readerDoneCount.store(0, .release);
     }
 }
@@ -561,4 +637,28 @@ test "ring - synthetic flag" {
     try std.testing.expect(dest[0].synthetic);
 
     clearAll();
+}
+
+test "start runs command through platform shell and logs output + exit" {
+    try start(std.testing.allocator, "echo hello");
+    defer stop();
+
+    // Wait up to 5s for the command to finish and the exit line to land
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (isRunning() and std.time.milliTimestamp() < deadline) {
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(!isRunning());
+
+    var dest: [max_log_lines]LogLine = undefined;
+    const n = copyRange(&dest, 0, dest.len);
+    var saw_hello = false;
+    var saw_exit = false;
+    for (dest[0..n]) |line| {
+        const text = line.bytes[0..line.len];
+        if (std.mem.eql(u8, std.mem.trimRight(u8, text, " "), "hello")) saw_hello = true;
+        if (std.mem.eql(u8, text, "[zlodev] exited (code 0)")) saw_exit = true;
+    }
+    try std.testing.expect(saw_hello);
+    try std.testing.expect(saw_exit);
 }
