@@ -154,7 +154,21 @@ fn createClientSslCtx() ?*ssl_c.SSL_CTX {
     return ctx;
 }
 
-pub fn start(config: *const ProxyConfig) !void {
+/// Bind the HTTPS listener on port 443. Separate from `start` so startup can
+/// fail before the TUI opens when the port is taken.
+pub fn listen(listen_addr: []const u8) !std.net.Server {
+    const address = try std.net.Address.parseIp(listen_addr, 443);
+    return address.listen(.{ .reuse_address = true }) catch |e| {
+        log.err("component=proxy op=bind port=443 error={any}", .{e});
+        return e;
+    };
+}
+
+/// Run the proxy on a listener from `listen`. Takes ownership of `listener`.
+pub fn start(config: *const ProxyConfig, listener: std.net.Server) !void {
+    var server = listener;
+    defer server.deinit();
+
     _ = ssl_c.OPENSSL_init_ssl(0, null);
 
     const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_server_method()) orelse {
@@ -208,16 +222,6 @@ pub fn start(config: *const ProxyConfig) !void {
     }
     const client_ctx: ?*ssl_c.SSL_CTX = if (has_external) createClientSslCtx() else null;
     defer if (client_ctx) |c| ssl_c.SSL_CTX_free(c);
-
-    const address = try std.net.Address.parseIp(config.listen_addr, 443);
-    var server = address.listen(.{ .reuse_address = true }) catch |e| {
-        log.err("component=proxy op=bind port=443 error={any}", .{e});
-        if (e == error.AddressInUse) {
-            std.debug.print("port 443 is already in use\n", .{});
-        }
-        return e;
-    };
-    defer server.deinit();
 
     log.info("component=proxy op=listening ip={s} port=443 target={s}:{d}", .{ config.listen_addr, config.target_host, config.target_port });
 

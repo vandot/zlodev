@@ -349,13 +349,35 @@ fn doStartDns(tld: []const u8) !void {
             };
         },
         .windows => {
-            std.debug.print("note: ensure DNS is installed ('zlodev install -d') and run in an elevated terminal\n", .{});
+            std.debug.print("note: ensure DNS is installed ('zlodev install --dns') and run in an elevated terminal\n", .{});
         },
         else => {},
     }
     const probe = dns.systemProbe();
+    const dns_sock = dns.bind(probe.ip, probe.port) catch |e| exitBindError("DNS", probe.ip, probe.port, e);
     log.info("component=dns op=listening ip={s} port={d} tld={s}", .{ probe.ip, probe.port, tld });
-    dns.serve(probe.ip, probe.port, tld);
+    dns.serve(dns_sock, probe.ip, probe.port, tld);
+}
+
+/// Print why a listener could not be bound and exit. Called before the TUI
+/// opens, so the message stays visible instead of being hidden by the alt screen.
+fn exitBindError(service: []const u8, ip: []const u8, port: u16, e: anyerror) noreturn {
+    switch (e) {
+        error.AddressInUse => std.debug.print(
+            "cannot start: {s} port {s}:{d} is already in use by another process\n",
+            .{ service, ip, port },
+        ),
+        error.AccessDenied, error.PermissionDenied => {
+            const hint: []const u8 = switch (builtin.os.tag) {
+                .windows => "run in an elevated terminal",
+                .linux => "run: sudo setcap cap_net_bind_service=+eip $(which zlodev)",
+                else => "check that no firewall or security policy blocks it",
+            };
+            std.debug.print("cannot start: permission denied binding {s} port {s}:{d} ({s})\n", .{ service, ip, port, hint });
+        },
+        else => std.debug.print("cannot start: failed to bind {s} port {s}:{d}: {any}\n", .{ service, ip, port, e }),
+    }
+    std.process.exit(1);
 }
 
 fn doStart(
@@ -420,6 +442,15 @@ fn doStart(
     const bind_owned = try allocator.dupe(u8, bind_addr);
     defer allocator.free(bind_owned);
 
+    // Bind every listener before the TUI takes over the terminal, so a port
+    // conflict is reported on the normal screen and zlodev exits instead of
+    // running half-started.
+    const probe = dns.systemProbe();
+    const dns_sock: ?compat.socket_t = if (local) null else dns.bind(probe.ip, probe.port) catch |e|
+        exitBindError("DNS", probe.ip, probe.port, e);
+    const http_listener = http_server.listen(bind_owned) catch |e| exitBindError("HTTP", bind_owned, 80, e);
+    const https_listener = proxy.listen(bind_owned) catch |e| exitBindError("HTTPS", bind_owned, 443, e);
+
     // Install signal handlers before spawning anything
     shutdown.installSignalHandlers();
 
@@ -433,21 +464,20 @@ fn doStart(
 
     // Start DNS server (not needed in .local mode — mDNS handles resolution)
     var dns_thread: ?std.Thread = null;
-    if (!local) {
-        const probe = dns.systemProbe();
+    if (dns_sock) |sock| {
         dns_thread = try std.Thread.spawn(.{}, struct {
-            fn run(ip: []const u8, port: u16, t: []const u8) void {
-                dns.serve(ip, port, t);
+            fn run(s: compat.socket_t, ip: []const u8, port: u16, t: []const u8) void {
+                dns.serve(s, ip, port, t);
             }
-        }.run, .{ probe.ip, probe.port, tld_owned });
+        }.run, .{ sock, probe.ip, probe.port, tld_owned });
     }
 
     // Start HTTP server
     const http_thread = try std.Thread.spawn(.{}, struct {
-        fn run(addr: []const u8, d: []const u8, ca_pem: []const u8, ca_der: []const u8) void {
-            http_server.serve(addr, d, ca_pem, ca_der);
+        fn run(l: std.net.Server, addr: []const u8, d: []const u8, ca_pem: []const u8, ca_der: []const u8) void {
+            http_server.serve(l, addr, d, ca_pem, ca_der);
         }
-    }.run, .{ bind_owned, domain_owned, ca_pem_owned, ca_der_owned });
+    }.run, .{ http_listener, bind_owned, domain_owned, ca_pem_owned, ca_der_owned });
 
     // Start HTTPS proxy on its own thread
     const config = proxy.ProxyConfig{
@@ -463,12 +493,12 @@ fn doStart(
         .domain = domain_owned,
     };
     const proxy_thread = try std.Thread.spawn(.{}, struct {
-        fn run(cfg: *const proxy.ProxyConfig) void {
-            proxy.start(cfg) catch |e| {
+        fn run(cfg: *const proxy.ProxyConfig, l: std.net.Server) void {
+            proxy.start(cfg, l) catch |e| {
                 log.err("component=proxy op=start error={any}", .{e});
             };
         }
-    }.run, .{&config});
+    }.run, .{ &config, https_listener });
 
     // Start subprocess if command is configured
     if (command) |cmd| {

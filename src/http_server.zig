@@ -4,18 +4,22 @@ const log = @import("log.zig");
 const shutdown = @import("shutdown.zig");
 const compat = @import("compat.zig");
 
-pub fn serve(bind_addr: []const u8, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {
+/// Bind the HTTP listener on port 80. Separate from `serve` so startup can
+/// fail before the TUI opens when the port is taken.
+pub fn listen(bind_addr: []const u8) !std.net.Server {
     const address = std.net.Address.parseIp(bind_addr, 80) catch |e| {
         log.err("component=http op=addr_parse error={any}", .{e});
-        return;
+        return e;
     };
-    var server = address.listen(.{ .reuse_address = true }) catch |e| {
+    return address.listen(.{ .reuse_address = true }) catch |e| {
         log.err("component=http op=bind port=80 error={any}", .{e});
-        if (e == error.AddressInUse) {
-            std.debug.print("port 80 is already in use\n", .{});
-        }
-        return;
+        return e;
     };
+}
+
+/// Serve on a listener from `listen` until shutdown. Takes ownership of `listener`.
+pub fn serve(listener: std.net.Server, bind_addr: []const u8, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {
+    var server = listener;
     defer server.deinit();
 
     var pool: std.Thread.Pool = undefined;

@@ -250,24 +250,29 @@ fn buildResponse(
     return pos;
 }
 
-pub fn serve(ip: []const u8, port: u16, tld: []const u8) void {
+/// Create and bind the DNS UDP socket. Separate from `serve` so startup can
+/// fail before the TUI opens when the port is taken.
+pub fn bind(ip: []const u8, port: u16) !compat.socket_t {
     const sock = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch |e| {
         log.err("component=dns op=socket error={any}", .{e});
-        return;
+        return e;
     };
-    defer compat.closeSocket(sock);
+    errdefer compat.closeSocket(sock);
 
     const addr = parseAddr(ip, port) catch |e| {
         log.err("component=dns op=addr_parse error={any}", .{e});
-        return;
+        return e;
     };
     posix.bind(sock, &addr.any, addr.getOsSockLen()) catch |e| {
         log.err("component=dns op=bind ip={s} port={d} error={any}", .{ ip, port, e });
-        if (e == error.AddressInUse) {
-            std.debug.print("dns port {d} is already in use\n", .{port});
-        }
-        return;
+        return e;
     };
+    return sock;
+}
+
+/// Answer queries on a socket from `bind` until shutdown. Takes ownership of `sock`.
+pub fn serve(sock: compat.socket_t, ip: []const u8, port: u16, tld: []const u8) void {
+    defer compat.closeSocket(sock);
 
     log.info("component=dns op=listening ip={s} port={d}", .{ ip, port });
 
