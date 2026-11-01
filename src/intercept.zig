@@ -1,4 +1,5 @@
 const std = @import("std");
+const rt = @import("rt.zig");
 
 pub const max_pending = 256;
 
@@ -11,7 +12,7 @@ pub const Decision = enum(u8) {
 pub const PendingEntry = struct {
     active: bool = false,
     backing_index: usize = 0,
-    event: std.Thread.ResetEvent = .{},
+    event: std.Io.Event = .unset,
     decision: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 };
 
@@ -25,13 +26,13 @@ pub const Phase = enum(u8) {
 
 var enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var slots: [max_pending]PendingEntry = @splat(PendingEntry{});
-var mutex: std.Thread.Mutex = .{};
+var mutex: std.Io.Mutex = .init;
 
 // Intercept pattern — substring match against "METHOD PATH"
 var pattern_buf: [max_pattern_len]u8 = @splat(0);
 var pattern_len: usize = 0;
 var phase: Phase = .both;
-var pattern_mutex: std.Thread.Mutex = .{};
+var pattern_mutex: std.Io.Mutex = .init;
 
 pub fn isEnabled() bool {
     return enabled.load(.acquire);
@@ -58,8 +59,8 @@ pub fn enableWithPattern(pat: []const u8) void {
 }
 
 pub fn setPattern(pat: []const u8) void {
-    pattern_mutex.lock();
-    defer pattern_mutex.unlock();
+    pattern_mutex.lockUncancelable(rt.io());
+    defer pattern_mutex.unlock(rt.io());
     // Parse phase prefix
     var actual_pat = pat;
     var p: Phase = .both;
@@ -77,23 +78,23 @@ pub fn setPattern(pat: []const u8) void {
 }
 
 pub fn getPattern(buf: *[max_pattern_len]u8) []const u8 {
-    pattern_mutex.lock();
-    defer pattern_mutex.unlock();
+    pattern_mutex.lockUncancelable(rt.io());
+    defer pattern_mutex.unlock(rt.io());
     @memcpy(buf[0..pattern_len], pattern_buf[0..pattern_len]);
     return buf[0..pattern_len];
 }
 
 pub fn getPhase() Phase {
-    pattern_mutex.lock();
-    defer pattern_mutex.unlock();
+    pattern_mutex.lockUncancelable(rt.io());
+    defer pattern_mutex.unlock(rt.io());
     return phase;
 }
 
 /// Check if a request should be intercepted (phase must be .request or .both).
 pub fn shouldInterceptRequest(method: []const u8, path: []const u8) bool {
     if (!enabled.load(.acquire)) return false;
-    pattern_mutex.lock();
-    defer pattern_mutex.unlock();
+    pattern_mutex.lockUncancelable(rt.io());
+    defer pattern_mutex.unlock(rt.io());
     if (phase == .response) return false;
     return matchesPattern(method, path);
 }
@@ -101,8 +102,8 @@ pub fn shouldInterceptRequest(method: []const u8, path: []const u8) bool {
 /// Check if a response should be intercepted (phase must be .response or .both).
 pub fn shouldInterceptResponse(method: []const u8, path: []const u8) bool {
     if (!enabled.load(.acquire)) return false;
-    pattern_mutex.lock();
-    defer pattern_mutex.unlock();
+    pattern_mutex.lockUncancelable(rt.io());
+    defer pattern_mutex.unlock(rt.io());
     if (phase == .request) return false;
     return matchesPattern(method, path);
 }
@@ -132,13 +133,13 @@ fn matchesPattern(method: []const u8, path: []const u8) bool {
 /// Acquire a free intercept slot and register it to a ring backing index.
 /// Returns null if all slots are occupied.
 pub fn acquire(backing_idx: usize) ?*PendingEntry {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     for (&slots) |*slot| {
         if (!slot.active) {
             slot.active = true;
             slot.decision = std.atomic.Value(u8).init(0);
-            slot.event = .{};
+            slot.event = .unset;
             slot.backing_index = backing_idx;
             return slot;
         }
@@ -148,8 +149,8 @@ pub fn acquire(backing_idx: usize) ?*PendingEntry {
 
 /// Release a slot back to the pool. Must be called after the proxy thread wakes up.
 pub fn release(slot: *PendingEntry) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     slot.active = false;
     slot.backing_index = 0;
 }
@@ -157,7 +158,7 @@ pub fn release(slot: *PendingEntry) void {
 /// Block until a decision is stored on the slot, then reset the event and
 /// release the slot. The single proxy-side entry point for waiting on a hold.
 pub fn awaitAndRelease(slot: *PendingEntry) Decision {
-    slot.event.wait();
+    slot.event.waitUncancelable(rt.io());
     const d = getDecision(slot);
     slot.event.reset();
     release(slot);
@@ -174,7 +175,7 @@ pub fn resolve(backing_idx: usize, d: Decision) void {
 /// Store a decision and wake the blocked proxy thread.
 fn setDecision(slot: *PendingEntry, d: Decision) void {
     slot.decision.store(@intFromEnum(d), .release);
-    slot.event.set();
+    slot.event.set(rt.io());
 }
 
 fn getDecision(slot: *PendingEntry) Decision {
@@ -184,12 +185,12 @@ fn getDecision(slot: *PendingEntry) Decision {
 
 /// Accept all pending intercepted entries (requests and responses).
 pub fn acceptAll() void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     for (&slots) |*slot| {
         if (slot.active) {
             slot.decision.store(@intFromEnum(Decision.accept), .release);
-            slot.event.set();
+            slot.event.set(rt.io());
         }
     }
 }
@@ -197,20 +198,20 @@ pub fn acceptAll() void {
 /// Drop all pending intercepts — sets decision to drop and signals all active slots.
 /// Used by clearAll() to wake blocked proxy threads before clearing entries.
 pub fn dropAll() void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     for (&slots) |*s| {
         if (s.active) {
             s.decision.store(@intFromEnum(Decision.drop), .release);
-            s.event.set();
+            s.event.set(rt.io());
         }
     }
 }
 
 /// Count active (held) slots.
 pub fn getPendingCount() usize {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     var n: usize = 0;
     for (&slots) |*slot| {
         if (slot.active) n += 1;
@@ -220,8 +221,8 @@ pub fn getPendingCount() usize {
 
 /// Find the intercept slot for a given backing index. Returns null if not found.
 fn findByBackingIndex(backing_idx: usize) ?*PendingEntry {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     for (&slots) |*slot| {
         if (slot.active and slot.backing_index == backing_idx) {
             return slot;
@@ -232,8 +233,8 @@ fn findByBackingIndex(backing_idx: usize) ?*PendingEntry {
 
 /// Release all active slots (for testing).
 fn releaseAll() void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     for (&slots) |*slot| {
         slot.active = false;
         slot.backing_index = 0;
@@ -443,7 +444,7 @@ test "dropAll signals all active slots" {
     dropAll();
     try std.testing.expectEqual(@as(u8, @intFromEnum(Decision.drop)), s.decision.load(.acquire));
 
-    s.event.wait();
+    s.event.waitUncancelable(rt.io());
     s.event.reset();
     release(s);
     try std.testing.expectEqual(@as(usize, 0), getPendingCount());

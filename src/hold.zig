@@ -1,4 +1,5 @@
 const std = @import("std");
+const rt = @import("rt.zig");
 const requests = @import("requests.zig");
 const intercept = @import("intercept.zig");
 
@@ -52,7 +53,7 @@ pub fn begin(entry: *const requests.Entry, is_response: bool, started: i64) ?Hol
 }
 
 fn elapsedSince(t: i64) u64 {
-    const e = std.time.milliTimestamp() - t;
+    const e = rt.milliTimestamp() - t;
     return if (e > 0) @intCast(e) else 0;
 }
 
@@ -63,7 +64,7 @@ const testing = std.testing;
 test "begin pins and registers; resolve round-trips through awaitDecision" {
     requests.clearAll();
     const e = requests.Entry{ .timestamp = 1 };
-    const h = begin(&e, false, std.time.milliTimestamp()).?;
+    const h = begin(&e, false, rt.milliTimestamp()).?;
 
     // Resolve before awaiting: the event is already set, so awaitDecision returns at once.
     intercept.resolve(h.index(), .accept);
@@ -74,7 +75,7 @@ test "begin pins and registers; resolve round-trips through awaitDecision" {
 test "drop decision finalizes the ring entry" {
     requests.clearAll();
     const e = requests.Entry{ .timestamp = 1 };
-    const h = begin(&e, true, std.time.milliTimestamp() - 5).?;
+    const h = begin(&e, true, rt.milliTimestamp() - 5).?;
 
     intercept.resolve(h.index(), .drop);
     try testing.expectEqual(intercept.Decision.drop, h.awaitDecision());
