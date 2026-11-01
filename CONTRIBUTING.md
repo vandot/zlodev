@@ -4,18 +4,22 @@ Thanks for your interest in contributing!
 
 ## Getting started
 
-1. Install [Zig 0.15.2](https://ziglang.org/download/)
+1. Install [Zig 0.17.0](https://ziglang.org/download/)
 2. Clone the repo and build:
    ```sh
    git clone https://github.com/vandot/zlodev.git
    cd zlodev
    zig build
    ```
-3. Run tests per-file (there is no `zig build test` step):
+3. Run tests per-file. `proxy.zig` and `cert.zig` import BoringSSL headers, so they run through `zig build test-c`:
    ```sh
+   zig build test-c
    zig test src/dns.zig
    zig test src/har.zig
-   zig test src/proxy.zig
+   zig test src/rt.zig
+   zig test src/compat.zig
+   zig test src/http_server.zig
+   zig test src/shutdown.zig
    zig test src/requests.zig
    zig test src/intercept.zig
    zig test src/http_wire.zig

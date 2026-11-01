@@ -1,10 +1,11 @@
 .{
     .name = .zlodev,
     .version = "0.4.1",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#41fff922316dcb8776332ec460e73eaf397d5033",
-            .hash = "vaxis-0.5.1-BWNV_JJOCQAtdJyLvrYCKbKIhX9q3liQkKMAzujWS4HJ",
+            .url = "git+https://github.com/rockorager/libvaxis.git#d4c3b3666e0c090e2b5092ca09893c6db15e0b79",
+            .hash = "vaxis-0.6.0-BWNV_O8ODQBFLRjA4D0q75pHPh63iPu_v0yhpCwsAMaM",
         },
         .boringssl = .{
             .url = "git+https://github.com/google/boringssl.git#d95b03c315bac8c44d3ce062053d3a5817915d91",

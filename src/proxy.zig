@@ -8,16 +8,10 @@ const hold = @import("hold.zig");
 const http_wire = @import("http_wire.zig");
 const shutdown = @import("shutdown.zig");
 const compat = @import("compat.zig");
+const rt = @import("rt.zig");
+const win32 = @import("win32.zig");
 
-const ssl_c = @cImport({
-    @cInclude("openssl/ssl.h");
-    @cInclude("openssl/err.h");
-    if (builtin.os.tag == .windows) {
-        @cInclude("winsock2.h");
-    } else {
-        @cInclude("sys/socket.h");
-    }
-});
+const ssl_c = @import("ssl_c");
 
 pub const default_max_request_body: usize = 10 * 1024 * 1024; // 10MB
 
@@ -156,18 +150,17 @@ fn createClientSslCtx() ?*ssl_c.SSL_CTX {
 
 /// Bind the HTTPS listener on port 443. Separate from `start` so startup can
 /// fail before the TUI opens when the port is taken.
-pub fn listen(listen_addr: []const u8) !std.net.Server {
-    const address = try std.net.Address.parseIp(listen_addr, 443);
-    return address.listen(.{ .reuse_address = true }) catch |e| {
+pub fn listen(listen_addr: []const u8) !compat.socket_t {
+    const address = try std.Io.net.IpAddress.parse(listen_addr, 443);
+    return compat.tcpListen(address) catch |e| {
         log.err("component=proxy op=bind port=443 error={any}", .{e});
         return e;
     };
 }
 
 /// Run the proxy on a listener from `listen`. Takes ownership of `listener`.
-pub fn start(config: *const ProxyConfig, listener: std.net.Server) !void {
-    var server = listener;
-    defer server.deinit();
+pub fn start(config: *const ProxyConfig, listener: compat.socket_t) !void {
+    defer compat.closeSocket(listener);
 
     _ = ssl_c.OPENSSL_init_ssl(0, null);
 
@@ -225,62 +218,74 @@ pub fn start(config: *const ProxyConfig, listener: std.net.Server) !void {
 
     log.info("component=proxy op=listening ip={s} port=443 target={s}:{d}", .{ config.listen_addr, config.target_host, config.target_port });
 
-    var pool: std.Thread.Pool = undefined;
-    pool.init(.{ .allocator = std.heap.page_allocator, .n_jobs = 64, .stack_size = if (builtin.cpu.arch == .x86_64) 4 * 1024 * 1024 else 1024 * 1024 }) catch |e| {
-        log.err("component=proxy op=pool_init error={any}", .{e});
-        return e;
-    };
-    defer pool.deinit();
+    var group: std.Io.Group = .init;
+    defer group.cancel(rt.io());
 
     var consecutive_failures: u32 = 0;
     while (shutdown.isRunning()) {
         // Poll with 1-second timeout before accept
-        var fds = [1]posix.pollfd{
-            .{ .fd = server.stream.handle, .events = posix.POLL.IN, .revents = 0 },
+        var fds = [1]compat.pollfd{
+            .{ .fd = listener, .events = compat.POLL.IN, .revents = 0 },
         };
-        const ready = posix.poll(&fds, 1000) catch |e| {
+        const ready = compat.poll(&fds, 1000) catch |e| {
             log.err("component=proxy op=poll error={any}", .{e});
             continue;
         };
         if (ready == 0) continue; // timeout, re-check shutdown
 
-        const conn = server.accept() catch |e| {
+        const conn = compat.accept(listener) catch |e| {
             log.err("component=proxy op=accept error={any}", .{e});
             consecutive_failures += 1;
             const backoff_ms: u64 = @min(5000, @as(u64, 100) << @intCast(@min(consecutive_failures, 6)));
-            std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+            rt.sleepMs(backoff_ms);
             continue;
         };
         consecutive_failures = 0;
 
         const ssl = ssl_c.SSL_new(ctx) orelse {
             log.err("component=proxy op=ssl_new error=alloc_failed", .{});
-            conn.stream.close();
+            compat.closeSocket(conn.sock);
             continue;
         };
 
-        _ = ssl_c.SSL_set_fd(ssl, compat.socketToFd(conn.stream.handle));
+        _ = ssl_c.SSL_set_fd(ssl, compat.socketToFd(conn.sock));
 
         const conn_id = nextConnId();
-        pool.spawn(handleConnection, .{
+        // All workers busy: hold this connection until one frees up (further
+        // clients wait in the listen backlog), like the old queued thread pool.
+        if (!rt.acquireWorkerSlot(&proxy_workers, max_proxy_workers, shutdown.isRunning)) {
+            rejectConnection(ssl, conn.sock, conn_id);
+            break;
+        }
+        rt.spawnWorker(rt.io(), &group, handleConnection, .{
             ssl,
-            conn.stream,
-            conn.address,
+            conn.sock,
+            conn.addr,
             config,
             conn_id,
             client_ctx,
-        }) catch |e| {
-            log.err("component=proxy op=pool_spawn conn={d} error={any}", .{ conn_id, e });
-            ssl_c.SSL_free(ssl);
-            conn.stream.close();
-        };
+        }, rejectConnectionAndRelease, .{ ssl, conn.sock, conn_id });
     }
+}
+
+var proxy_workers: std.atomic.Value(u32) = .init(0);
+const max_proxy_workers = 64;
+
+fn rejectConnection(ssl: *ssl_c.SSL, client_sock: compat.socket_t, conn_id: u64) void {
+    log.err("component=proxy op=pool_spawn conn={d} error=ConcurrencyUnavailable", .{conn_id});
+    ssl_c.SSL_free(ssl);
+    compat.closeSocket(client_sock);
+}
+
+fn rejectConnectionAndRelease(ssl: *ssl_c.SSL, client_sock: compat.socket_t, conn_id: u64) void {
+    _ = proxy_workers.fetchSub(1, .acq_rel);
+    rejectConnection(ssl, client_sock, conn_id);
 }
 
 /// Resolve, connect, and (for external routes) TLS-handshake an upstream connection.
 /// On any failure the specific cause is logged and `error.UpstreamUnavailable` is
-/// returned; the caller maps that to a single 502. Owns the resolved AddressList for
-/// its own lifetime and sets send/recv timeouts on the socket before returning.
+/// returned; the caller maps that to a single 502. Sets send/recv timeouts on the
+/// socket before returning.
 fn connectUpstream(
     is_external: bool,
     upstream_host: []const u8,
@@ -289,37 +294,31 @@ fn connectUpstream(
     client_ctx: ?*ssl_c.SSL_CTX,
     conn_id: u64,
 ) !UpstreamConn {
-    // Resolve upstream address — DNS for external, IP parse for local
-    var addr_list: ?*std.net.AddressList = null;
-    defer if (addr_list) |al| al.deinit();
-
-    const upstream_addr: std.net.Address = blk: {
+    // Resolve + connect — DNS for external, IP parse for local
+    const upstream_sock: compat.socket_t = blk: {
         if (is_external) {
-            const al = std.net.getAddressList(std.heap.page_allocator, upstream_host, upstream_port) catch {
-                log.err("component=proxy conn={d} op=dns_resolve host={s} error=failed", .{ conn_id, upstream_host });
+            break :blk compat.tcpConnectHost(upstream_host, upstream_port) catch |e| {
+                switch (e) {
+                    error.UnknownHostName => log.err(
+                        "component=proxy conn={d} op=dns_resolve host={s} error={any}",
+                        .{ conn_id, upstream_host, e },
+                    ),
+                    else => log.err(
+                        "component=proxy conn={d} op=upstream_connect host={s} error={any}",
+                        .{ conn_id, upstream_host, e },
+                    ),
+                }
                 return error.UpstreamUnavailable;
             };
-            addr_list = al;
-            if (al.addrs.len == 0) {
-                log.err("component=proxy conn={d} op=dns_resolve host={s} error=no_addresses", .{ conn_id, upstream_host });
-                return error.UpstreamUnavailable;
-            }
-            break :blk al.addrs[0];
         } else {
-            break :blk std.net.Address.parseIp(config.target_host, upstream_port) catch {
+            const addr = std.Io.net.IpAddress.parse(config.target_host, upstream_port) catch {
+                return error.UpstreamUnavailable;
+            };
+            break :blk compat.tcpConnect(addr) catch |e| {
+                log.err("component=proxy conn={d} op=upstream_connect host={s} error={any}", .{ conn_id, upstream_host, e });
                 return error.UpstreamUnavailable;
             };
         }
-    };
-
-    const upstream_sock = posix.socket(upstream_addr.any.family, posix.SOCK.STREAM, 0) catch |e| {
-        log.err("component=proxy conn={d} op=upstream_socket error={any}", .{ conn_id, e });
-        return error.UpstreamUnavailable;
-    };
-    posix.connect(upstream_sock, &upstream_addr.any, upstream_addr.getOsSockLen()) catch |e| {
-        log.err("component=proxy conn={d} op=upstream_connect host={s} error={any}", .{ conn_id, upstream_host, e });
-        compat.closeSocket(upstream_sock);
-        return error.UpstreamUnavailable;
     };
 
     // Wrap in TLS for external upstreams; plain socket for local
@@ -361,16 +360,17 @@ fn connectUpstream(
 
 fn handleConnection(
     ssl: *ssl_c.SSL,
-    stream: std.net.Stream,
-    client_addr: std.net.Address,
+    client_sock: compat.socket_t,
+    client_addr: std.Io.net.IpAddress,
     config: *const ProxyConfig,
     conn_id: u64,
     client_ctx: ?*ssl_c.SSL_CTX,
 ) void {
+    defer _ = proxy_workers.fetchSub(1, .acq_rel);
     defer {
         _ = ssl_c.SSL_shutdown(ssl);
         ssl_c.SSL_free(ssl);
-        stream.close();
+        compat.closeSocket(client_sock);
     }
 
     if (ssl_c.SSL_accept(ssl) != 1) {
@@ -378,7 +378,7 @@ fn handleConnection(
     }
 
     // Set receive timeout on client socket
-    setSocketTimeout(stream.handle, .recv, 30);
+    setSocketTimeout(client_sock, .recv, 30);
 
     // Keep-alive loop: process multiple requests on the same TLS connection
     var request_count: u32 = 0;
@@ -401,7 +401,7 @@ fn handleConnection(
         if (total == 0 or headers_end == null) return; // client closed or bad data
 
         const hdr_end = headers_end.?;
-        const start_time = std.time.milliTimestamp();
+        const start_time = rt.milliTimestamp();
 
         // Parse request line
         const first_line_end = std.mem.indexOf(u8, req_buf[0..total], "\r\n") orelse return;
@@ -526,7 +526,7 @@ fn handleConnection(
         // which set status/duration before unpinning — so this defer only fires for
         // error exits where the entry would otherwise be pinned forever.
         defer if (was_intercepted) {
-            const dur = std.time.milliTimestamp() - start_time;
+            const dur = rt.milliTimestamp() - start_time;
             requests.finishIfDangling(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0);
         };
 
@@ -535,7 +535,7 @@ fn handleConnection(
         const upstream_host = route_result.hostname orelse config.target_host;
 
         const upstream = connectUpstream(is_external, upstream_host, upstream_port, config, client_ctx, conn_id) catch {
-            const dur = std.time.milliTimestamp() - start_time;
+            const dur = rt.milliTimestamp() - start_time;
             if (was_intercepted) {
                 requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
             }
@@ -615,7 +615,7 @@ fn handleConnection(
             entry.resp_body_len = @intCast(resp_body_captured);
 
             // Record when upstream response was fully received
-            const resp_received_time = std.time.milliTimestamp();
+            const resp_received_time = rt.milliTimestamp();
             const upstream_dur = resp_received_time - start_time;
             const req_dur: u64 = if (upstream_dur > 0) @intCast(upstream_dur) else 0;
 
@@ -652,11 +652,11 @@ fn handleConnection(
                         forwardResponseFromEntry(ssl, resp_snap, is_external, config.domain, must_close);
 
                         // Duration = hold time only
-                        const hold_elapsed = std.time.milliTimestamp() - resp_received_time;
+                        const hold_elapsed = rt.milliTimestamp() - resp_received_time;
                         requests.finishResponseIntercept(h.index(), if (hold_elapsed > 0) @intCast(hold_elapsed) else 0);
 
                         if (must_close) return;
-                        setSocketTimeout(stream.handle, .recv, 15);
+                        setSocketTimeout(client_sock, .recv, 15);
                         continue;
                     },
                 }
@@ -671,7 +671,7 @@ fn handleConnection(
             forwardResponseFromEntry(ssl, &entry, is_external, config.domain, must_close);
 
             if (must_close) return;
-            setSocketTimeout(stream.handle, .recv, 15);
+            setSocketTimeout(client_sock, .recv, 15);
             continue;
         }
 
@@ -708,7 +708,7 @@ fn handleConnection(
         }
         entry.resp_body_len = @intCast(resp_body_captured);
 
-        const elapsed = std.time.milliTimestamp() - start_time;
+        const elapsed = rt.milliTimestamp() - start_time;
         entry.duration_ms = if (elapsed > 0) @intCast(elapsed) else 0;
 
         if (was_intercepted) {
@@ -726,7 +726,7 @@ fn handleConnection(
         if (must_close) return;
 
         // Shorter idle timeout for subsequent requests on this connection
-        setSocketTimeout(stream.handle, .recv, 15);
+        setSocketTimeout(client_sock, .recv, 15);
     }
 }
 
@@ -862,17 +862,12 @@ pub fn replay(source: *const requests.Entry) void {
     ssl_c.SSL_CTX_set_verify(ctx, ssl_c.SSL_VERIFY_NONE, null);
 
     // Connect TCP to the proxy's own HTTPS endpoint
-    const proxy_addr = std.net.Address.parseIp("127.0.0.1", 443) catch |e| {
+    const proxy_addr = std.Io.net.IpAddress.parse("127.0.0.1", 443) catch |e| {
         log.err("component=proxy op=replay_connect error={any}", .{e});
         return;
     };
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch |e| {
-        log.err("component=proxy op=replay_socket error={any}", .{e});
-        return;
-    };
-    posix.connect(sock, &proxy_addr.any, proxy_addr.getOsSockLen()) catch |e| {
+    const sock = compat.tcpConnect(proxy_addr) catch |e| {
         log.err("component=proxy op=replay_connect error={any}", .{e});
-        compat.closeSocket(sock);
         return;
     };
 
@@ -960,17 +955,12 @@ fn handleWebSocket(
     log.info("component=proxy op=websocket_upgrade uri={s}", .{entry.getPath()});
 
     // Connect to upstream (use resolved route port, not default)
-    const upstream_addr = std.net.Address.parseIp(config.target_host, upstream_port) catch |e| {
+    const upstream_addr = std.Io.net.IpAddress.parse(config.target_host, upstream_port) catch |e| {
         log.err("component=proxy op=websocket_connect error={any}", .{e});
         return;
     };
-    const upstream_sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch |e| {
-        log.err("component=proxy op=websocket_socket error={any}", .{e});
-        return;
-    };
-    posix.connect(upstream_sock, &upstream_addr.any, upstream_addr.getOsSockLen()) catch |e| {
+    const upstream_sock = compat.tcpConnect(upstream_addr) catch |e| {
         log.err("component=proxy op=websocket_connect error={any}", .{e});
-        compat.closeSocket(upstream_sock);
         sslSendError(ssl, 502, "Bad Gateway");
         return;
     };
@@ -996,7 +986,7 @@ fn handleWebSocket(
 
     // Log as a WS entry (pinned so it won't be overwritten during long-lived connection)
     entry.status = 101;
-    const elapsed = std.time.milliTimestamp() - entry.timestamp;
+    const elapsed = rt.milliTimestamp() - entry.timestamp;
     entry.duration_ms = if (elapsed > 0) @intCast(elapsed) else 0;
     // Store response headers
     if (std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n")) |first_end| {
@@ -1021,28 +1011,28 @@ fn handleWebSocket(
 
     var pipe_buf: [8192]u8 = undefined;
     while (true) {
-        var fds = [2]posix.pollfd{
-            .{ .fd = client_fd, .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = upstream_sock, .events = posix.POLL.IN, .revents = 0 },
+        var fds = [2]compat.pollfd{
+            .{ .fd = client_fd, .events = compat.POLL.IN, .revents = 0 },
+            .{ .fd = upstream_sock, .events = compat.POLL.IN, .revents = 0 },
         };
-        const ready = posix.poll(&fds, 30000) catch break; // 30s timeout
+        const ready = compat.poll(&fds, 30000) catch break; // 30s timeout
         if (ready == 0) break; // timeout
 
         // Client -> upstream
-        if (fds[0].revents & posix.POLL.IN != 0) {
+        if (fds[0].revents & compat.POLL.IN != 0) {
             const n = ssl_c.SSL_read(ssl, @ptrCast(&pipe_buf), @intCast(pipe_buf.len));
             if (n <= 0) break;
             upstream.writeAll(pipe_buf[0..@intCast(n)]) catch break;
         }
-        if (fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) break;
+        if (fds[0].revents & (compat.POLL.HUP | compat.POLL.ERR) != 0) break;
 
         // Upstream -> client
-        if (fds[1].revents & posix.POLL.IN != 0) {
+        if (fds[1].revents & compat.POLL.IN != 0) {
             const n = upstream.read(&pipe_buf) catch break;
             if (n == 0) break;
             sslWriteAll(ssl, pipe_buf[0..n]);
         }
-        if (fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) break;
+        if (fds[1].revents & (compat.POLL.HUP | compat.POLL.ERR) != 0) break;
     }
     requests.unpin(ws_backing_idx);
 }
@@ -1058,7 +1048,7 @@ fn setSocketTimeout(fd: posix.socket_t, which: SO_TIMEOUT, seconds: u32) void {
         };
         const ms: u32 = seconds * 1000;
         const bytes = std.mem.toBytes(ms);
-        _ = std.os.windows.ws2_32.setsockopt(fd, std.os.windows.ws2_32.SOL.SOCKET, opt, @ptrCast(&bytes), @sizeOf(@TypeOf(ms)));
+        _ = win32.setsockopt(fd, 0xffff, opt, &bytes, @sizeOf(@TypeOf(ms))); // 0xffff = SOL_SOCKET
     } else {
         const opt: u32 = switch (which) {
             .recv => ssl_c.SO_RCVTIMEO,
@@ -1069,16 +1059,11 @@ fn setSocketTimeout(fd: posix.socket_t, which: SO_TIMEOUT, seconds: u32) void {
     }
 }
 
-fn formatAddress(addr: std.net.Address, buf: []u8) []const u8 {
+fn formatAddress(addr: std.Io.net.IpAddress, buf: []u8) []const u8 {
     // Format IP only, without port
-    return switch (addr.any.family) {
-        posix.AF.INET => blk: {
-            const bytes: [4]u8 = @bitCast(addr.in.sa.addr);
-            break :blk std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            }) catch "0.0.0.0";
-        },
-        else => std.fmt.bufPrint(buf, "{any}", .{addr}) catch "0.0.0.0",
+    return switch (addr) {
+        .ip4 => |a| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }) catch "0.0.0.0",
+        .ip6 => |a| std.fmt.bufPrint(buf, "{f}", .{a}) catch "0.0.0.0",
     };
 }
 
@@ -1087,14 +1072,14 @@ fn formatAddress(addr: std.net.Address, buf: []u8) []const u8 {
 const testing = std.testing;
 
 test "formatAddress IPv4" {
-    const addr = std.net.Address.parseIp4("192.168.1.42", 8080) catch unreachable;
+    const addr = std.Io.net.IpAddress.parseIp4("192.168.1.42", 8080) catch unreachable;
     var buf: [64]u8 = undefined;
     const result = formatAddress(addr, &buf);
     try testing.expectEqualStrings("192.168.1.42", result);
 }
 
 test "formatAddress loopback" {
-    const addr = std.net.Address.parseIp4("127.0.0.1", 443) catch unreachable;
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 443) catch unreachable;
     var buf: [64]u8 = undefined;
     const result = formatAddress(addr, &buf);
     try testing.expectEqualStrings("127.0.0.1", result);
@@ -1301,4 +1286,20 @@ test "forwardRequest recomputes Content-Length from the body, ignoring the origi
     try testing.expect(std.mem.indexOf(u8, out[0..len], "Content-Length: 4\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, out[0..len], "Content-Length: 99") == null);
     try testing.expect(std.mem.endsWith(u8, out[0..len], "\r\n\r\nabcd"));
+}
+
+test "connectUpstream returns UpstreamUnavailable for an unresolvable external host" {
+    const cfg = ProxyConfig{
+        .target_host = "127.0.0.1",
+        .target_port = 1,
+        .listen_addr = "127.0.0.1",
+        .cert_path = "",
+        .key_path = "",
+        .ca_path = "",
+        .server_ident = "test",
+        .max_request_body = 0,
+        .routes = &.{},
+        .domain = "dev.lo",
+    };
+    try testing.expectError(error.UpstreamUnavailable, connectUpstream(true, "nonexistent.invalid", 443, &cfg, null, 1));
 }

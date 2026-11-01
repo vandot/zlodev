@@ -27,7 +27,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.17.0
 
       - name: Build
         run: zig build
@@ -38,8 +38,18 @@ jobs:
       - name: Test requests + har
         run: zig test src/har.zig
 
-      - name: Test proxy
-        run: zig test src/proxy.zig
+      - name: Test proxy + cert
+        run: zig build test-c
+
+      - name: Test runtime, hold, wire, json, http server, shutdown, compat
+        run: |
+          zig test src/rt.zig
+          zig test src/hold.zig
+          zig test src/http_wire.zig
+          zig test src/jsonfmt.zig
+          zig test src/http_server.zig
+          zig test src/shutdown.zig
+          zig test src/compat.zig
 
       - name: Test intercept
         run: zig test src/intercept.zig
@@ -81,7 +91,7 @@ jobs:
           zig test tests/integration.zig
 
   macos:
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -91,7 +101,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.17.0
 
       - name: Build
         run: zig build
@@ -102,8 +112,18 @@ jobs:
       - name: Test requests + har
         run: zig test src/har.zig
 
-      - name: Test proxy
-        run: zig test src/proxy.zig
+      - name: Test proxy + cert
+        run: zig build test-c
+
+      - name: Test runtime, hold, wire, json, http server, shutdown, compat
+        run: |
+          zig test src/rt.zig
+          zig test src/hold.zig
+          zig test src/http_wire.zig
+          zig test src/jsonfmt.zig
+          zig test src/http_server.zig
+          zig test src/shutdown.zig
+          zig test src/compat.zig
 
       - name: Test intercept
         run: zig test src/intercept.zig
@@ -142,7 +162,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.17.0
 
       - name: Build
         run: zig build
@@ -153,8 +173,18 @@ jobs:
       - name: Test requests + har
         run: zig test src/har.zig
 
-      - name: Test proxy
-        run: zig test src/proxy.zig
+      - name: Test proxy + cert
+        run: zig build test-c
+
+      - name: Test runtime, hold, wire, json, http server, shutdown, compat
+        run: |
+          zig test src/rt.zig
+          zig test src/hold.zig
+          zig test src/http_wire.zig
+          zig test src/jsonfmt.zig
+          zig test src/http_server.zig
+          zig test src/shutdown.zig
+          zig test src/compat.zig
 
       - name: Test intercept
         run: zig test src/intercept.zig

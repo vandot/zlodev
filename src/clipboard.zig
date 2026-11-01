@@ -1,8 +1,10 @@
 const std = @import("std");
+const rt = @import("rt.zig");
 const requests = @import("requests.zig");
 
 /// Copy a request as a curl command to the clipboard.
 pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) void {
+    _ = alloc; // std.process.spawn no longer takes an allocator
     var entry_copy: requests.Entry = undefined;
     if (!requests.copyEntry(logical, &entry_copy)) return;
     const entry = &entry_copy;
@@ -88,21 +90,17 @@ pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) 
         .windows => &.{"clip.exe"},
         else => return,
     };
-    var child = std.process.Child.init(clip_cmd, alloc);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return;
-    if (child.stdin) |*stdin| {
-        stdin.writeAll(buf[0..pos]) catch {};
-        stdin.close();
+    var child = std.process.spawn(rt.io(), .{ .argv = clip_cmd, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore }) catch return;
+    if (child.stdin) |stdin| {
+        stdin.writeStreamingAll(rt.io(), buf[0..pos]) catch {};
+        stdin.close(rt.io());
         child.stdin = null;
     }
-    _ = child.wait() catch {};
+    _ = child.wait(rt.io()) catch {};
 }
 
 pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    return std.ascii.findIgnoreCase(haystack, needle) != null;
 }
 
 // --- Unit Tests ---

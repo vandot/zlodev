@@ -1,4 +1,5 @@
 const std = @import("std");
+const rt = @import("rt.zig");
 const root = @import("root");
 const intercept = @import("intercept.zig");
 
@@ -29,20 +30,20 @@ pub const Phase = enum {
 };
 
 pub const Entry = struct {
-    method: [7]u8 = .{0} ** 7,
+    method: [7]u8 = @splat(0),
     method_len: u8 = 0,
-    path: [512]u8 = .{0} ** 512,
+    path: [512]u8 = @splat(0),
     path_len: u16 = 0,
     status: u16 = 0,
     duration_ms: u64 = 0,
     timestamp: i64 = 0,
-    req_headers: [max_header_len]u8 = .{0} ** max_header_len,
+    req_headers: [max_header_len]u8 = @splat(0),
     req_headers_len: u16 = 0,
-    resp_headers: [max_header_len]u8 = .{0} ** max_header_len,
+    resp_headers: [max_header_len]u8 = @splat(0),
     resp_headers_len: u16 = 0,
-    req_body: [max_body_len]u8 = .{0} ** max_body_len,
+    req_body: [max_body_len]u8 = @splat(0),
     req_body_len: u32 = 0,
-    resp_body: [max_body_len]u8 = .{0} ** max_body_len,
+    resp_body: [max_body_len]u8 = @splat(0),
     resp_body_len: u32 = 0,
     req_body_truncated: bool = false,
     resp_body_truncated: bool = false,
@@ -77,7 +78,7 @@ pub const Entry = struct {
     }
 };
 
-var mutex: std.Thread.Mutex = .{};
+var mutex: std.Io.Mutex = .init;
 var entries: [max_entries]*Entry = undefined;
 var entries_backing: [max_entries]Entry = @splat(Entry{});
 var count: usize = 0;
@@ -94,8 +95,8 @@ fn ensureInit() void {
 }
 
 pub fn push(entry: Entry) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     ensureInit();
     // Skip pinned entries
     var attempts: usize = 0;
@@ -116,8 +117,8 @@ pub fn push(entry: Entry) void {
 
 /// Push an entry and pin it so it won't be overwritten. Returns the backing index, or null if all slots are pinned.
 pub fn pushAndPin(entry: Entry) ?usize {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     ensureInit();
     // Skip pinned entries
     var attempts: usize = 0;
@@ -148,8 +149,8 @@ fn getByBackingIndex(idx: usize) *Entry {
 /// Update a pinned entry in-place (thread-safe) and unpin it.
 /// req_body is not updated here — it's already set during pushAndPin (and may have been edited).
 pub fn finishEntry(idx: usize, status: u16, duration_ms: u64, resp_headers: []const u8, resp_body: []const u8) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     const e = &entries_backing[idx];
     e.status = status;
     e.duration_ms = duration_ms;
@@ -165,8 +166,8 @@ pub fn finishEntry(idx: usize, status: u16, duration_ms: u64, resp_headers: []co
 /// Finish a response-intercepted entry. Response data is already in the entry (and may have been edited).
 /// Just updates duration and unpins.
 pub fn finishResponseIntercept(idx: usize, duration_ms: u64) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     const e = &entries_backing[idx];
     e.duration_ms = duration_ms;
     if (!e.starred) e.pinned = false;
@@ -174,16 +175,16 @@ pub fn finishResponseIntercept(idx: usize, duration_ms: u64) void {
 
 /// Clear the pinned flag on an entry.
 pub fn unpin(idx: usize) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     if (!entries_backing[idx].starred) entries_backing[idx].pinned = false;
 }
 
 /// Classify a ring-resident entry by phase + hold state (locked read).
 /// The read counterpart to the transition ops below.
 pub fn phaseOf(idx: usize) Phase {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     return phaseOfEntry(&entries_backing[idx]);
 }
 
@@ -196,30 +197,30 @@ fn phaseOfEntry(e: *const Entry) Phase {
 
 /// Current status of a ring-resident entry (locked read).
 pub fn statusOf(idx: usize) u16 {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     return entries_backing[idx].status;
 }
 
 /// Copy a ring-resident entry (by backing index) into caller storage, under the mutex.
 /// Used where a held entry must be read off the lock (e.g. forwarding, TUI edit load).
 pub fn snapshotByBackingIndex(idx: usize, dest: *Entry) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     dest.* = entries_backing[idx];
 }
 
 /// Mark a held entry accepted. The pin is kept until a finish op runs.
 pub fn markAccepted(idx: usize) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     entries_backing[idx].state = .accepted;
 }
 
 /// Mark a held entry dropped and record how long it was held.
 pub fn markDropped(idx: usize, duration_ms: u64) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     const e = &entries_backing[idx];
     e.state = .dropped;
     e.duration_ms = duration_ms;
@@ -227,15 +228,15 @@ pub fn markDropped(idx: usize, duration_ms: u64) void {
 
 /// Release a request-phase hold back to a normal capture (intercept skipped/declined).
 pub fn releaseHold(idx: usize) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     entries_backing[idx].state = .normal;
 }
 
 /// Release a response-phase entry back to a normal capture (intercept skipped).
 pub fn releaseResponseHold(idx: usize, duration_ms: u64) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     const e = &entries_backing[idx];
     e.state = .normal;
     e.resp_intercepted = false;
@@ -245,8 +246,8 @@ pub fn releaseResponseHold(idx: usize, duration_ms: u64) void {
 /// Finish an entry that was accepted but left dangling on an error exit:
 /// only acts if still pinned (not starred) and in the accepted state.
 pub fn finishIfDangling(idx: usize, status: u16, duration_ms: u64) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     const e = &entries_backing[idx];
     if (e.pinned and !e.starred and e.state == .accepted) {
         e.status = status;
@@ -280,8 +281,8 @@ pub const EditableHold = struct {
     /// request phase. Slices are clamped. Returns false if the hold was resolved
     /// since it was opened (in which case nothing is written).
     pub fn commitRequest(self: EditableHold, method: []const u8, path: []const u8, headers: []const u8, body: []const u8) bool {
-        mutex.lock();
-        defer mutex.unlock();
+        mutex.lockUncancelable(rt.io());
+        defer mutex.unlock(rt.io());
         const e = &entries_backing[self.idx];
         if (e.state != .intercepted or e.resp_intercepted) return false;
         const m = @min(method.len, e.method.len);
@@ -302,8 +303,8 @@ pub const EditableHold = struct {
     /// Apply edited response fields, but only if the entry is still held at the
     /// response phase. Slices are clamped. Returns false if the hold was resolved.
     pub fn commitResponse(self: EditableHold, status: u16, headers: []const u8, body: []const u8) bool {
-        mutex.lock();
-        defer mutex.unlock();
+        mutex.lockUncancelable(rt.io());
+        defer mutex.unlock(rt.io());
         const e = &entries_backing[self.idx];
         if (e.state != .intercepted or !e.resp_intercepted) return false;
         e.status = status;
@@ -329,8 +330,8 @@ pub const EditableHold = struct {
 /// detect a hold that was resolved meanwhile.
 pub fn editHeld(logical: usize) ?EditableHold {
     const idx = logicalToBackingIndex(logical) orelse return null;
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     const ph = phaseOfEntry(&entries_backing[idx]);
     if (ph == .response_done) return null;
     return EditableHold{ .idx = idx, .phase = ph };
@@ -338,8 +339,8 @@ pub fn editHeld(logical: usize) ?EditableHold {
 
 /// Toggle the starred flag on an entry. Starred entries are pinned to survive ring buffer overflow.
 pub fn toggleStar(idx: usize) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     const e = &entries_backing[idx];
     e.starred = !e.starred;
     if (e.starred) {
@@ -351,8 +352,8 @@ pub fn toggleStar(idx: usize) void {
 
 /// Mark an entry as deleted by backing index.
 pub fn remove(idx: usize) void {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     if (entries_backing[idx].state != .deleted) {
         live_count -|= 1;
     }
@@ -367,11 +368,11 @@ pub fn clearAll() void {
     // Spin-wait for proxy threads to process drops and release their slots (up to 100ms).
     var wait_iters: usize = 0;
     while (intercept.getPendingCount() > 0 and wait_iters < 100) : (wait_iters += 1) {
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        rt.sleepMs(1);
     }
 
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     for (0..max_entries) |i| {
         entries_backing[i].state = .deleted;
         entries_backing[i].pinned = false;
@@ -385,8 +386,8 @@ pub fn clearAll() void {
 
 /// Convert a logical index (0 = oldest, skipping deleted) to a backing array index.
 pub fn logicalToBackingIndex(logical: usize) ?usize {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     if (count == 0) return null;
     const ring_start = if (count >= max_entries) write_pos else 0;
     var seen: usize = 0;
@@ -401,8 +402,8 @@ pub fn logicalToBackingIndex(logical: usize) ?usize {
 
 /// Get a range of non-deleted entries for display. Returns count written.
 pub fn getRange(buf: []*const Entry, offset: usize, limit: usize) usize {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     ensureInit();
     if (count == 0) return 0;
     const ring_start = if (count >= max_entries) write_pos else 0;
@@ -424,8 +425,8 @@ pub fn getRange(buf: []*const Entry, offset: usize, limit: usize) usize {
 
 /// Get a single entry by logical index (0 = oldest, skipping deleted).
 pub fn getOne(index: usize) ?*const Entry {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     ensureInit();
     if (count == 0) return null;
     const ring_start = if (count >= max_entries) write_pos else 0;
@@ -442,8 +443,8 @@ pub fn getOne(index: usize) ?*const Entry {
 /// Copy an entry by logical index into caller-provided storage, under the mutex.
 /// Returns true if the entry was found and copied, false otherwise.
 pub fn copyEntry(logical: usize, dest: *Entry) bool {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     ensureInit();
     if (count == 0) return false;
     const ring_start = if (count >= max_entries) write_pos else 0;
@@ -461,8 +462,8 @@ pub fn copyEntry(logical: usize, dest: *Entry) bool {
 }
 
 pub fn getCount() usize {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
     return live_count;
 }
 

@@ -10,36 +10,26 @@ const binary_path = switch (builtin.os.tag) {
 const hostname_max = if (builtin.os.tag == .windows) 256 else std.posix.HOST_NAME_MAX;
 
 fn runCmd(argv: []const []const u8) !std.process.Child.Term {
-    var child = std.process.Child.init(argv, testing.allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-    return child.wait();
+    var child = try std.process.spawn(testing.io, .{ .argv = argv, .stdin = .ignore });
+    return child.wait(testing.io);
 }
 
 fn runCmdExpectSuccess(argv: []const []const u8) !void {
     const term = try runCmd(argv);
-    try testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, term);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
 fn startBackground(argv: []const []const u8) !std.process.Child {
-    var child = std.process.Child.init(argv, testing.allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-    return child;
+    return std.process.spawn(testing.io, .{ .argv = argv, .stdin = .ignore });
 }
 
 fn killProcess(child: *std.process.Child) void {
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
+    child.kill(testing.io);
 }
 
 fn getHostname(buf: *[hostname_max]u8) []const u8 {
     if (builtin.os.tag == .windows) {
-        const name = std.process.getEnvVarOwned(testing.allocator, "COMPUTERNAME") catch return "localhost";
+        const name = testing.environ.getAlloc(testing.allocator, "COMPUTERNAME") catch return "localhost";
         defer testing.allocator.free(name);
         const len = @min(name.len, buf.len);
         @memcpy(buf[0..len], name[0..len]);
@@ -57,18 +47,18 @@ const null_dev = if (builtin.os.tag == .windows) "NUL" else "/dev/null";
 /// Poll a URL until it returns HTTP 200, or timeout.
 /// Set insecure=true for HTTPS polling before trust store may be visible.
 fn pollUrl(url: []const u8, timeout_ms: u64, insecure: bool) !void {
-    const start = std.time.milliTimestamp();
+    const start = std.Io.Timestamp.now(testing.io, .real).toMilliseconds();
     while (true) {
         const term = if (insecure)
             runCmd(&.{ "curl", "-sf", "--insecure", "--max-time", "2", "-o", null_dev, url })
         else
             runCmd(&.{ "curl", "-sf", "--max-time", "2", "-o", null_dev, url });
         if (term) |t| {
-            if (std.meta.eql(t, std.process.Child.Term{ .Exited = 0 })) return;
+            if (std.meta.eql(t, std.process.Child.Term{ .exited = 0 })) return;
         } else |_| {}
-        const elapsed: u64 = @intCast(std.time.milliTimestamp() - start);
+        const elapsed: u64 = @intCast(std.Io.Timestamp.now(testing.io, .real).toMilliseconds() - start);
         if (elapsed > timeout_ms) return error.PollTimeout;
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        testing.io.sleep(.fromMilliseconds(200), .awake) catch {};
     }
 }
 
@@ -186,7 +176,7 @@ test "dev.lo: full integration" {
 
         // Remote test — allowed to fail (httpbin.org may be down)
         const remote_term = try runCmd(&.{ "hurl", "--test", "tests/hurl/remote.hurl" });
-        if (!std.meta.eql(remote_term, std.process.Child.Term{ .Exited = 0 })) {
+        if (!std.meta.eql(remote_term, std.process.Child.Term{ .exited = 0 })) {
             std.debug.print("WARNING: remote.hurl failed (httpbin.org may be unreachable), continuing\n", .{});
         }
     }

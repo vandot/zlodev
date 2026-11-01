@@ -1,14 +1,14 @@
 const std = @import("std");
+const rt = @import("rt.zig");
 const sep = std.fs.path.sep_str;
 const compat = @import("compat.zig");
 
 pub fn sudoCmd(allocator: std.mem.Allocator, argv: []const []const u8) !void {
-    var child = std.process.Child.init(argv, allocator);
-    child.stderr_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    const term = try child.spawnAndWait();
+    _ = allocator;
+    var child = try std.process.spawn(rt.io(), .{ .argv = argv, .stdout = .inherit, .stderr = .inherit });
+    const term = try child.wait(rt.io());
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.CommandFailed;
         },
         else => return error.CommandFailed,
@@ -18,47 +18,21 @@ pub fn sudoCmd(allocator: std.mem.Allocator, argv: []const []const u8) !void {
 /// Run a command and capture its stdout output. Returns allocated slice (caller must free).
 /// Returns null if the command fails or produces no output.
 pub fn runCmdOutput(allocator: std.mem.Allocator, argv: []const []const u8) ?[]const u8 {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.stdin_behavior = .Ignore;
-    child.spawn() catch return null;
-    const stdout_file = child.stdout.?;
-    var read_buf: [4096]u8 = undefined;
-    var result = std.ArrayListUnmanaged(u8){};
-    while (true) {
-        const n = stdout_file.read(&read_buf) catch break;
-        if (n == 0) break;
-        result.appendSlice(allocator, read_buf[0..n]) catch break;
-    }
-    const term = child.wait() catch {
-        result.deinit(allocator);
-        return null;
+    const res = std.process.run(allocator, rt.io(), .{ .argv = argv }) catch return null;
+    allocator.free(res.stderr);
+    const ok = switch (res.term) {
+        .exited => |code| code == 0,
+        else => false,
     };
-    switch (term) {
-        .Exited => |code| {
-            if (code != 0) {
-                result.deinit(allocator);
-                return null;
-            }
-        },
-        else => {
-            result.deinit(allocator);
-            return null;
-        },
-    }
-    if (result.items.len == 0) {
-        result.deinit(allocator);
+    if (!ok or res.stdout.len == 0) {
+        allocator.free(res.stdout);
         return null;
     }
-    return result.toOwnedSlice(allocator) catch {
-        result.deinit(allocator);
-        return null;
-    };
+    return res.stdout;
 }
 
 pub fn dirExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(rt.io(), path, .{}) catch return false;
     return true;
 }
 
@@ -66,8 +40,8 @@ pub fn writeTmpFile(allocator: std.mem.Allocator, name: []const u8, content: []c
     const tmp = compat.getTmpDir();
     const path = try std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "zlodev_{s}", .{ tmp, name });
     errdefer allocator.free(path);
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(content);
+    const file = try std.Io.Dir.createFileAbsolute(rt.io(), path, .{});
+    defer file.close(rt.io());
+    try file.writeStreamingAll(rt.io(), content);
     return path;
 }

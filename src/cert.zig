@@ -4,17 +4,9 @@ const builtin = @import("builtin");
 const log = @import("log.zig");
 const sys = @import("sys.zig");
 const compat = @import("compat.zig");
+const rt = @import("rt.zig");
 
-const c = @cImport({
-    @cInclude("openssl/evp.h");
-    @cInclude("openssl/x509.h");
-    @cInclude("openssl/x509v3.h");
-    @cInclude("openssl/pem.h");
-    @cInclude("openssl/bio.h");
-    @cInclude("openssl/err.h");
-    @cInclude("openssl/bn.h");
-    @cInclude("openssl/rsa.h");
-});
+const c = @import("cert_c");
 
 pub fn getBasePath(buf: []u8) ![]const u8 {
     switch (builtin.os.tag) {
@@ -39,41 +31,41 @@ pub fn getBasePath(buf: []u8) ![]const u8 {
 }
 
 pub fn getCertPath(buf: []u8, domain: []const u8) ![]const u8 {
-    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var base_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const base = try getBasePath(&base_buf);
     return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "{s}", .{ base, domain });
 }
 
 pub fn getCert(cert_buf: []u8, key_buf: []u8, domain: []const u8) !struct { cert: []const u8, key: []const u8 } {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try getCertPath(&path_buf, domain);
     const cert_path = try std.fmt.bufPrint(cert_buf, "{s}" ++ sep ++ "zlodev.crt", .{dir});
     const key = try std.fmt.bufPrint(key_buf, "{s}" ++ sep ++ "zlodev.key", .{dir});
 
     // Check if files exist
-    std.fs.accessAbsolute(cert_path, .{}) catch return error.CertNotFound;
-    std.fs.accessAbsolute(key, .{}) catch return error.KeyNotFound;
+    std.Io.Dir.accessAbsolute(rt.io(), cert_path, .{}) catch return error.CertNotFound;
+    std.Io.Dir.accessAbsolute(rt.io(), key, .{}) catch return error.KeyNotFound;
 
     return .{ .cert = cert_path, .key = key };
 }
 
 pub fn caExists(domain: []const u8) bool {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = getCertPath(&path_buf, domain) catch return false;
-    var ca_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ca_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const ca_path = std.fmt.bufPrint(&ca_buf, "{s}" ++ sep ++ "zlodevCA.pem", .{dir}) catch return false;
-    std.fs.accessAbsolute(ca_path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(rt.io(), ca_path, .{}) catch return false;
     return true;
 }
 
 pub fn getCaPath(buf: []u8, domain: []const u8) ![]const u8 {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try getCertPath(&path_buf, domain);
     return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "zlodevCA.pem", .{dir});
 }
 
 pub fn getCaDerPath(buf: []u8, domain: []const u8) ![]const u8 {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try getCertPath(&path_buf, domain);
     return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "zlodevCA.der", .{dir});
 }
@@ -130,7 +122,7 @@ fn addExtension(cert_x509: *c.X509, issuer: ?*c.X509, nid: c_int, value: [:0]con
 fn allocPrintZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]u8 {
     const s = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(s);
-    return try allocator.dupeZ(u8, s);
+    return try allocator.dupeSentinel(u8, s, 0);
 }
 
 fn setNameEntry(name: *c.X509_NAME, nid: c_int, value: []const u8) !void {
@@ -276,13 +268,13 @@ fn generateDomainCert(allocator: std.mem.Allocator, domain: []const u8, ca_cert:
 }
 
 pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cert_dir = try getCertPath(&path_buf, domain);
 
     // Create directories (recursively, in case intermediate dirs don't exist)
-    std.fs.makeDirAbsolute(cert_dir) catch {
+    std.Io.Dir.createDirAbsolute(rt.io(), cert_dir, .default_dir) catch {
         // If single-level create failed, try creating the full path
-        std.fs.cwd().makePath(cert_dir) catch return error.CertCreateFailed;
+        std.Io.Dir.cwd().createDirPath(rt.io(), cert_dir) catch return error.CertCreateFailed;
     };
 
     // Generate CA certificate and key
@@ -333,7 +325,7 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
 }
 
 pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cert_dir = try getCertPath(&path_buf, domain);
 
     if (!caExists(domain)) {
@@ -378,12 +370,12 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
     }
 
     // Remove cert directory
-    std.fs.deleteTreeAbsolute(cert_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(rt.io(), cert_dir) catch {};
     std.debug.print("CA removed from trusted roots and certificates deleted for {s}\n", .{domain});
 }
 
 fn removeFromKeychain(allocator: std.mem.Allocator, cert_dir: []const u8) void {
-    var ca_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ca_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const ca_path = std.fmt.bufPrint(&ca_path_buf, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir}) catch {
         std.debug.print("CA file path could not be determined, skipping keychain removal\n", .{});
         return;
@@ -407,14 +399,14 @@ fn appendToGitCaBundle(allocator: std.mem.Allocator, ca_pem_path: []const u8) vo
     defer allocator.free(bundle_path);
 
     // Read CA PEM content
-    const ca_content = std.fs.cwd().readFileAlloc(allocator, ca_pem_path, 8192) catch {
+    const ca_content = std.Io.Dir.cwd().readFileAlloc(rt.io(), ca_pem_path, allocator, .limited(8192)) catch {
         std.debug.print("warning: could not read CA file for Git bundle\n", .{});
         return;
     };
     defer allocator.free(ca_content);
 
     // Check if already present
-    const bundle_content = std.fs.cwd().readFileAlloc(allocator, bundle_path, 4 * 1024 * 1024) catch {
+    const bundle_content = std.Io.Dir.cwd().readFileAlloc(rt.io(), bundle_path, allocator, .limited(4 * 1024 * 1024)) catch {
         std.debug.print("warning: could not read Git CA bundle\n", .{});
         return;
     };
@@ -422,7 +414,7 @@ fn appendToGitCaBundle(allocator: std.mem.Allocator, ca_pem_path: []const u8) vo
     if (std.mem.indexOf(u8, bundle_content, "# BEGIN zlodev CA") != null) return;
 
     // Build new content in memory
-    var new_content = std.ArrayListUnmanaged(u8){};
+    var new_content: std.ArrayListUnmanaged(u8) = .empty;
     defer new_content.deinit(allocator);
     new_content.appendSlice(allocator, bundle_content) catch return;
     new_content.appendSlice(allocator, ca_bundle_marker_begin) catch return;
@@ -433,16 +425,16 @@ fn appendToGitCaBundle(allocator: std.mem.Allocator, ca_pem_path: []const u8) vo
     const tmp_path = std.fmt.allocPrint(allocator, "{s}.zlodev_tmp", .{bundle_path}) catch return;
     defer allocator.free(tmp_path);
 
-    const tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch return;
-    tmp_file.writeAll(new_content.items) catch {
-        tmp_file.close();
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+    const tmp_file = std.Io.Dir.createFileAbsolute(rt.io(), tmp_path, .{}) catch return;
+    tmp_file.writeStreamingAll(rt.io(), new_content.items) catch {
+        tmp_file.close(rt.io());
+        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
         return;
     };
-    tmp_file.close();
+    tmp_file.close(rt.io());
 
-    std.fs.renameAbsolute(tmp_path, bundle_path) catch {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+    std.Io.Dir.renameAbsolute(tmp_path, bundle_path, rt.io()) catch {
+        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
         return;
     };
 
@@ -454,7 +446,7 @@ fn removeFromGitCaBundle(allocator: std.mem.Allocator) void {
     const bundle_path = getGitCaBundlePath(allocator) orelse return;
     defer allocator.free(bundle_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, bundle_path, 4 * 1024 * 1024) catch return;
+    const content = std.Io.Dir.cwd().readFileAlloc(rt.io(), bundle_path, allocator, .limited(4 * 1024 * 1024)) catch return;
     defer allocator.free(content);
 
     const begin = std.mem.indexOf(u8, content, ca_bundle_marker_begin) orelse return;
@@ -466,21 +458,21 @@ fn removeFromGitCaBundle(allocator: std.mem.Allocator) void {
     const tmp_path = std.fmt.allocPrint(allocator, "{s}.zlodev_tmp", .{bundle_path}) catch return;
     defer allocator.free(tmp_path);
 
-    const tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch return;
-    tmp_file.writeAll(content[0..begin]) catch {
-        tmp_file.close();
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+    const tmp_file = std.Io.Dir.createFileAbsolute(rt.io(), tmp_path, .{}) catch return;
+    tmp_file.writeStreamingAll(rt.io(), content[0..begin]) catch {
+        tmp_file.close(rt.io());
+        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
         return;
     };
-    tmp_file.writeAll(content[end..]) catch {
-        tmp_file.close();
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+    tmp_file.writeStreamingAll(rt.io(), content[end..]) catch {
+        tmp_file.close(rt.io());
+        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
         return;
     };
-    tmp_file.close();
+    tmp_file.close(rt.io());
 
-    std.fs.renameAbsolute(tmp_path, bundle_path) catch {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+    std.Io.Dir.renameAbsolute(tmp_path, bundle_path, rt.io()) catch {
+        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
         return;
     };
     std.debug.print("CA removed from Git CA bundle\n", .{});
@@ -513,7 +505,7 @@ fn getGitCaBundlePath(allocator: std.mem.Allocator) ?[]const u8 {
         "C:\\Program Files (x86)\\Git\\mingw64\\etc\\ssl\\certs\\ca-bundle.crt",
     };
     for (fallback_paths) |path| {
-        std.fs.accessAbsolute(path, .{}) catch continue;
+        std.Io.Dir.accessAbsolute(rt.io(), path, .{}) catch continue;
         return allocator.dupe(u8, path) catch return null;
     }
     return null;
@@ -521,8 +513,8 @@ fn getGitCaBundlePath(allocator: std.mem.Allocator) ?[]const u8 {
 
 fn getFingerprint(ca_path: []const u8) ![40]u8 {
     // Null-terminate the path for C API
-    var path_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_z_buf, "{s}", .{ca_path}) catch return error.CertReadFailed;
+    var path_z_buf: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+    const path_z = std.mem.printSentinel(&path_z_buf, "{s}", .{ca_path}, 0) catch return error.CertReadFailed;
 
     const bio = c.BIO_new_file(path_z.ptr, "r") orelse return error.CertReadFailed;
     defer _ = c.BIO_free(bio);

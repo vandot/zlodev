@@ -3,63 +3,8 @@ const log = @import("log.zig");
 const shutdown = @import("shutdown.zig");
 const builtin = @import("builtin");
 
-/// Win32 job object bindings (not in Zig's std).
-const win32 = struct {
-    const windows = std.os.windows;
-    const HANDLE = windows.HANDLE;
-    const BOOL = windows.BOOL;
-
-    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
-    const JobObjectExtendedLimitInformation: c_int = 9;
-
-    const BASIC_LIMIT_INFORMATION = extern struct {
-        PerProcessUserTimeLimit: i64 = 0,
-        PerJobUserTimeLimit: i64 = 0,
-        LimitFlags: u32 = 0,
-        MinimumWorkingSetSize: usize = 0,
-        MaximumWorkingSetSize: usize = 0,
-        ActiveProcessLimit: u32 = 0,
-        Affinity: usize = 0,
-        PriorityClass: u32 = 0,
-        SchedulingClass: u32 = 0,
-    };
-    const IO_COUNTERS = extern struct {
-        ReadOperationCount: u64 = 0,
-        WriteOperationCount: u64 = 0,
-        OtherOperationCount: u64 = 0,
-        ReadTransferCount: u64 = 0,
-        WriteTransferCount: u64 = 0,
-        OtherTransferCount: u64 = 0,
-    };
-    const EXTENDED_LIMIT_INFORMATION = extern struct {
-        BasicLimitInformation: BASIC_LIMIT_INFORMATION = .{},
-        IoInfo: IO_COUNTERS = .{},
-        ProcessMemoryLimit: usize = 0,
-        JobMemoryLimit: usize = 0,
-        PeakProcessMemoryUsed: usize = 0,
-        PeakJobMemoryUsed: usize = 0,
-    };
-
-    extern "kernel32" fn CreateJobObjectW(attrs: ?*anyopaque, name: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
-    extern "kernel32" fn SetInformationJobObject(job: HANDLE, class: c_int, info: *const anyopaque, len: u32) callconv(.winapi) BOOL;
-    extern "kernel32" fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) callconv(.winapi) BOOL;
-    extern "kernel32" fn TerminateJobObject(job: HANDLE, exit_code: u32) callconv(.winapi) BOOL;
-
-    /// Put `process` into a new job that kills all its processes when closed
-    /// (including when zlodev exits). Returns null if any step fails.
-    fn assignToKillJob(process: HANDLE) ?HANDLE {
-        const job = CreateJobObjectW(null, null) orelse return null;
-        var info = EXTENDED_LIMIT_INFORMATION{};
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, @sizeOf(EXTENDED_LIMIT_INFORMATION)) == 0 or
-            AssignProcessToJobObject(job, process) == 0)
-        {
-            windows.CloseHandle(job);
-            return null;
-        }
-        return job;
-    }
-};
+const rt = @import("rt.zig");
+const win32 = @import("win32.zig");
 
 const AnsiStripper = struct {
     state: enum { normal, esc, csi, osc, osc_esc } = .normal,
@@ -286,7 +231,7 @@ pub const LogLine = struct {
     seq: u64 = 0,
 };
 
-var ring_mutex: std.Thread.Mutex = .{};
+var ring_mutex: std.Io.Mutex = .init;
 var ring: []LogLine = &.{};
 var ring_write_pos: usize = 0;
 var ring_count: usize = 0;
@@ -294,8 +239,8 @@ var ring_seq: u64 = 0;
 var ring_allocated: bool = false;
 
 fn appendLine(data: []const u8, source: LogSource, is_synthetic: bool) void {
-    ring_mutex.lock();
-    defer ring_mutex.unlock();
+    ring_mutex.lockUncancelable(rt.io());
+    defer ring_mutex.unlock(rt.io());
 
     const slot = &ring[ring_write_pos];
     const copy_len = @min(data.len, max_line_len);
@@ -313,14 +258,14 @@ fn appendLine(data: []const u8, source: LogSource, is_synthetic: bool) void {
 }
 
 pub fn getLineCount() usize {
-    ring_mutex.lock();
-    defer ring_mutex.unlock();
+    ring_mutex.lockUncancelable(rt.io());
+    defer ring_mutex.unlock(rt.io());
     return ring_count;
 }
 
 pub fn copyRange(dest: []LogLine, start_idx: usize, max_count: usize) usize {
-    ring_mutex.lock();
-    defer ring_mutex.unlock();
+    ring_mutex.lockUncancelable(rt.io());
+    defer ring_mutex.unlock(rt.io());
 
     if (ring_count == 0) return 0;
 
@@ -344,8 +289,8 @@ pub fn copyRange(dest: []LogLine, start_idx: usize, max_count: usize) usize {
 }
 
 pub fn clearAll() void {
-    ring_mutex.lock();
-    defer ring_mutex.unlock();
+    ring_mutex.lockUncancelable(rt.io());
+    defer ring_mutex.unlock(rt.io());
     ring_count = 0;
     ring_write_pos = 0;
 }
@@ -360,16 +305,17 @@ var child_process: ?std.process.Child = null;
 var stdout_thread: ?std.Thread = null;
 var stderr_thread: ?std.Thread = null;
 var process_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-var has_allocator: bool = false;
-var stored_allocator: std.mem.Allocator = undefined;
 var readerDoneCount: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 // Windows job object holding the child tree; killing it takes grandchildren
 // (e.g. node under cmd.exe) down too. Unused on other platforms.
 var job_handle: ?std.os.windows.HANDLE = null;
+// Process group of the running child (== its pid, set at spawn). Kept separately
+// because wait() on the reader thread clears child.id, but group members can
+// outlive the shell. Unused on Windows.
+var child_pgid: i32 = 0;
 
 pub fn start(allocator: std.mem.Allocator, command: []const u8) !void {
-    stored_allocator = allocator;
-    has_allocator = true;
+    _ = allocator; // std.process.spawn no longer takes an allocator
     const copy_len = @min(command.len, command_buf.len);
     @memcpy(command_buf[0..copy_len], command[0..copy_len]);
     command_len = copy_len;
@@ -414,20 +360,17 @@ fn spawnChild() !void {
         &.{ "cmd.exe", "/c", cmd }
     else
         &.{ "/bin/sh", "-c", cmd };
-    var child = std.process.Child.init(
-        argv,
-        if (has_allocator) stored_allocator else std.heap.page_allocator,
-    );
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
+    const child = try std.process.spawn(rt.io(), .{
+        .argv = argv,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        // Own process group so stop/restart can signal grandchildren (npm workers).
+        .pgid = if (builtin.os.tag == .windows) null else 0,
+    });
     if (builtin.os.tag == .windows) {
-        job_handle = win32.assignToKillJob(child.id);
+        job_handle = win32.assignToKillJob(child.id.?);
     } else {
-        // Make child its own process group leader so we can signal
-        // the entire group (including grandchildren like npm workers)
-        std.posix.setpgid(@intCast(child.id), @intCast(child.id)) catch {};
+        child_pgid = @intCast(child.id.?);
     }
     child_process = child;
     process_running.store(true, .release);
@@ -440,7 +383,7 @@ fn spawnChild() !void {
     errdefer {
         // stderr_thread spawn failed — clean up child and stdout reader
         if (builtin.os.tag != .windows) {
-            std.posix.kill(-@as(i32, @intCast(child.id)), std.posix.SIG.KILL) catch {};
+            std.posix.kill(-@as(i32, @intCast(child.id.?)), .KILL) catch {};
         }
         if (stdout_thread) |t| t.join();
         stdout_thread = null;
@@ -458,7 +401,7 @@ fn readerAppendLine(ctx: *const ReaderContext, line: []const u8) void {
     appendLine(line, ctx.source, false);
 }
 
-fn readerThread(pipe: std.fs.File, source: LogSource) void {
+fn readerThread(pipe: std.Io.File, source: LogSource) void {
     var ansi = AnsiStripper{};
     var splitter = LineSplitter{};
     var read_buf: [4096]u8 = undefined;
@@ -466,7 +409,7 @@ fn readerThread(pipe: std.fs.File, source: LogSource) void {
     const ctx = ReaderContext{ .source = source };
 
     while (shutdown.isRunning() and process_running.load(.acquire)) {
-        const n = pipe.read(&read_buf) catch break;
+        const n = pipe.readStreaming(rt.io(), &.{&read_buf}) catch break;
         if (n == 0) break;
 
         // Strip ANSI escapes
@@ -487,7 +430,7 @@ fn readerThread(pipe: std.fs.File, source: LogSource) void {
     if (readerDoneCount.fetchAdd(1, .acq_rel) == 1) {
         // Both readers done — wait for child and inject exit line
         if (child_process) |*child| {
-            const term = child.wait() catch |e| {
+            const term = child.wait(rt.io()) catch |e| {
                 var buf: [256]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "[zlodev] wait failed: {any}", .{e}) catch "[zlodev] wait failed";
                 appendLine(msg, .stdout, true);
@@ -495,10 +438,9 @@ fn readerThread(pipe: std.fs.File, source: LogSource) void {
                 return;
             };
             const code: i64 = switch (term) {
-                .Exited => |c| @as(i64, c),
-                .Signal => |s| -@as(i64, @intCast(s)),
-                .Stopped => |s| -@as(i64, @intCast(s)),
-                .Unknown => -1,
+                .exited => |c| @as(i64, c),
+                .signal, .stopped => |s| -@as(i64, @intFromEnum(s)),
+                .unknown => -1,
             };
             var buf: [64]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "[zlodev] exited (code {d})", .{code}) catch "[zlodev] exited";
@@ -510,30 +452,32 @@ fn readerThread(pipe: std.fs.File, source: LogSource) void {
 
 fn stopChild() void {
     if (child_process) |*child| {
-        // Send SIGTERM (on Unix) / terminate (on Windows)
-        const pid = child.id;
+        // SIGTERM the group (Unix) / terminate the job (Windows)
         if (builtin.os.tag == .windows) {
             // No graceful signal on Windows: terminate the whole job (cmd.exe
             // and everything it spawned), falling back to the direct child.
+            // wait() on the reader thread clears child.id once reaped.
             if (job_handle) |job| {
                 _ = win32.TerminateJobObject(job, 1);
-            } else {
-                _ = std.os.windows.kernel32.TerminateProcess(child.id, 1);
+            } else if (child.id) |id| {
+                _ = win32.TerminateProcess(id, 1);
             }
         } else {
-            std.posix.kill(-@as(i32, @intCast(pid)), std.posix.SIG.TERM) catch {};
+            // Signal the stored group even if the shell itself was already
+            // reaped: group members may outlive it. ESRCH is ignored.
+            std.posix.kill(-child_pgid, .TERM) catch {};
         }
 
         // Wait up to 3 seconds for exit
-        const deadline = std.time.milliTimestamp() + 3000;
-        while (process_running.load(.acquire) and std.time.milliTimestamp() < deadline) {
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+        const deadline = rt.milliTimestamp() + 3000;
+        while (process_running.load(.acquire) and rt.milliTimestamp() < deadline) {
+            rt.sleepMs(50);
         }
 
         // Force kill if still running
         if (process_running.load(.acquire)) {
             if (builtin.os.tag != .windows) {
-                std.posix.kill(-@as(i32, @intCast(pid)), std.posix.SIG.KILL) catch {};
+                std.posix.kill(-child_pgid, .KILL) catch {};
             }
         }
 
@@ -644,9 +588,9 @@ test "start runs command through platform shell and logs output + exit" {
     defer stop();
 
     // Wait up to 5s for the command to finish and the exit line to land
-    const deadline = std.time.milliTimestamp() + 5000;
-    while (isRunning() and std.time.milliTimestamp() < deadline) {
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+    const deadline = rt.milliTimestamp() + 5000;
+    while (isRunning() and rt.milliTimestamp() < deadline) {
+        rt.sleepMs(20);
     }
     try std.testing.expect(!isRunning());
 
@@ -656,9 +600,34 @@ test "start runs command through platform shell and logs output + exit" {
     var saw_exit = false;
     for (dest[0..n]) |line| {
         const text = line.bytes[0..line.len];
-        if (std.mem.eql(u8, std.mem.trimRight(u8, text, " "), "hello")) saw_hello = true;
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, text, " "), "hello")) saw_hello = true;
         if (std.mem.eql(u8, text, "[zlodev] exited (code 0)")) saw_exit = true;
     }
     try std.testing.expect(saw_hello);
     try std.testing.expect(saw_exit);
+}
+
+test "stopChild kills the whole process group" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try start(std.testing.allocator, "sleep 30 & sleep 30");
+    defer stop();
+    const pgid: i32 = @intCast(child_process.?.id.?);
+    stopChild();
+    // kill(-pgid, 0) fails with ESRCH once no process in the group is left
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(-pgid, @enumFromInt(0)));
+}
+
+test "stopChild kills group members that outlive the shell" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // The shell exits at once; the backgrounded sleep keeps running in the
+    // process group with its output detached from our pipes.
+    try start(std.testing.allocator, "sleep 30 >/dev/null 2>&1 &");
+    defer stop();
+    const pgid = child_pgid;
+    const deadline = rt.milliTimestamp() + 5000;
+    while (isRunning() and rt.milliTimestamp() < deadline) rt.sleepMs(20);
+    try std.testing.expect(!isRunning());
+    stopChild();
+    rt.sleepMs(100);
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(-pgid, @enumFromInt(0)));
 }

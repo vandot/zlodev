@@ -1,4 +1,5 @@
 const std = @import("std");
+const rt = @import("rt.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 const log = @import("log.zig");
@@ -253,21 +254,14 @@ fn buildResponse(
 /// Create and bind the DNS UDP socket. Separate from `serve` so startup can
 /// fail before the TUI opens when the port is taken.
 pub fn bind(ip: []const u8, port: u16) !compat.socket_t {
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch |e| {
-        log.err("component=dns op=socket error={any}", .{e});
-        return e;
-    };
-    errdefer compat.closeSocket(sock);
-
     const addr = parseAddr(ip, port) catch |e| {
         log.err("component=dns op=addr_parse error={any}", .{e});
         return e;
     };
-    posix.bind(sock, &addr.any, addr.getOsSockLen()) catch |e| {
+    return compat.udpBind(addr) catch |e| {
         log.err("component=dns op=bind ip={s} port={d} error={any}", .{ ip, port, e });
         return e;
     };
-    return sock;
 }
 
 /// Answer queries on a socket from `bind` until shutdown. Takes ownership of `sock`.
@@ -280,26 +274,24 @@ pub fn serve(sock: compat.socket_t, ip: []const u8, port: u16, tld: []const u8) 
     var resp_buf: [512]u8 = undefined;
 
     while (shutdown.isRunning()) {
-        // Poll with 1-second timeout before recvfrom
-        var fds = [1]posix.pollfd{
-            .{ .fd = sock, .events = posix.POLL.IN, .revents = 0 },
+        // Poll with 1-second timeout before receive
+        var fds = [1]compat.pollfd{
+            .{ .fd = sock, .events = compat.POLL.IN, .revents = 0 },
         };
-        const ready = posix.poll(&fds, 1000) catch |e| {
+        const ready = compat.poll(&fds, 1000) catch |e| {
             log.err("component=dns op=poll error={any}", .{e});
             continue;
         };
         if (ready == 0) continue; // timeout, re-check shutdown
 
-        var src_addr: posix.sockaddr.in = undefined;
-        var src_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-        const n = posix.recvfrom(sock, &recv_buf, 0, @ptrCast(&src_addr), &src_addr_len) catch |e| {
+        const msg = compat.recvFrom(sock, &recv_buf) catch |e| {
             log.err("component=dns op=recvfrom error={any}", .{e});
             continue;
         };
 
-        if (n < 12) continue; // Too small for DNS header
+        if (msg.data.len < 12) continue; // Too small for DNS header
 
-        const data = recv_buf[0..n];
+        const data = msg.data;
         const header = parseHeader(data);
         if (header.qd_count == 0) continue;
 
@@ -307,15 +299,15 @@ pub fn serve(sock: compat.socket_t, ip: []const u8, port: u16, tld: []const u8) 
         const resp_len = buildResponse(data, question, header, tld, &resp_buf);
         if (resp_len == 0) continue;
 
-        _ = posix.sendto(sock, resp_buf[0..resp_len], 0, @ptrCast(&src_addr), src_addr_len) catch |e| {
+        compat.sendTo(sock, msg.from, resp_buf[0..resp_len]) catch |e| {
             log.err("component=dns op=sendto error={any}", .{e});
             continue;
         };
     }
 }
 
-fn parseAddr(ip: []const u8, port: u16) !std.net.Address {
-    return try std.net.Address.parseIp4(ip, port);
+fn parseAddr(ip: []const u8, port: u16) !std.Io.net.IpAddress {
+    return try std.Io.net.IpAddress.parseIp4(ip, port);
 }
 
 pub fn systemProbe() struct { ip: []const u8, port: u16 } {
@@ -385,7 +377,7 @@ pub fn uninstall(allocator: std.mem.Allocator, tld: []const u8) !void {
             try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.network" });
             try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.netdev" });
             // Only delete interface if it exists
-            if (std.fs.accessAbsolute("/sys/class/net/zlodev0", .{})) |_| {
+            if (std.Io.Dir.accessAbsolute(rt.io(), "/sys/class/net/zlodev0", .{})) |_| {
                 sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
             } else |_| {}
             sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" }) catch {};
@@ -620,7 +612,7 @@ test "writeU32" {
 
 test "parseQuestion rejects compression pointers" {
     // Craft a packet with a compression pointer (0xC0) where a label length should be
-    var pkt: [20]u8 = .{0} ** 20;
+    var pkt: [20]u8 = @splat(0);
     // Header (12 bytes)
     pkt[4] = 0; pkt[5] = 1; // QDCOUNT = 1
     // QNAME starting at byte 12: compression pointer instead of label
@@ -628,4 +620,10 @@ test "parseQuestion rejects compression pointers" {
     pkt[13] = 0x00; // pointer offset
     const result = parseQuestion(&pkt);
     try std.testing.expect(result == null);
+}
+
+test "bind reports AddressInUse when the port is taken" {
+    const first = try bind("127.0.0.1", 53535);
+    defer compat.closeSocket(first);
+    try std.testing.expectError(error.AddressInUse, bind("127.0.0.1", 53535));
 }

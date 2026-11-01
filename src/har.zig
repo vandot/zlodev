@@ -1,10 +1,11 @@
 const std = @import("std");
+const rt = @import("rt.zig");
 const requests = @import("requests.zig");
 
 /// Export visible requests as a HAR file. Writes filename to fname_out, returns length or null on failure.
 pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: []const u8, fname_out: *[64]u8) ?usize {
     // Generate filename with timestamp
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = rt.milliTimestamp();
     const now_s: u64 = if (now_ms > 0) @intCast(@divTrunc(now_ms, 1000)) else 0;
     const epoch_secs = std.time.epoch.EpochSeconds{ .secs = now_s };
     const epoch_day = epoch_secs.getEpochDay();
@@ -21,14 +22,14 @@ pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: [
         day_secs.getSecondsIntoMinute(),
     }) catch return null;
 
-    const file = std.fs.cwd().createFile(fname, .{}) catch return null;
-    defer file.close();
+    const file = std.Io.Dir.cwd().createFile(rt.io(), fname, .{}) catch return null;
+    defer file.close(rt.io());
     const wr = struct {
-        fn writeAll(f: std.fs.File, data: []const u8) !void {
-            try f.writeAll(data);
+        fn writeAll(f: std.Io.File, data: []const u8) !void {
+            try f.writeStreamingAll(rt.io(), data);
         }
-        fn writeByte(f: std.fs.File, byte: u8) !void {
-            try f.writeAll(&.{byte});
+        fn writeByte(f: std.Io.File, byte: u8) !void {
+            try f.writeStreamingAll(rt.io(), &.{byte});
         }
     };
 
@@ -112,44 +113,44 @@ pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: [
     return fname.len;
 }
 
-fn writeJsonEscapedFile(f: std.fs.File, data: []const u8) !void {
+fn writeJsonEscapedFile(f: std.Io.File, data: []const u8) !void {
     for (data) |ch| {
         switch (ch) {
-            '"' => try f.writeAll("\\\""),
-            '\\' => try f.writeAll("\\\\"),
-            '\n' => try f.writeAll("\\n"),
-            '\r' => try f.writeAll("\\r"),
-            '\t' => try f.writeAll("\\t"),
+            '"' => try f.writeStreamingAll(rt.io(), "\\\""),
+            '\\' => try f.writeStreamingAll(rt.io(), "\\\\"),
+            '\n' => try f.writeStreamingAll(rt.io(), "\\n"),
+            '\r' => try f.writeStreamingAll(rt.io(), "\\r"),
+            '\t' => try f.writeStreamingAll(rt.io(), "\\t"),
             else => {
                 if (ch < 0x20) {
                     var esc_buf: [6]u8 = undefined;
                     const esc = std.fmt.bufPrint(&esc_buf, "\\u{x:0>4}", .{ch}) catch continue;
-                    try f.writeAll(esc);
+                    try f.writeStreamingAll(rt.io(), esc);
                 } else {
-                    try f.writeAll(&.{ch});
+                    try f.writeStreamingAll(rt.io(), &.{ch});
                 }
             },
         }
     }
 }
 
-fn writeHeadersJsonFile(f: std.fs.File, raw_headers: []const u8) !void {
+fn writeHeadersJsonFile(f: std.Io.File, raw_headers: []const u8) !void {
     var iter = std.mem.splitSequence(u8, raw_headers, "\r\n");
     var first = true;
     while (iter.next()) |header| {
         if (header.len == 0) continue;
-        if (!first) try f.writeAll(",");
+        if (!first) try f.writeStreamingAll(rt.io(), ",");
         first = false;
         if (std.mem.indexOf(u8, header, ": ")) |sep| {
-            try f.writeAll("{\"name\":\"");
+            try f.writeStreamingAll(rt.io(), "{\"name\":\"");
             try writeJsonEscapedFile(f, header[0..sep]);
-            try f.writeAll("\",\"value\":\"");
+            try f.writeStreamingAll(rt.io(), "\",\"value\":\"");
             try writeJsonEscapedFile(f, header[sep + 2 ..]);
-            try f.writeAll("\"}");
+            try f.writeStreamingAll(rt.io(), "\"}");
         } else {
-            try f.writeAll("{\"name\":\"");
+            try f.writeStreamingAll(rt.io(), "{\"name\":\"");
             try writeJsonEscapedFile(f, header);
-            try f.writeAll("\",\"value\":\"\"}");
+            try f.writeStreamingAll(rt.io(), "\",\"value\":\"\"}");
         }
     }
 }
@@ -162,24 +163,24 @@ const testing = std.testing;
 fn escapeToString(input: []const u8, buf: []u8) ![]const u8 {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const f = try tmp.dir.createFile("esc_test", .{ .read = true });
-    defer f.close();
-    try writeJsonEscapedFile(f, input);
-    try f.seekTo(0);
-    const n = try f.readAll(buf);
-    return buf[0..n];
+    {
+        const f = try tmp.dir.createFile(rt.io(), "esc_test", .{});
+        defer f.close(rt.io());
+        try writeJsonEscapedFile(f, input);
+    }
+    return tmp.dir.readFile(rt.io(), "esc_test", buf);
 }
 
 /// Helper: write headers JSON to a buffer via a temp file, return the result.
 fn headersToString(input: []const u8, buf: []u8) ![]const u8 {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const f = try tmp.dir.createFile("hdr_test", .{ .read = true });
-    defer f.close();
-    try writeHeadersJsonFile(f, input);
-    try f.seekTo(0);
-    const n = try f.readAll(buf);
-    return buf[0..n];
+    {
+        const f = try tmp.dir.createFile(rt.io(), "hdr_test", .{});
+        defer f.close(rt.io());
+        try writeHeadersJsonFile(f, input);
+    }
+    return tmp.dir.readFile(rt.io(), "hdr_test", buf);
 }
 
 test "writeJsonEscapedFile plain text" {
@@ -275,11 +276,9 @@ test "exportHar produces valid JSON structure" {
         return error.TestUnexpectedResult;
     };
     const fname = fname_buf[0..fname_len];
-    defer std.fs.cwd().deleteFile(fname) catch {};
+    defer std.Io.Dir.cwd().deleteFile(rt.io(), fname) catch {};
 
-    const file = std.fs.cwd().openFile(fname, .{}) catch return error.TestUnexpectedResult;
-    defer file.close();
-    const content = file.readToEndAlloc(testing.allocator, 1024 * 1024) catch return error.TestUnexpectedResult;
+    const content = std.Io.Dir.cwd().readFileAlloc(rt.io(), fname, testing.allocator, .limited(1024 * 1024)) catch return error.TestUnexpectedResult;
     defer testing.allocator.free(content);
 
     // Verify it starts and ends correctly
@@ -303,11 +302,9 @@ test "exportHar with empty entries" {
         return error.TestUnexpectedResult;
     };
     const fname = fname_buf[0..fname_len];
-    defer std.fs.cwd().deleteFile(fname) catch {};
+    defer std.Io.Dir.cwd().deleteFile(rt.io(), fname) catch {};
 
-    const file = std.fs.cwd().openFile(fname, .{}) catch return error.TestUnexpectedResult;
-    defer file.close();
-    const content = file.readToEndAlloc(testing.allocator, 1024 * 1024) catch return error.TestUnexpectedResult;
+    const content = std.Io.Dir.cwd().readFileAlloc(rt.io(), fname, testing.allocator, .limited(1024 * 1024)) catch return error.TestUnexpectedResult;
     defer testing.allocator.free(content);
 
     try testing.expectEqualStrings("{\"log\":{\"version\":\"1.2\",\"creator\":{\"name\":\"zlodev\",\"version\":\"1.0\"},\"entries\":[]}}", content);
@@ -323,7 +320,7 @@ test "exportHar filename format" {
         return error.TestUnexpectedResult;
     };
     const fname = fname_buf[0..fname_len];
-    defer std.fs.cwd().deleteFile(fname) catch {};
+    defer std.Io.Dir.cwd().deleteFile(rt.io(), fname) catch {};
 
     // Filename should match pattern: zlodev_YYYYMMDD_HHMMSS.har
     try testing.expect(std.mem.startsWith(u8, fname, "zlodev_"));

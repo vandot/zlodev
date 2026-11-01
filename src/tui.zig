@@ -1,4 +1,6 @@
 const std = @import("std");
+const rt = @import("rt.zig");
+const win32 = @import("win32.zig");
 const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const requests = @import("requests.zig");
@@ -28,13 +30,13 @@ const EditState = struct {
     field: EditField = .method,
     hold: ?requests.EditableHold = null,
     // Editable buffers
-    method_buf: [7]u8 = .{0} ** 7,
+    method_buf: [7]u8 = @splat(0),
     method_len: usize = 0,
-    path_buf: [512]u8 = .{0} ** 512,
+    path_buf: [512]u8 = @splat(0),
     path_len: usize = 0,
-    headers_buf: [requests.max_header_len]u8 = .{0} ** requests.max_header_len,
+    headers_buf: [requests.max_header_len]u8 = @splat(0),
     headers_len: usize = 0,
-    body_buf: [requests.max_body_len]u8 = .{0} ** requests.max_body_len,
+    body_buf: [requests.max_body_len]u8 = @splat(0),
     body_len: usize = 0,
     // Cursor position (byte offset into active field)
     cursor: usize = 0,
@@ -377,10 +379,10 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     defer alloc.free(ca_text);
 
     var tty_buf: [4096]u8 = undefined;
-    var tty = try vaxis.Tty.init(&tty_buf);
+    var tty = try vaxis.Tty.init(rt.io(), &tty_buf);
     defer tty.deinit();
 
-    var vx = try vaxis.init(alloc, .{});
+    var vx = try vaxis.init(rt.io(), alloc, rt.env_map.?, .{});
     defer {
         vx.deinit(alloc, tty.writer());
         tty.writer().flush() catch {};
@@ -389,14 +391,12 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
             // Wait briefly for responses to arrive, then flush the console input
             // buffer before tty.deinit() re-enables ECHO_INPUT — otherwise the
             // response bytes (e.g. "0n") get echoed to the terminal.
-            std.Thread.sleep(50 * std.time.ns_per_ms);
-            const c = @cImport(@cInclude("windows.h"));
-            _ = c.FlushConsoleInputBuffer(c.GetStdHandle(c.STD_INPUT_HANDLE));
+            rt.sleepMs(50);
+            if (win32.GetStdHandle(win32.STD_INPUT_HANDLE)) |h| _ = win32.FlushConsoleInputBuffer(h);
         }
     }
 
-    var loop: vaxis.Loop(Event) = .{ .tty = &tty, .vaxis = &vx };
-    try loop.init();
+    var loop: vaxis.Loop(Event) = .init(rt.io(), &tty, &vx);
     try loop.start();
     defer loop.stop();
 
@@ -404,7 +404,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     // Skip terminal query on Windows — the response bytes leak through as
     // spurious key events and as "0n" printed on exit.
     if (builtin.os.tag != .windows) {
-        try vx.queryTerminal(tty.writer(), 1 * std.time.ns_per_s);
+        try vx.queryTerminal(tty.writer(), .fromSeconds(1));
     }
 
     var cursor: usize = 0;
@@ -430,10 +430,10 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     var show_body: bool = false;
     var edit_state: EditState = .{};
     var search_mode: bool = false;
-    var search_buf: [128]u8 = .{0} ** 128;
+    var search_buf: [128]u8 = @splat(0);
     var search_len: usize = 0;
     var intercept_mode: bool = false;
-    var intercept_buf: [intercept.max_pattern_len]u8 = .{0} ** intercept.max_pattern_len;
+    var intercept_buf: [intercept.max_pattern_len]u8 = @splat(0);
     var intercept_len: usize = 0;
     var filtered_count: usize = 0;
     // Maps filtered index -> original index in ptr_buf
@@ -446,7 +446,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     var ptr_buf: [requests.max_entries]*const requests.Entry = undefined;
 
     while (true) {
-        while (loop.tryEvent()) |event| {
+        while (try loop.tryEvent()) |event| {
             switch (event) {
                 .key_press => |key| {
                     if (key.matches('c', .{ .ctrl = true })) return;
@@ -600,7 +600,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 const msg = "Copied as curl!";
                                 @memcpy(flash_buf[0..msg.len], msg);
                                 flash_len = msg.len;
-                                flash_time = std.time.milliTimestamp();
+                                flash_time = rt.milliTimestamp();
                             }
                             if (key.matches('E', .{})) {
                                 var export_buf: [requests.max_entries]*const requests.Entry = undefined;
@@ -617,7 +617,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
                                 }
-                                flash_time = std.time.milliTimestamp();
+                                flash_time = rt.milliTimestamp();
                             }
                             if (key.matches('r', .{}) and filtered_count > 0) {
                                 if (edit_state.openForReplay(alloc, filter_map[cursor])) view = .edit;
@@ -628,13 +628,13 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                     const msg = "Restarting...";
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
-                                    flash_time = std.time.milliTimestamp();
+                                    flash_time = rt.milliTimestamp();
                                 } else if (filtered_count > 0) {
                                     replayEntry(filter_map[cursor]);
                                     const msg = "Replayed!";
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
-                                    flash_time = std.time.milliTimestamp();
+                                    flash_time = rt.milliTimestamp();
                                 }
                             }
                             if (key.matches('e', .{}) and filtered_count > 0) {
@@ -679,7 +679,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 const msg = "Copied as curl!";
                                 @memcpy(flash_buf[0..msg.len], msg);
                                 flash_len = msg.len;
-                                flash_time = std.time.milliTimestamp();
+                                flash_time = rt.milliTimestamp();
                             } else if (key.matches('r', .{})) {
                                 if (edit_state.openForReplay(alloc, detail_index)) view = .edit;
                             } else if (key.matches('R', .{})) {
@@ -687,7 +687,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 const msg = "Replayed!";
                                 @memcpy(flash_buf[0..msg.len], msg);
                                 flash_len = msg.len;
-                                flash_time = std.time.milliTimestamp();
+                                flash_time = rt.milliTimestamp();
                             } else if (key.matches('b', .{})) {
                                 show_body = !show_body;
                                 detail_scroll = 0;
@@ -705,7 +705,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                     const msg = "Replayed!";
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
-                                    flash_time = std.time.milliTimestamp();
+                                    flash_time = rt.milliTimestamp();
                                 }
                                 edit_state.active = false;
                                 view = .list;
@@ -866,7 +866,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
 
         // Flash message (top-right, visible for 2 seconds)
         if (flash_len > 0) {
-            const now = std.time.milliTimestamp();
+            const now = rt.milliTimestamp();
             if (now - flash_time < 2000) {
                 const col: u16 = @intCast(win.width -| (flash_len + 2));
                 const green: vaxis.Color = .{ .rgb = .{ 0x3f, 0xb9, 0x50 } };
@@ -878,7 +878,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
 
         try vx.render(tty.writer());
         accepting_input = true;
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        rt.sleepMs(50);
     }
 }
 
@@ -1091,7 +1091,7 @@ fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Entry, se
     var dur_buf: [16]u8 = undefined;
     const dur_text = if (entry.state == .intercepted) blk: {
         // Show live elapsed time for held requests
-        const now = std.time.milliTimestamp();
+        const now = rt.milliTimestamp();
         const held_ms: u64 = if (now > entry.timestamp) @intCast(now - entry.timestamp) else 0;
         break :blk if (held_ms >= 1000)
             std.fmt.bufPrint(&dur_buf, "{d}s", .{held_ms / 1000}) catch "?"
