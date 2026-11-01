@@ -210,8 +210,13 @@ fn posixError(e: posix.E) SocketError {
     };
 }
 
+var winsock_started: std.atomic.Value(bool) = .init(false);
+
 fn openSocket(fam: u32, kind: u32) SocketError!socket_t {
     if (builtin.os.tag == .windows) {
+        // Start Winsock on first use (tests and helpers may not go through main);
+        // WSAStartup is reference-counted, so a racing second call is harmless.
+        if (!winsock_started.swap(true, .acq_rel)) initNetworking();
         const s = win32.WSASocketW(@intCast(fam), @intCast(kind), 0, null, 0, win32.WSA_FLAG_OVERLAPPED | win32.WSA_FLAG_NO_HANDLE_INHERIT);
         if (@intFromPtr(s) == win32.INVALID_SOCKET) return lastError();
         return s;
