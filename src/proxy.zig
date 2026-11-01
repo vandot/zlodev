@@ -225,10 +225,10 @@ pub fn start(config: *const ProxyConfig, listener: std.Io.net.Server) !void {
     var consecutive_failures: u32 = 0;
     while (shutdown.isRunning()) {
         // Poll with 1-second timeout before accept
-        var fds = [1]posix.pollfd{
-            .{ .fd = server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
+        var fds = [1]compat.pollfd{
+            .{ .fd = server.socket.handle, .events = compat.POLL.IN, .revents = 0 },
         };
-        const ready = posix.poll(&fds, 1000) catch |e| {
+        const ready = compat.poll(&fds, 1000) catch |e| {
             log.err("component=proxy op=poll error={any}", .{e});
             continue;
         };
@@ -1020,28 +1020,28 @@ fn handleWebSocket(
 
     var pipe_buf: [8192]u8 = undefined;
     while (true) {
-        var fds = [2]posix.pollfd{
-            .{ .fd = client_fd, .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = upstream_sock, .events = posix.POLL.IN, .revents = 0 },
+        var fds = [2]compat.pollfd{
+            .{ .fd = client_fd, .events = compat.POLL.IN, .revents = 0 },
+            .{ .fd = upstream_sock, .events = compat.POLL.IN, .revents = 0 },
         };
-        const ready = posix.poll(&fds, 30000) catch break; // 30s timeout
+        const ready = compat.poll(&fds, 30000) catch break; // 30s timeout
         if (ready == 0) break; // timeout
 
         // Client -> upstream
-        if (fds[0].revents & posix.POLL.IN != 0) {
+        if (fds[0].revents & compat.POLL.IN != 0) {
             const n = ssl_c.SSL_read(ssl, @ptrCast(&pipe_buf), @intCast(pipe_buf.len));
             if (n <= 0) break;
             upstream.writeAll(pipe_buf[0..@intCast(n)]) catch break;
         }
-        if (fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) break;
+        if (fds[0].revents & (compat.POLL.HUP | compat.POLL.ERR) != 0) break;
 
         // Upstream -> client
-        if (fds[1].revents & posix.POLL.IN != 0) {
+        if (fds[1].revents & compat.POLL.IN != 0) {
             const n = upstream.read(&pipe_buf) catch break;
             if (n == 0) break;
             sslWriteAll(ssl, pipe_buf[0..n]);
         }
-        if (fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) break;
+        if (fds[1].revents & (compat.POLL.HUP | compat.POLL.ERR) != 0) break;
     }
     requests.unpin(ws_backing_idx);
 }

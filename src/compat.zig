@@ -42,6 +42,20 @@ pub fn fdToSocket(fd: c_int) socket_t {
     }
 }
 
+/// poll() over sockets. Zig 0.17's std.posix.poll no longer covers Windows,
+/// so use WSAPoll there (what 0.15's posix.poll called).
+pub const pollfd = if (builtin.os.tag == .windows) win32.WSAPOLLFD else posix.pollfd;
+pub const POLL = if (builtin.os.tag == .windows) win32.POLL else posix.POLL;
+
+pub fn poll(fds: []pollfd, timeout_ms: i32) !usize {
+    if (builtin.os.tag == .windows) {
+        const rc = win32.WSAPoll(fds.ptr, @intCast(fds.len), timeout_ms);
+        if (rc == win32.SOCKET_ERROR) return error.Unexpected;
+        return @intCast(rc);
+    }
+    return posix.poll(fds, timeout_ms);
+}
+
 /// Initialize Winsock. Must be called before any socket operations on Windows.
 /// No-op on other platforms.
 pub fn initNetworking() void {
@@ -101,4 +115,19 @@ pub const SocketStream = struct {
 pub fn getenv(comptime name: [:0]const u8) ?[]const u8 {
     const result = std.c.getenv(name) orelse return null;
     return std.mem.sliceTo(result, 0);
+}
+
+test "poll reports a readable UDP socket and times out on an idle one" {
+    const io = @import("rt.zig").io();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 53536);
+    const sock = try addr.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+
+    var fds = [1]pollfd{.{ .fd = sock.handle, .events = POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 0), try poll(&fds, 0));
+
+    try sock.send(io, &addr, "ping");
+    fds[0].revents = 0;
+    try std.testing.expectEqual(@as(usize, 1), try poll(&fds, 1000));
+    try std.testing.expect(fds[0].revents & POLL.IN != 0);
 }

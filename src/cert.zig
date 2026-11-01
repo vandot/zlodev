@@ -414,7 +414,7 @@ fn appendToGitCaBundle(allocator: std.mem.Allocator, ca_pem_path: []const u8) vo
     if (std.mem.indexOf(u8, bundle_content, "# BEGIN zlodev CA") != null) return;
 
     // Build new content in memory
-    var new_content = std.ArrayListUnmanaged(u8){};
+    var new_content: std.ArrayListUnmanaged(u8) = .empty;
     defer new_content.deinit(allocator);
     new_content.appendSlice(allocator, bundle_content) catch return;
     new_content.appendSlice(allocator, ca_bundle_marker_begin) catch return;

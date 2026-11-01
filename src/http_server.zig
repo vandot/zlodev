@@ -36,10 +36,10 @@ pub fn serve(listener: std.Io.net.Server, bind_addr: []const u8, domain: []const
     var consecutive_failures: u32 = 0;
     while (shutdown.isRunning()) {
         // Poll with 1-second timeout before accept
-        var fds = [1]posix.pollfd{
-            .{ .fd = server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
+        var fds = [1]compat.pollfd{
+            .{ .fd = server.socket.handle, .events = compat.POLL.IN, .revents = 0 },
         };
-        const ready = posix.poll(&fds, 1000) catch |e| {
+        const ready = compat.poll(&fds, 1000) catch |e| {
             log.err("component=http op=poll error={any}", .{e});
             continue;
         };

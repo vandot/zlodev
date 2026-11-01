@@ -275,10 +275,10 @@ pub fn serve(sock: std.Io.net.Socket, ip: []const u8, port: u16, tld: []const u8
 
     while (shutdown.isRunning()) {
         // Poll with 1-second timeout before receive
-        var fds = [1]posix.pollfd{
-            .{ .fd = sock.handle, .events = posix.POLL.IN, .revents = 0 },
+        var fds = [1]compat.pollfd{
+            .{ .fd = sock.handle, .events = compat.POLL.IN, .revents = 0 },
         };
-        const ready = posix.poll(&fds, 1000) catch |e| {
+        const ready = compat.poll(&fds, 1000) catch |e| {
             log.err("component=dns op=poll error={any}", .{e});
             continue;
         };

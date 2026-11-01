@@ -32,6 +32,17 @@ pub extern "ws2_32" fn WSAStartup(version: u16, data: *WSADATA) callconv(.winapi
 pub extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
 pub extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
 pub extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
+pub const WSAPOLLFD = extern struct {
+    fd: SOCKET,
+    events: i16,
+    revents: i16,
+};
+pub const POLL = struct {
+    pub const IN: i16 = 0x0300; // POLLRDNORM | POLLRDBAND
+    pub const ERR: i16 = 0x0001;
+    pub const HUP: i16 = 0x0002;
+};
+pub extern "ws2_32" fn WSAPoll(fds: [*]WSAPOLLFD, nfds: u32, timeout: i32) callconv(.winapi) c_int;
 pub extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
 
 // Job objects: `--command` puts cmd.exe in a kill-on-close job so stop/restart
