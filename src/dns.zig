@@ -253,20 +253,20 @@ fn buildResponse(
 
 /// Create and bind the DNS UDP socket. Separate from `serve` so startup can
 /// fail before the TUI opens when the port is taken.
-pub fn bind(ip: []const u8, port: u16) !std.Io.net.Socket {
+pub fn bind(ip: []const u8, port: u16) !compat.socket_t {
     const addr = parseAddr(ip, port) catch |e| {
         log.err("component=dns op=addr_parse error={any}", .{e});
         return e;
     };
-    return addr.bind(rt.io(), .{ .mode = .dgram }) catch |e| {
+    return compat.udpBind(addr) catch |e| {
         log.err("component=dns op=bind ip={s} port={d} error={any}", .{ ip, port, e });
         return e;
     };
 }
 
 /// Answer queries on a socket from `bind` until shutdown. Takes ownership of `sock`.
-pub fn serve(sock: std.Io.net.Socket, ip: []const u8, port: u16, tld: []const u8) void {
-    defer sock.close(rt.io());
+pub fn serve(sock: compat.socket_t, ip: []const u8, port: u16, tld: []const u8) void {
+    defer compat.closeSocket(sock);
 
     log.info("component=dns op=listening ip={s} port={d}", .{ ip, port });
 
@@ -276,7 +276,7 @@ pub fn serve(sock: std.Io.net.Socket, ip: []const u8, port: u16, tld: []const u8
     while (shutdown.isRunning()) {
         // Poll with 1-second timeout before receive
         var fds = [1]compat.pollfd{
-            .{ .fd = sock.handle, .events = compat.POLL.IN, .revents = 0 },
+            .{ .fd = sock, .events = compat.POLL.IN, .revents = 0 },
         };
         const ready = compat.poll(&fds, 1000) catch |e| {
             log.err("component=dns op=poll error={any}", .{e});
@@ -284,7 +284,7 @@ pub fn serve(sock: std.Io.net.Socket, ip: []const u8, port: u16, tld: []const u8
         };
         if (ready == 0) continue; // timeout, re-check shutdown
 
-        const msg = sock.receive(rt.io(), &recv_buf) catch |e| {
+        const msg = compat.recvFrom(sock, &recv_buf) catch |e| {
             log.err("component=dns op=recvfrom error={any}", .{e});
             continue;
         };
@@ -299,7 +299,7 @@ pub fn serve(sock: std.Io.net.Socket, ip: []const u8, port: u16, tld: []const u8
         const resp_len = buildResponse(data, question, header, tld, &resp_buf);
         if (resp_len == 0) continue;
 
-        sock.send(rt.io(), &msg.from, resp_buf[0..resp_len]) catch |e| {
+        compat.sendTo(sock, msg.from, resp_buf[0..resp_len]) catch |e| {
             log.err("component=dns op=sendto error={any}", .{e});
             continue;
         };
@@ -624,6 +624,6 @@ test "parseQuestion rejects compression pointers" {
 
 test "bind reports AddressInUse when the port is taken" {
     const first = try bind("127.0.0.1", 53535);
-    defer first.close(rt.io());
+    defer compat.closeSocket(first);
     try std.testing.expectError(error.AddressInUse, bind("127.0.0.1", 53535));
 }

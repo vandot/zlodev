@@ -456,7 +456,7 @@ fn doStart(
     // conflict is reported on the normal screen and zlodev exits instead of
     // running half-started.
     const probe = dns.systemProbe();
-    const dns_sock: ?std.Io.net.Socket = if (local) null else dns.bind(probe.ip, probe.port) catch |e|
+    const dns_sock: ?compat.socket_t = if (local) null else dns.bind(probe.ip, probe.port) catch |e|
         exitBindError("DNS", probe.ip, probe.port, e);
     const http_listener = http_server.listen(bind_owned) catch |e| exitBindError("HTTP", bind_owned, 80, e);
     const https_listener = proxy.listen(bind_owned) catch |e| exitBindError("HTTPS", bind_owned, 443, e);
@@ -476,7 +476,7 @@ fn doStart(
     var dns_thread: ?std.Thread = null;
     if (dns_sock) |sock| {
         dns_thread = try std.Thread.spawn(.{}, struct {
-            fn run(s: std.Io.net.Socket, ip: []const u8, port: u16, t: []const u8) void {
+            fn run(s: compat.socket_t, ip: []const u8, port: u16, t: []const u8) void {
                 dns.serve(s, ip, port, t);
             }
         }.run, .{ sock, probe.ip, probe.port, tld_owned });
@@ -484,7 +484,7 @@ fn doStart(
 
     // Start HTTP server
     const http_thread = try std.Thread.spawn(.{}, struct {
-        fn run(l: std.Io.net.Server, addr: []const u8, d: []const u8, ca_pem: []const u8, ca_der: []const u8) void {
+        fn run(l: compat.socket_t, addr: []const u8, d: []const u8, ca_pem: []const u8, ca_der: []const u8) void {
             http_server.serve(l, addr, d, ca_pem, ca_der);
         }
     }.run, .{ http_listener, bind_owned, domain_owned, ca_pem_owned, ca_der_owned });
@@ -503,7 +503,7 @@ fn doStart(
         .domain = domain_owned,
     };
     const proxy_thread = try std.Thread.spawn(.{}, struct {
-        fn run(cfg: *const proxy.ProxyConfig, l: std.Io.net.Server) void {
+        fn run(cfg: *const proxy.ProxyConfig, l: compat.socket_t) void {
             proxy.start(cfg, l) catch |e| {
                 log.err("component=proxy op=start error={any}", .{e});
             };
@@ -740,8 +740,8 @@ fn getHostname(buf: *[hostname_max]u8) []const u8 {
 
 fn isPortListening(bind_addr: []const u8, port: u16) bool {
     const addr = std.Io.net.IpAddress.parse(bind_addr, port) catch return false;
-    const stream = addr.connect(rt.io(), .{ .mode = .stream }) catch return false;
-    stream.close(rt.io());
+    const sock = compat.tcpConnect(addr) catch return false;
+    compat.closeSocket(sock);
     return true;
 }
 

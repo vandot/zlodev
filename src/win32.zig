@@ -43,6 +43,29 @@ pub const POLL = struct {
     pub const HUP: i16 = 0x0002;
 };
 pub extern "ws2_32" fn WSAPoll(fds: [*]WSAPOLLFD, nfds: u32, timeout: i32) callconv(.winapi) c_int;
+pub const INVALID_SOCKET: usize = std.math.maxInt(usize);
+pub const WSA_FLAG_OVERLAPPED: u32 = 0x01;
+pub const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
+pub const ADDRINFOA = extern struct {
+    flags: i32,
+    family: i32,
+    socktype: i32,
+    protocol: i32,
+    addrlen: usize,
+    canonname: ?[*:0]u8,
+    addr: ?*std.c.sockaddr,
+    next: ?*ADDRINFOA,
+};
+pub extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+pub extern "ws2_32" fn WSASocketW(af: c_int, kind: c_int, protocol: c_int, info: ?*anyopaque, g: u32, flags: u32) callconv(.winapi) SOCKET;
+pub extern "ws2_32" fn bind(s: SOCKET, name: *const anyopaque, namelen: c_int) callconv(.winapi) c_int;
+pub extern "ws2_32" fn listen(s: SOCKET, backlog: c_int) callconv(.winapi) c_int;
+pub extern "ws2_32" fn accept(s: SOCKET, addr: ?*anyopaque, addrlen: ?*c_int) callconv(.winapi) SOCKET;
+pub extern "ws2_32" fn connect(s: SOCKET, name: *const anyopaque, namelen: c_int) callconv(.winapi) c_int;
+pub extern "ws2_32" fn recvfrom(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int, from: ?*anyopaque, fromlen: ?*c_int) callconv(.winapi) c_int;
+pub extern "ws2_32" fn sendto(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int, to: *const anyopaque, tolen: c_int) callconv(.winapi) c_int;
+pub extern "ws2_32" fn getaddrinfo(node: [*:0]const u8, service: ?[*:0]const u8, hints: ?*const ADDRINFOA, res: *?*ADDRINFOA) callconv(.winapi) c_int;
+pub extern "ws2_32" fn freeaddrinfo(res: *ADDRINFOA) callconv(.winapi) void;
 pub extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
 
 // Job objects: `--command` puts cmd.exe in a kill-on-close job so stop/restart
