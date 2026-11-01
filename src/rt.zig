@@ -31,6 +31,21 @@ pub fn sleepMs(ms: u64) void {
     io().sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
 }
 
+/// Run `work(args)` on a worker thread from `group`; if the Io's concurrency
+/// limit is reached, run `reject(reject_args)` inline instead (closes the socket).
+pub fn spawnWorker(
+    io_: std.Io,
+    group: *std.Io.Group,
+    comptime work: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(work)),
+    comptime reject: anytype,
+    reject_args: std.meta.ArgsTuple(@TypeOf(reject)),
+) void {
+    group.concurrent(io_, work, args) catch {
+        @call(.auto, reject, reject_args);
+    };
+}
+
 test "milliTimestamp is wall clock and monotone enough" {
     const a = milliTimestamp();
     sleepMs(5);
@@ -43,4 +58,20 @@ test "timestamp seconds matches millis" {
     const s = timestamp();
     const ms = milliTimestamp();
     try std.testing.expect(@abs(@divTrunc(ms, 1000) - s) <= 1);
+}
+
+test "spawnWorker closes the connection when concurrency is unavailable" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    defer threaded.deinit();
+    var group: std.Io.Group = .init;
+    var closed = false;
+    const Ctx = struct {
+        fn work(_: *bool) void {}
+        fn reject(flag: *bool) void {
+            flag.* = true;
+        }
+    };
+    spawnWorker(threaded.io(), &group, Ctx.work, .{&closed}, Ctx.reject, .{&closed});
+    group.await(threaded.io()) catch {};
+    try std.testing.expect(closed);
 }

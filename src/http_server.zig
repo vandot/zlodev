@@ -3,31 +3,33 @@ const posix = std.posix;
 const log = @import("log.zig");
 const shutdown = @import("shutdown.zig");
 const compat = @import("compat.zig");
+const rt = @import("rt.zig");
+const builtin = @import("builtin");
+const win32 = @import("win32.zig");
 
 /// Bind the HTTP listener on port 80. Separate from `serve` so startup can
 /// fail before the TUI opens when the port is taken.
-pub fn listen(bind_addr: []const u8) !std.net.Server {
-    const address = std.net.Address.parseIp(bind_addr, 80) catch |e| {
+pub fn listen(bind_addr: []const u8) !std.Io.net.Server {
+    const address = std.Io.net.IpAddress.parse(bind_addr, 80) catch |e| {
         log.err("component=http op=addr_parse error={any}", .{e});
         return e;
     };
-    return address.listen(.{ .reuse_address = true }) catch |e| {
+    return address.listen(rt.io(), .{ .reuse_address = true }) catch |e| {
         log.err("component=http op=bind port=80 error={any}", .{e});
         return e;
     };
 }
 
-/// Serve on a listener from `listen` until shutdown. Takes ownership of `listener`.
-pub fn serve(listener: std.net.Server, bind_addr: []const u8, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {
-    var server = listener;
-    defer server.deinit();
+var http_workers: std.atomic.Value(u32) = .init(0);
+const max_http_workers = 8;
 
-    var pool: std.Thread.Pool = undefined;
-    pool.init(.{ .allocator = std.heap.page_allocator, .n_jobs = 8 }) catch |e| {
-        log.err("component=http op=pool_init error={any}", .{e});
-        return;
-    };
-    defer pool.deinit();
+/// Serve on a listener from `listen` until shutdown. Takes ownership of `listener`.
+pub fn serve(listener: std.Io.net.Server, bind_addr: []const u8, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {
+    var server = listener;
+    defer server.deinit(rt.io());
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(rt.io());
 
     log.info("component=http op=listening ip={s} port=80 host={s}", .{ bind_addr, domain });
 
@@ -35,7 +37,7 @@ pub fn serve(listener: std.net.Server, bind_addr: []const u8, domain: []const u8
     while (shutdown.isRunning()) {
         // Poll with 1-second timeout before accept
         var fds = [1]posix.pollfd{
-            .{ .fd = server.stream.handle, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
         };
         const ready = posix.poll(&fds, 1000) catch |e| {
             log.err("component=http op=poll error={any}", .{e});
@@ -43,24 +45,43 @@ pub fn serve(listener: std.net.Server, bind_addr: []const u8, domain: []const u8
         };
         if (ready == 0) continue; // timeout, re-check shutdown
 
-        const conn = server.accept() catch |e| {
+        const conn = server.accept(rt.io()) catch |e| {
             log.err("component=http op=accept error={any}", .{e});
             consecutive_failures += 1;
             const backoff_ms: u64 = @min(5000, @as(u64, 100) << @intCast(@min(consecutive_failures, 6)));
-            std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+            rt.sleepMs(backoff_ms);
             continue;
         };
         consecutive_failures = 0;
 
-        // Set receive timeout to prevent slow clients from exhausting the thread pool
-        const timeout = posix.timeval{ .sec = 5, .usec = 0 };
-        posix.setsockopt(conn.stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        // Set receive timeout to prevent slow clients from exhausting the workers
+        setRecvTimeout(conn.socket.handle, 5);
 
-        const stream = compat.SocketStream{ .handle = conn.stream.handle };
-        pool.spawn(handleRequest, .{ stream, domain, ca_pem_path, ca_der_path }) catch |e| {
-            log.err("component=http op=pool_spawn error={any}", .{e});
+        const stream = compat.SocketStream{ .handle = conn.socket.handle };
+        if (http_workers.fetchAdd(1, .acq_rel) >= max_http_workers) {
+            _ = http_workers.fetchSub(1, .acq_rel);
+            log.err("component=http op=pool_spawn error=busy", .{});
             stream.close();
-        };
+            continue;
+        }
+        rt.spawnWorker(rt.io(), &group, handleRequest, .{ stream, domain, ca_pem_path, ca_der_path }, rejectRequest, .{stream});
+    }
+}
+
+fn rejectRequest(stream: compat.SocketStream) void {
+    _ = http_workers.fetchSub(1, .acq_rel);
+    log.err("component=http op=pool_spawn error=ConcurrencyUnavailable", .{});
+    stream.close();
+}
+
+fn setRecvTimeout(sock: compat.socket_t, seconds: u32) void {
+    if (builtin.os.tag == .windows) {
+        // Windows SO_RCVTIMEO takes DWORD milliseconds
+        const bytes = std.mem.toBytes(@as(u32, seconds * 1000));
+        _ = win32.setsockopt(sock, 0xffff, 0x1006, &bytes, bytes.len); // SOL_SOCKET, SO_RCVTIMEO
+    } else {
+        const timeout = posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
+        posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
     }
 }
 
@@ -85,6 +106,7 @@ fn detectPlatform(headers: []const u8) Platform {
 }
 
 fn handleRequest(stream: compat.SocketStream, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {
+    defer _ = http_workers.fetchSub(1, .acq_rel);
     defer stream.close();
 
     // Read request
@@ -261,9 +283,7 @@ const ca_page_desktop = ca_page_style ++
 ;
 
 fn serveFile(stream: compat.SocketStream, file_path: []const u8, content_type: []const u8, filename: []const u8) !void {
-    const file = try std.fs.openFileAbsolute(file_path, .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(std.heap.page_allocator, 1024 * 1024);
+    const content = try std.Io.Dir.cwd().readFileAlloc(rt.io(), file_path, std.heap.page_allocator, .limited(1024 * 1024));
     defer std.heap.page_allocator.free(content);
 
     var resp_buf: [512]u8 = undefined;
@@ -283,4 +303,13 @@ fn sendError(stream: compat.SocketStream, status: []const u8) void {
     const response = std.fmt.bufPrint(&buf,
         "HTTP/1.1 {s}\r\nContent-Length: 0\r\n\r\n", .{status}) catch return;
     stream.writeAll(response) catch {};
+}
+
+test "listen reports AddressInUse when another process holds the port" {
+    // The other process (python, nginx, ...) binds without SO_REUSEPORT; zlodev's
+    // own listen uses reuse_address, exactly like `listen` above.
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 18080);
+    var other = try addr.listen(rt.io(), .{});
+    defer other.deinit(rt.io());
+    try std.testing.expectError(error.AddressInUse, addr.listen(rt.io(), .{ .reuse_address = true }));
 }
