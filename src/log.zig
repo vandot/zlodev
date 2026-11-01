@@ -2,10 +2,13 @@ const std = @import("std");
 const sep = std.fs.path.sep_str;
 const builtin = @import("builtin");
 const compat = @import("compat.zig");
+const rt = @import("rt.zig");
 
 var muted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-var log_file: ?std.fs.File = null;
-var log_mutex: std.Thread.Mutex = .{};
+var log_file: ?std.Io.File = null;
+// Append position in log_file; std.Io.File has no seek, so writes are positional.
+var log_offset: u64 = 0;
+var log_mutex: std.Io.Mutex = .init;
 
 pub fn mute() void {
     muted.store(true, .release);
@@ -24,24 +27,24 @@ fn getHomeDir() ?[]const u8 {
 
 pub fn initLogFile() void {
     const home = getHomeDir() orelse return;
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir_path = std.fmt.bufPrint(&path_buf, "{s}" ++ sep ++ ".zlodev", .{home}) catch return;
-    std.fs.makeDirAbsolute(dir_path) catch |e| switch (e) {
+    std.Io.Dir.createDirAbsolute(rt.io(), dir_path, .default_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return,
     };
-    var file_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const file_path = std.fmt.bufPrint(&file_buf, "{s}" ++ sep ++ ".zlodev" ++ sep ++ "zlodev.log", .{home}) catch return;
-    log_file = std.fs.createFileAbsolute(file_path, .{ .truncate = false }) catch return;
-    // Seek to end for append
+    log_file = std.Io.Dir.createFileAbsolute(rt.io(), file_path, .{ .truncate = false }) catch return;
+    // Append after existing content
     if (log_file) |f| {
-        f.seekFromEnd(0) catch {};
+        log_offset = f.length(rt.io()) catch 0;
     }
 }
 
 pub fn deinitLogFile() void {
     if (log_file) |f| {
-        f.close();
+        f.close(rt.io());
         log_file = null;
     }
 }
@@ -61,9 +64,10 @@ pub fn err(comptime fmt: []const u8, args: anytype) void {
         if (log_file) |f| {
             var line_buf: [4096]u8 = undefined;
             const line = std.fmt.bufPrint(&line_buf, "[{s}] ERROR " ++ fmt ++ "\n", .{ts} ++ args) catch return;
-            log_mutex.lock();
-            defer log_mutex.unlock();
-            f.writeAll(line) catch {};
+            log_mutex.lockUncancelable(rt.io());
+            defer log_mutex.unlock(rt.io());
+            f.writePositionalAll(rt.io(), line, log_offset) catch return;
+            log_offset += line.len;
         }
     } else {
         std.debug.print("[{s}] ERROR " ++ fmt ++ "\n", .{ts} ++ args);
@@ -71,7 +75,7 @@ pub fn err(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn timestamp(buf: *[20]u8) []const u8 {
-    const epoch = std.time.timestamp();
+    const epoch = rt.timestamp();
     const es = std.time.epoch.EpochSeconds{ .secs = @intCast(epoch) };
     const day = es.getDaySeconds();
     const yd = es.getEpochDay().calculateYearDay();

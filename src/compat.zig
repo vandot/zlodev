@@ -94,15 +94,8 @@ pub const SocketStream = struct {
     }
 };
 
-/// Get an environment variable, cross-platform.
-/// On Windows, uses C runtime getenv via libc. On POSIX, uses posix.getenv.
+/// Get an environment variable via the C runtime (we always link libc).
 pub fn getenv(comptime name: [:0]const u8) ?[]const u8 {
-    if (builtin.os.tag == .windows) {
-        const result = std.c.getenv(name);
-        if (result) |ptr| {
-            return std.mem.sliceTo(ptr, 0);
-        }
-        return null;
-    }
-    return posix.getenv(name);
+    const result = std.c.getenv(name) orelse return null;
+    return std.mem.sliceTo(result, 0);
 }
