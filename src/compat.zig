@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const win32 = @import("win32.zig");
 
 pub const socket_t = posix.socket_t;
 
@@ -8,9 +9,9 @@ pub const socket_t = posix.socket_t;
 /// On Windows uses closesocket, on POSIX uses close.
 pub fn closeSocket(sock: socket_t) void {
     if (builtin.os.tag == .windows) {
-        std.os.windows.closesocket(sock) catch {};
+        _ = win32.closesocket(sock);
     } else {
-        posix.close(sock);
+        _ = std.c.close(sock);
     }
 }
 
@@ -45,8 +46,8 @@ pub fn fdToSocket(fd: c_int) socket_t {
 /// No-op on other platforms.
 pub fn initNetworking() void {
     if (builtin.os.tag == .windows) {
-        var wsa_data: std.os.windows.ws2_32.WSADATA = undefined;
-        _ = std.os.windows.ws2_32.WSAStartup(0x0202, &wsa_data);
+        var wsa_data: win32.WSADATA = undefined;
+        _ = win32.WSAStartup(0x0202, &wsa_data);
     }
 }
 
@@ -60,15 +61,14 @@ pub fn getTmpDir() []const u8 {
 
 /// Cross-platform socket stream. On Windows, Zig's std.net.Stream uses ReadFile/
 /// WriteFile which don't work with Winsock sockets. This wrapper uses recv/send
-/// on Windows and delegates to the standard Stream on POSIX.
+/// on Windows and read/write on POSIX.
 pub const SocketStream = struct {
     handle: socket_t,
 
     pub fn read(self: SocketStream, buf: []u8) !usize {
         if (builtin.os.tag == .windows) {
-            const ws2 = std.os.windows.ws2_32;
-            const rc = ws2.recv(self.handle, @ptrCast(buf.ptr), @intCast(buf.len), 0);
-            if (rc == ws2.SOCKET_ERROR) return error.Unexpected;
+            const rc = win32.recv(self.handle, buf.ptr, @intCast(buf.len), 0);
+            if (rc == win32.SOCKET_ERROR) return error.Unexpected;
             return @intCast(rc);
         }
         return posix.read(self.handle, buf);
@@ -76,16 +76,19 @@ pub const SocketStream = struct {
 
     pub fn writeAll(self: SocketStream, data: []const u8) !void {
         if (builtin.os.tag == .windows) {
-            const ws2 = std.os.windows.ws2_32;
             var written: usize = 0;
             while (written < data.len) {
-                const rc = ws2.send(self.handle, @ptrCast(data[written..].ptr), @intCast(data.len - written), 0);
-                if (rc == ws2.SOCKET_ERROR) return error.Unexpected;
+                const rc = win32.send(self.handle, data[written..].ptr, @intCast(data.len - written), 0);
+                if (rc == win32.SOCKET_ERROR) return error.Unexpected;
                 written += @intCast(rc);
             }
         } else {
-            const stream = std.net.Stream{ .handle = self.handle };
-            return stream.writeAll(data);
+            var written: usize = 0;
+            while (written < data.len) {
+                const rc = std.c.write(self.handle, data[written..].ptr, data.len - written);
+                if (rc < 0) return error.Unexpected;
+                written += @intCast(rc);
+            }
         }
     }
 
