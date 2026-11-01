@@ -28,13 +28,13 @@ const EditState = struct {
     field: EditField = .method,
     hold: ?requests.EditableHold = null,
     // Editable buffers
-    method_buf: [7]u8 = .{0} ** 7,
+    method_buf: [7]u8 = @splat(0),
     method_len: usize = 0,
-    path_buf: [512]u8 = .{0} ** 512,
+    path_buf: [512]u8 = @splat(0),
     path_len: usize = 0,
-    headers_buf: [requests.max_header_len]u8 = .{0} ** requests.max_header_len,
+    headers_buf: [requests.max_header_len]u8 = @splat(0),
     headers_len: usize = 0,
-    body_buf: [requests.max_body_len]u8 = .{0} ** requests.max_body_len,
+    body_buf: [requests.max_body_len]u8 = @splat(0),
     body_len: usize = 0,
     // Cursor position (byte offset into active field)
     cursor: usize = 0,
@@ -430,10 +430,10 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     var show_body: bool = false;
     var edit_state: EditState = .{};
     var search_mode: bool = false;
-    var search_buf: [128]u8 = .{0} ** 128;
+    var search_buf: [128]u8 = @splat(0);
     var search_len: usize = 0;
     var intercept_mode: bool = false;
-    var intercept_buf: [intercept.max_pattern_len]u8 = .{0} ** intercept.max_pattern_len;
+    var intercept_buf: [intercept.max_pattern_len]u8 = @splat(0);
     var intercept_len: usize = 0;
     var filtered_count: usize = 0;
     // Maps filtered index -> original index in ptr_buf

@@ -9,15 +9,7 @@ const http_wire = @import("http_wire.zig");
 const shutdown = @import("shutdown.zig");
 const compat = @import("compat.zig");
 
-const ssl_c = @cImport({
-    @cInclude("openssl/ssl.h");
-    @cInclude("openssl/err.h");
-    if (builtin.os.tag == .windows) {
-        @cInclude("winsock2.h");
-    } else {
-        @cInclude("sys/socket.h");
-    }
-});
+const ssl_c = @import("ssl_c");
 
 pub const default_max_request_body: usize = 10 * 1024 * 1024; // 10MB
 

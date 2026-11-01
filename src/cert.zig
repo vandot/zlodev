@@ -5,16 +5,7 @@ const log = @import("log.zig");
 const sys = @import("sys.zig");
 const compat = @import("compat.zig");
 
-const c = @cImport({
-    @cInclude("openssl/evp.h");
-    @cInclude("openssl/x509.h");
-    @cInclude("openssl/x509v3.h");
-    @cInclude("openssl/pem.h");
-    @cInclude("openssl/bio.h");
-    @cInclude("openssl/err.h");
-    @cInclude("openssl/bn.h");
-    @cInclude("openssl/rsa.h");
-});
+const c = @import("cert_c");
 
 pub fn getBasePath(buf: []u8) ![]const u8 {
     switch (builtin.os.tag) {
@@ -522,7 +513,7 @@ fn getGitCaBundlePath(allocator: std.mem.Allocator) ?[]const u8 {
 fn getFingerprint(ca_path: []const u8) ![40]u8 {
     // Null-terminate the path for C API
     var path_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_z_buf, "{s}", .{ca_path}) catch return error.CertReadFailed;
+    const path_z = std.fmt.bufPrintSentinel(&path_z_buf, 0, "{s}", .{ca_path}) catch return error.CertReadFailed;
 
     const bio = c.BIO_new_file(path_z.ptr, "r") orelse return error.CertReadFailed;
     defer _ = c.BIO_free(bio);

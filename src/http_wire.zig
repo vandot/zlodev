@@ -57,7 +57,7 @@ pub fn isChunkedEncoding(headers: []const u8) bool {
     var iter = std.mem.splitSequence(u8, headers, "\r\n");
     while (iter.next()) |header| {
         if (std.ascii.startsWithIgnoreCase(header, "transfer-encoding:")) {
-            const value = std.mem.trimLeft(u8, header["transfer-encoding:".len..], " ");
+            const value = std.mem.trimStart(u8, header["transfer-encoding:".len..], " ");
             var token_iter = std.mem.splitScalar(u8, value, ',');
             while (token_iter.next()) |token| {
                 const trimmed = std.mem.trim(u8, token, " ");
@@ -72,7 +72,7 @@ pub fn isWebSocketUpgrade(headers: []const u8) bool {
     var iter = std.mem.splitSequence(u8, headers, "\r\n");
     while (iter.next()) |header| {
         if (std.ascii.startsWithIgnoreCase(header, "upgrade:")) {
-            const value = std.mem.trimLeft(u8, header["upgrade:".len..], " ");
+            const value = std.mem.trimStart(u8, header["upgrade:".len..], " ");
             if (std.ascii.startsWithIgnoreCase(value, "websocket")) return true;
         }
     }

@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
     const crypto_lib = buildCrypto(b, boringssl, target, optimize);
     const ssl_lib = buildSSL(b, boringssl, target, optimize);
 
-    const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse (optimize != .Debug);
+    const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse (optimize != .debug);
 
     const exe = b.addExecutable(.{
         .name = "zlodev",
@@ -31,6 +31,9 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addOptions("build_options", options);
+
+    // Zig 0.17 removed @cImport; translate BoringSSL headers in the build graph.
+    addBoringSslHeaders(b, exe.root_module, boringssl, target, optimize);
 
     const vaxis = b.dependency("vaxis", .{
         .target = target,
@@ -48,16 +51,48 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary("ws2_32", .{});
     }
 
+    // proxy.zig and cert.zig import translate-c modules, so their tests need the build graph.
+    const test_step = b.step("test-c", "Run tests for modules that import BoringSSL headers");
+    for ([_][]const u8{ "src/proxy.zig", "src/cert.zig" }) |path| {
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }) });
+        t.root_module.addOptions("build_options", options);
+        addBoringSslHeaders(b, t.root_module, boringssl, target, optimize);
+        t.root_module.linkLibrary(crypto_lib);
+        t.root_module.linkLibrary(ssl_lib);
+        t.root_module.addIncludePath(boringssl.path("include"));
+        if (target.result.os.tag == .windows) {
+            t.root_module.linkSystemLibrary("ws2_32", .{});
+        }
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run zlodev");
     run_step.dependOn(&run_cmd.step);
+}
+
+fn addBoringSslHeaders(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    boringssl: *std.Build.Dependency,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    for ([_][2][]const u8{ .{ "ssl_c", "src/c/ssl.h" }, .{ "cert_c", "src/c/cert.h" } }) |h| {
+        const tc = b.addTranslateC(.{ .root_source_file = b.path(h[1]), .target = target, .optimize = optimize });
+        tc.addIncludePath(boringssl.path("include"));
+        mod.addImport(h[0], tc.createModule());
+    }
 }
 
 fn getCommonFlags(target: std.Build.ResolvedTarget) []const []const u8 {

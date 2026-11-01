@@ -28,7 +28,7 @@ var slots: [max_pending]PendingEntry = @splat(PendingEntry{});
 var mutex: std.Thread.Mutex = .{};
 
 // Intercept pattern — substring match against "METHOD PATH"
-var pattern_buf: [max_pattern_len]u8 = .{0} ** max_pattern_len;
+var pattern_buf: [max_pattern_len]u8 = @splat(0);
 var pattern_len: usize = 0;
 var phase: Phase = .both;
 var pattern_mutex: std.Thread.Mutex = .{};
@@ -113,8 +113,8 @@ fn matchesPattern(method: []const u8, path: []const u8) bool {
 
     const pat = pattern_buf[0..pattern_len];
 
-    if (std.ascii.indexOfIgnoreCase(method, pat) != null) return true;
-    if (std.ascii.indexOfIgnoreCase(path, pat) != null) return true;
+    if (std.ascii.findIgnoreCase(method, pat) != null) return true;
+    if (std.ascii.findIgnoreCase(path, pat) != null) return true;
 
     // Build "METHOD PATH" for combined match
     var combined: [520]u8 = undefined;
@@ -123,7 +123,7 @@ fn matchesPattern(method: []const u8, path: []const u8) bool {
         combined[method.len] = ' ';
         @memcpy(combined[method.len + 1 ..][0..path.len], path);
         const full = combined[0 .. method.len + 1 + path.len];
-        if (std.ascii.indexOfIgnoreCase(full, pat) != null) return true;
+        if (std.ascii.findIgnoreCase(full, pat) != null) return true;
     }
 
     return false;

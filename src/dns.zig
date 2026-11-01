@@ -620,7 +620,7 @@ test "writeU32" {
 
 test "parseQuestion rejects compression pointers" {
     // Craft a packet with a compression pointer (0xC0) where a label length should be
-    var pkt: [20]u8 = .{0} ** 20;
+    var pkt: [20]u8 = @splat(0);
     // Header (12 bytes)
     pkt[4] = 0; pkt[5] = 1; // QDCOUNT = 1
     // QNAME starting at byte 12: compression pointer instead of label

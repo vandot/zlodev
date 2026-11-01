@@ -656,7 +656,7 @@ test "start runs command through platform shell and logs output + exit" {
     var saw_exit = false;
     for (dest[0..n]) |line| {
         const text = line.bytes[0..line.len];
-        if (std.mem.eql(u8, std.mem.trimRight(u8, text, " "), "hello")) saw_hello = true;
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, text, " "), "hello")) saw_hello = true;
         if (std.mem.eql(u8, text, "[zlodev] exited (code 0)")) saw_exit = true;
     }
     try std.testing.expect(saw_hello);
