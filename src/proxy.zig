@@ -387,8 +387,17 @@ fn handleConnection(
         var req_buf: [16384]u8 = undefined;
         var total: usize = 0;
         var headers_end: ?usize = null;
+        // Same budget as the SO_RCVTIMEO set below: 30s first request, 15s keep-alive.
+        const idle_timeout_ms: u32 = if (request_count == 0) 30_000 else 15_000;
 
         while (total < req_buf.len) {
+            // Idle keep-alive connections park here; wake each second so
+            // Ctrl+C doesn't wait out the receive timeout. BoringSSL may
+            // already hold decrypted bytes the socket poll can't see.
+            if (ssl_c.SSL_pending(ssl) == 0) {
+                var fds = [1]compat.pollfd{.{ .fd = client_sock, .events = compat.POLL.IN, .revents = 0 }};
+                if (compat.pollWhileRunning(&fds, idle_timeout_ms, shutdown.isRunning) != .ready) return;
+            }
             const n = ssl_c.SSL_read(ssl, @ptrCast(req_buf[total..].ptr), @intCast(req_buf.len - total));
             if (n <= 0) break;
             total += @as(usize, @intCast(n));
@@ -1015,8 +1024,8 @@ fn handleWebSocket(
             .{ .fd = client_fd, .events = compat.POLL.IN, .revents = 0 },
             .{ .fd = upstream_sock, .events = compat.POLL.IN, .revents = 0 },
         };
-        const ready = compat.poll(&fds, 30000) catch break; // 30s timeout
-        if (ready == 0) break; // timeout
+        // 30s with no traffic either way closes the pipe; shutdown closes it within 1s.
+        if (compat.pollWhileRunning(&fds, 30_000, shutdown.isRunning) != .ready) break;
 
         // Client -> upstream
         if (fds[0].revents & compat.POLL.IN != 0) {
