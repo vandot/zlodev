@@ -38,7 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh
 
 ### Build from source
 
-Building from source requires [Zig](https://ziglang.org/download/) 0.15.2. No other dependencies — BoringSSL is compiled from source automatically.
+Building from source requires [Zig](https://ziglang.org/download/) 0.17.0. No other dependencies — BoringSSL is compiled from source automatically.
 
 ```sh
 git clone https://github.com/vandot/zlodev.git
