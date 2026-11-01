@@ -252,10 +252,11 @@ pub fn start(config: *const ProxyConfig, listener: std.Io.net.Server) !void {
         _ = ssl_c.SSL_set_fd(ssl, compat.socketToFd(stream.socket.handle));
 
         const conn_id = nextConnId();
-        if (proxy_workers.fetchAdd(1, .acq_rel) >= max_proxy_workers) {
-            _ = proxy_workers.fetchSub(1, .acq_rel);
+        // All workers busy: hold this connection until one frees up (further
+        // clients wait in the listen backlog), like the old queued thread pool.
+        if (!rt.acquireWorkerSlot(&proxy_workers, max_proxy_workers, shutdown.isRunning)) {
             rejectConnection(ssl, stream, conn_id);
-            continue;
+            break;
         }
         rt.spawnWorker(rt.io(), &group, handleConnection, .{
             ssl,
@@ -384,7 +385,7 @@ fn handleConnection(
     }
 
     // Set receive timeout on client socket
-    setSocketTimeout(stream.handle, .recv, 30);
+    setSocketTimeout(stream.socket.handle, .recv, 30);
 
     // Keep-alive loop: process multiple requests on the same TLS connection
     var request_count: u32 = 0;
@@ -662,7 +663,7 @@ fn handleConnection(
                         requests.finishResponseIntercept(h.index(), if (hold_elapsed > 0) @intCast(hold_elapsed) else 0);
 
                         if (must_close) return;
-                        setSocketTimeout(stream.handle, .recv, 15);
+                        setSocketTimeout(stream.socket.handle, .recv, 15);
                         continue;
                     },
                 }
@@ -677,7 +678,7 @@ fn handleConnection(
             forwardResponseFromEntry(ssl, &entry, is_external, config.domain, must_close);
 
             if (must_close) return;
-            setSocketTimeout(stream.handle, .recv, 15);
+            setSocketTimeout(stream.socket.handle, .recv, 15);
             continue;
         }
 
@@ -732,7 +733,7 @@ fn handleConnection(
         if (must_close) return;
 
         // Shorter idle timeout for subsequent requests on this connection
-        setSocketTimeout(stream.handle, .recv, 15);
+        setSocketTimeout(stream.socket.handle, .recv, 15);
     }
 }
 

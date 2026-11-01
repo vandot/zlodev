@@ -46,6 +46,21 @@ pub fn spawnWorker(
     };
 }
 
+/// Reserve one of `max` worker slots in `counter`, waiting while all are busy
+/// (the old std.Thread.Pool queued excess work; here excess connections wait
+/// in the listen backlog). Returns false without reserving if `running()`
+/// turns false while waiting. Release with `counter.fetchSub(1, .acq_rel)`.
+pub fn acquireWorkerSlot(counter: *std.atomic.Value(u32), max: u32, running: *const fn () bool) bool {
+    while (running()) {
+        var cur = counter.load(.acquire);
+        while (cur < max) {
+            cur = counter.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) orelse return true;
+        }
+        sleepMs(5);
+    }
+    return false;
+}
+
 test "milliTimestamp is wall clock and monotone enough" {
     const a = milliTimestamp();
     sleepMs(5);
@@ -74,4 +89,34 @@ test "spawnWorker closes the connection when concurrency is unavailable" {
     spawnWorker(threaded.io(), &group, Ctx.work, .{&closed}, Ctx.reject, .{&closed});
     group.await(threaded.io()) catch {};
     try std.testing.expect(closed);
+}
+
+test "acquireWorkerSlot waits for a free slot instead of failing" {
+    var counter: std.atomic.Value(u32) = .init(2);
+    const Releaser = struct {
+        fn run(c: *std.atomic.Value(u32)) void {
+            sleepMs(50);
+            _ = c.fetchSub(1, .acq_rel);
+        }
+        fn alwaysRunning() bool {
+            return true;
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Releaser.run, .{&counter});
+    defer t.join();
+    const start = milliTimestamp();
+    try std.testing.expect(acquireWorkerSlot(&counter, 2, Releaser.alwaysRunning));
+    try std.testing.expect(milliTimestamp() - start >= 40);
+    try std.testing.expectEqual(@as(u32, 2), counter.load(.acquire));
+}
+
+test "acquireWorkerSlot gives up when shutdown is requested" {
+    var counter: std.atomic.Value(u32) = .init(1);
+    const Stopped = struct {
+        fn running() bool {
+            return false;
+        }
+    };
+    try std.testing.expect(!acquireWorkerSlot(&counter, 1, Stopped.running));
+    try std.testing.expectEqual(@as(u32, 1), counter.load(.acquire));
 }

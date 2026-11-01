@@ -58,11 +58,11 @@ pub fn serve(listener: std.Io.net.Server, bind_addr: []const u8, domain: []const
         setRecvTimeout(conn.socket.handle, 5);
 
         const stream = compat.SocketStream{ .handle = conn.socket.handle };
-        if (http_workers.fetchAdd(1, .acq_rel) >= max_http_workers) {
-            _ = http_workers.fetchSub(1, .acq_rel);
-            log.err("component=http op=pool_spawn error=busy", .{});
+        // All workers busy: hold this connection until one frees up (further
+        // clients wait in the listen backlog), like the old queued thread pool.
+        if (!rt.acquireWorkerSlot(&http_workers, max_http_workers, shutdown.isRunning)) {
             stream.close();
-            continue;
+            break;
         }
         rt.spawnWorker(rt.io(), &group, handleRequest, .{ stream, domain, ca_pem_path, ca_der_path }, rejectRequest, .{stream});
     }
