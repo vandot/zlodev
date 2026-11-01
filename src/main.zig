@@ -24,6 +24,7 @@ const Command = enum {
 pub const panic = tui.panic;
 
 const compat = @import("compat.zig");
+const rt = @import("rt.zig");
 
 pub fn main() !void {
     compat.initNetworking();
@@ -883,20 +884,8 @@ fn lineValue(line: []const u8, key: []const u8) ?[]const u8 {
 }
 
 fn runCmdOutput(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    const stdout_file = child.stdout.?;
-    var read_buf: [4096]u8 = undefined;
-    var result = std.ArrayListUnmanaged(u8){};
-    defer result.deinit(allocator);
-    while (true) {
-        const n = try stdout_file.read(&read_buf);
-        if (n == 0) break;
-        try result.appendSlice(allocator, read_buf[0..n]);
-    }
-    _ = try child.wait();
-    return try result.toOwnedSlice(allocator);
+    const res = try std.process.run(allocator, rt.io(), .{ .argv = argv });
+    allocator.free(res.stderr);
+    return res.stdout;
 }
 
