@@ -122,7 +122,7 @@ fn addExtension(cert_x509: *c.X509, issuer: ?*c.X509, nid: c_int, value: [:0]con
 fn allocPrintZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]u8 {
     const s = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(s);
-    return try allocator.dupeZ(u8, s);
+    return try allocator.dupeSentinel(u8, s, 0);
 }
 
 fn setNameEntry(name: *c.X509_NAME, nid: c_int, value: []const u8) !void {
@@ -514,7 +514,7 @@ fn getGitCaBundlePath(allocator: std.mem.Allocator) ?[]const u8 {
 fn getFingerprint(ca_path: []const u8) ![40]u8 {
     // Null-terminate the path for C API
     var path_z_buf: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
-    const path_z = std.fmt.bufPrintSentinel(&path_z_buf, 0, "{s}", .{ca_path}) catch return error.CertReadFailed;
+    const path_z = std.mem.printSentinel(&path_z_buf, "{s}", .{ca_path}, 0) catch return error.CertReadFailed;
 
     const bio = c.BIO_new_file(path_z.ptr, "r") orelse return error.CertReadFailed;
     defer _ = c.BIO_free(bio);

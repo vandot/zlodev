@@ -26,12 +26,22 @@ pub const panic = tui.panic;
 const compat = @import("compat.zig");
 const rt = @import("rt.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     compat.initNetworking();
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // One Threaded Io for the whole process: proxy (64) + HTTP (8) workers
+    // plus headroom for replay/TUI helpers. Worker stacks match the old pool.
+    var threaded: std.Io.Threaded = .init(init.gpa, .{
+        .stack_size = if (builtin.cpu.arch == .x86_64) 4 * 1024 * 1024 else 1024 * 1024,
+        .concurrent_limit = .limited(96),
+        .environ = init.minimal.environ,
+        .argv0 = .init(init.minimal.args),
+    });
+    defer threaded.deinit();
+    rt.setIo(threaded.io());
+    rt.env_map = init.environ_map;
+
+    const allocator = init.gpa;
 
     var command: Command = .none;
     var local = false;
@@ -56,11 +66,8 @@ pub fn main() !void {
     var command_str: ?[]const u8 = null;
     var command_set = false;
 
-    var args = if (builtin.os.tag == .windows)
-        try std.process.argsWithAllocator(std.heap.page_allocator)
-    else
-        std.process.args();
-    defer if (builtin.os.tag == .windows) args.deinit();
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args.deinit();
     _ = args.skip(); // skip program name
 
     while (args.next()) |arg| {
@@ -294,12 +301,12 @@ fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool,
             if (!std.mem.eql(u8, avahi, "active")) {
                 // Configure systemd-resolved for mDNS
                 const resolved_conf = "[Resolve]\nMulticastDNS=yes\nLLMNR=no";
-                const tmp_file = try std.fs.cwd().createFile("/tmp/zlodev_resolved.conf", .{});
-                try tmp_file.writeAll(resolved_conf);
-                tmp_file.close();
+                const tmp_file = try std.Io.Dir.cwd().createFile(rt.io(), "/tmp/zlodev_resolved.conf", .{});
+                try tmp_file.writeStreamingAll(rt.io(), resolved_conf);
+                tmp_file.close(rt.io());
                 try sys.sudoCmd(allocator, &.{ "sudo", "mkdir", "-p", "/etc/systemd/resolved.conf.d" });
                 try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", "/tmp/zlodev_resolved.conf", "/etc/systemd/resolved.conf.d/zlodev.conf" });
-                std.fs.cwd().deleteFile("/tmp/zlodev_resolved.conf") catch {};
+                std.Io.Dir.cwd().deleteFile(rt.io(), "/tmp/zlodev_resolved.conf") catch {};
                 sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
             }
         },
@@ -340,13 +347,13 @@ fn doStartDns(tld: []const u8) !void {
         .macos => {
             var path_buf: [256]u8 = undefined;
             const resolver_path = std.fmt.bufPrint(&path_buf, "/etc/resolver/{s}", .{tld}) catch "";
-            std.fs.accessAbsolute(resolver_path, .{}) catch {
-                std.debug.print("warning: DNS resolver not installed, run 'zlodev install -d' first\n", .{});
+            std.Io.Dir.accessAbsolute(rt.io(), resolver_path, .{}) catch {
+                std.debug.print("warning: DNS resolver not installed, run 'zlodev install --dns' first\n", .{});
             };
         },
         .linux => {
-            std.fs.accessAbsolute("/etc/systemd/network/zlodev0.network", .{}) catch {
-                std.debug.print("warning: DNS resolver not installed, run 'zlodev install -d' first\n", .{});
+            std.Io.Dir.accessAbsolute(rt.io(), "/etc/systemd/network/zlodev0.network", .{}) catch {
+                std.debug.print("warning: DNS resolver not installed, run 'zlodev install --dns' first\n", .{});
             };
         },
         .windows => {
@@ -404,31 +411,31 @@ fn doStart(
     }
 
     // Get certificate paths
-    var cert_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var key_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var cert_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var key_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const certs = cert.getCert(&cert_buf, &key_buf, full_domain) catch {
         std.debug.print("certificates not found, run 'zlodev install' first\n", .{});
         std.process.exit(1);
     };
 
     // Get CA paths for HTTP server and proxy
-    var ca_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ca_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const ca_path = cert.getCaPath(&ca_buf, full_domain) catch {
         std.debug.print("CA certificate not found, run 'zlodev install' first\n", .{});
         std.process.exit(1);
     };
-    var ca_der_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ca_der_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const ca_der_path = cert.getCaDerPath(&ca_der_buf, full_domain) catch {
         std.debug.print("CA DER certificate not found, run 'zlodev install' first\n", .{});
         std.process.exit(1);
     };
 
     // We need null-terminated paths for OpenSSL
-    const cert_path_z = try allocator.dupeZ(u8, certs.cert);
+    const cert_path_z = try allocator.dupeSentinel(u8, certs.cert, 0);
     defer allocator.free(cert_path_z);
-    const key_path_z = try allocator.dupeZ(u8, certs.key);
+    const key_path_z = try allocator.dupeSentinel(u8, certs.key, 0);
     defer allocator.free(key_path_z);
-    const ca_path_z = try allocator.dupeZ(u8, ca_path);
+    const ca_path_z = try allocator.dupeSentinel(u8, ca_path, 0);
     defer allocator.free(ca_path_z);
 
     // Make owned copies for threads (freed after TUI exits, process is terminating)
@@ -447,7 +454,7 @@ fn doStart(
     // conflict is reported on the normal screen and zlodev exits instead of
     // running half-started.
     const probe = dns.systemProbe();
-    const dns_sock: ?compat.socket_t = if (local) null else dns.bind(probe.ip, probe.port) catch |e|
+    const dns_sock: ?std.Io.net.Socket = if (local) null else dns.bind(probe.ip, probe.port) catch |e|
         exitBindError("DNS", probe.ip, probe.port, e);
     const http_listener = http_server.listen(bind_owned) catch |e| exitBindError("HTTP", bind_owned, 80, e);
     const https_listener = proxy.listen(bind_owned) catch |e| exitBindError("HTTPS", bind_owned, 443, e);
@@ -467,7 +474,7 @@ fn doStart(
     var dns_thread: ?std.Thread = null;
     if (dns_sock) |sock| {
         dns_thread = try std.Thread.spawn(.{}, struct {
-            fn run(s: compat.socket_t, ip: []const u8, port: u16, t: []const u8) void {
+            fn run(s: std.Io.net.Socket, ip: []const u8, port: u16, t: []const u8) void {
                 dns.serve(s, ip, port, t);
             }
         }.run, .{ sock, probe.ip, probe.port, tld_owned });
@@ -475,7 +482,7 @@ fn doStart(
 
     // Start HTTP server
     const http_thread = try std.Thread.spawn(.{}, struct {
-        fn run(l: std.net.Server, addr: []const u8, d: []const u8, ca_pem: []const u8, ca_der: []const u8) void {
+        fn run(l: std.Io.net.Server, addr: []const u8, d: []const u8, ca_pem: []const u8, ca_der: []const u8) void {
             http_server.serve(l, addr, d, ca_pem, ca_der);
         }
     }.run, .{ http_listener, bind_owned, domain_owned, ca_pem_owned, ca_der_owned });
@@ -494,7 +501,7 @@ fn doStart(
         .domain = domain_owned,
     };
     const proxy_thread = try std.Thread.spawn(.{}, struct {
-        fn run(cfg: *const proxy.ProxyConfig, l: std.net.Server) void {
+        fn run(cfg: *const proxy.ProxyConfig, l: std.Io.net.Server) void {
             proxy.start(cfg, l) catch |e| {
                 log.err("component=proxy op=start error={any}", .{e});
             };
@@ -515,7 +522,7 @@ fn doStart(
             log.info("component=main route kind={s} pattern={s} port={d}", .{ kind_str, route.pattern, route.port });
         }
         while (shutdown.isRunning()) {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            rt.sleepMs(100);
         }
     } else {
         // Run TUI on main thread (blocks until user quits)
@@ -690,9 +697,9 @@ fn detectPort() u16 {
         .{ .file = "mix.exs", .port = 4000 },
     };
 
-    const cwd = std.fs.cwd();
+    const cwd = std.Io.Dir.cwd();
     for (checks) |check| {
-        if (cwd.access(check.file, .{})) |_| {
+        if (cwd.access(rt.io(), check.file, .{})) |_| {
             return check.port;
         } else |_| {}
     }
@@ -701,13 +708,8 @@ fn detectPort() u16 {
 }
 
 fn readEnvPort() ?u16 {
-    const cwd = std.fs.cwd();
-    const file = cwd.openFile(".env", .{}) catch return null;
-    defer file.close();
-
     var buf: [4096]u8 = undefined;
-    const n = file.readAll(&buf) catch return null;
-    const content = buf[0..n];
+    const content = std.Io.Dir.cwd().readFile(rt.io(), ".env", &buf) catch return null;
 
     var iter = std.mem.splitScalar(u8, content, '\n');
     while (iter.next()) |line| {
@@ -735,10 +737,9 @@ fn getHostname(buf: *[hostname_max]u8) []const u8 {
 }
 
 fn isPortListening(bind_addr: []const u8, port: u16) bool {
-    const addr = std.net.Address.parseIp(bind_addr, port) catch return false;
-    const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return false;
-    defer compat.closeSocket(sock);
-    std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch return false;
+    const addr = std.Io.net.IpAddress.parse(bind_addr, port) catch return false;
+    const stream = addr.connect(rt.io(), .{ .mode = .stream }) catch return false;
+    stream.close(rt.io());
     return true;
 }
 
@@ -817,15 +818,9 @@ fn readConfigFile(
     routes: *[proxy.max_routes]proxy.Route,
     route_count: *usize,
 ) !ConfigResult {
-    const file = if (std.fs.path.isAbsolute(path))
-        try std.fs.openFileAbsolute(path, .{})
-    else
-        try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
+    // Dir.cwd().readFile accepts absolute paths too.
     var buf: [8192]u8 = undefined;
-    const n = try file.readAll(&buf);
-    const content = buf[0..n];
+    const content = try std.Io.Dir.cwd().readFile(rt.io(), path, &buf);
 
     var result = ConfigResult{};
 
