@@ -239,11 +239,12 @@ fn setCloexec(fd: socket_t) void {
 }
 
 fn setReuse(sock: socket_t) void {
+    // Windows: no SO_REUSEADDR. It is only needed on POSIX to rebind ports in
+    // TIME_WAIT (Windows allows that anyway); on Windows it would let sockets
+    // share the port and turns "port taken" into WSAEACCES instead of
+    // WSAEADDRINUSE, so the user would see "permission denied".
+    if (builtin.os.tag == .windows) return;
     const one: c_int = 1;
-    if (builtin.os.tag == .windows) {
-        _ = win32.setsockopt(sock, 0xffff, 0x0004, std.mem.asBytes(&one), @sizeOf(c_int)); // SOL_SOCKET, SO_REUSEADDR
-        return;
-    }
     // Same options std.net used in 0.15 for reuse_address.
     posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
     if (@hasDecl(posix.SO, "REUSEPORT")) {
