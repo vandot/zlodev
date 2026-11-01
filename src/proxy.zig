@@ -219,7 +219,6 @@ pub fn start(config: *const ProxyConfig, listener: compat.socket_t) !void {
     log.info("component=proxy op=listening ip={s} port=443 target={s}:{d}", .{ config.listen_addr, config.target_host, config.target_port });
 
     var group: std.Io.Group = .init;
-    defer group.cancel(rt.io());
 
     var consecutive_failures: u32 = 0;
     while (shutdown.isRunning()) {
@@ -254,7 +253,8 @@ pub fn start(config: *const ProxyConfig, listener: compat.socket_t) !void {
         // All workers busy: hold this connection until one frees up (further
         // clients wait in the listen backlog), like the old queued thread pool.
         if (!rt.acquireWorkerSlot(&proxy_workers, max_proxy_workers, shutdown.isRunning)) {
-            rejectConnection(ssl, conn.sock, conn_id);
+            // Shutdown began while waiting for a slot — not a spawn failure.
+            discardConnection(ssl, conn.sock);
             break;
         }
         rt.spawnWorker(rt.io(), &group, handleConnection, .{
@@ -266,15 +266,44 @@ pub fn start(config: *const ProxyConfig, listener: compat.socket_t) !void {
             client_ctx,
         }, rejectConnectionAndRelease, .{ ssl, conn.sock, conn_id });
     }
+
+    // Release intercept holds and wait (bounded) for workers. Group.cancel
+    // awaits every task, so only call it once they've all finished; on a
+    // timeout return anyway and let process exit reap the stragglers.
+    if (drainWorkers(shutdown_drain_ms)) {
+        group.cancel(rt.io());
+    } else {
+        log.err("component=proxy op=shutdown workers={d} error=DrainTimeout", .{proxy_workers.load(.acquire)});
+    }
 }
 
 var proxy_workers: std.atomic.Value(u32) = .init(0);
 const max_proxy_workers = 64;
+/// How long shutdown waits for proxy workers before exiting anyway.
+const shutdown_drain_ms = 5000;
+
+/// After the accept loop stops: wake workers parked on intercept holds and
+/// wait for every proxy worker to exit. dropAll runs on each pass because a
+/// worker mid-request can begin a hold after the first one. Returns false if
+/// workers are still running at the deadline (e.g. stuck on a slow upstream).
+fn drainWorkers(timeout_ms: u32) bool {
+    const deadline = rt.milliTimestamp() + timeout_ms;
+    while (proxy_workers.load(.acquire) > 0) {
+        if (rt.milliTimestamp() >= deadline) return false;
+        intercept.dropAll();
+        rt.sleepMs(20);
+    }
+    return true;
+}
+
+fn discardConnection(ssl: *ssl_c.SSL, client_sock: compat.socket_t) void {
+    ssl_c.SSL_free(ssl);
+    compat.closeSocket(client_sock);
+}
 
 fn rejectConnection(ssl: *ssl_c.SSL, client_sock: compat.socket_t, conn_id: u64) void {
     log.err("component=proxy op=pool_spawn conn={d} error=ConcurrencyUnavailable", .{conn_id});
-    ssl_c.SSL_free(ssl);
-    compat.closeSocket(client_sock);
+    discardConnection(ssl, client_sock);
 }
 
 fn rejectConnectionAndRelease(ssl: *ssl_c.SSL, client_sock: compat.socket_t, conn_id: u64) void {
@@ -1311,4 +1340,49 @@ test "connectUpstream returns UpstreamUnavailable for an unresolvable external h
         .domain = "dev.lo",
     };
     try testing.expectError(error.UpstreamUnavailable, connectUpstream(true, "nonexistent.invalid", 443, &cfg, null, 1));
+}
+
+const DrainTestWorker = struct {
+    fn holdUntilDecided(slot: *intercept.PendingEntry, out: *intercept.Decision) void {
+        out.* = intercept.awaitAndRelease(slot);
+        _ = proxy_workers.fetchSub(1, .acq_rel);
+    }
+    fn holdLate(out: *intercept.Decision) void {
+        rt.sleepMs(100); // begins its hold after drainWorkers' first dropAll()
+        const slot = intercept.acquire(9) orelse {
+            _ = proxy_workers.fetchSub(1, .acq_rel);
+            return;
+        };
+        holdUntilDecided(slot, out);
+    }
+};
+
+test "drainWorkers drops held intercepts so their workers finish" {
+    proxy_workers.store(1, .release);
+    defer proxy_workers.store(0, .release);
+    const slot = intercept.acquire(7) orelse return error.NoFreeSlot;
+    var decision: intercept.Decision = .pending;
+    const t = try std.Thread.spawn(.{}, DrainTestWorker.holdUntilDecided, .{ slot, &decision });
+    try testing.expect(drainWorkers(2000));
+    t.join();
+    try testing.expectEqual(intercept.Decision.drop, decision);
+}
+
+test "drainWorkers drops a hold that begins after draining started" {
+    proxy_workers.store(1, .release);
+    defer proxy_workers.store(0, .release);
+    var decision: intercept.Decision = .pending;
+    const t = try std.Thread.spawn(.{}, DrainTestWorker.holdLate, .{&decision});
+    try testing.expect(drainWorkers(2000));
+    t.join();
+    try testing.expectEqual(intercept.Decision.drop, decision);
+}
+
+test "drainWorkers gives up after the deadline when a worker never finishes" {
+    proxy_workers.store(1, .release);
+    defer proxy_workers.store(0, .release);
+    const start_ms = rt.milliTimestamp();
+    try testing.expect(!drainWorkers(100));
+    const took = rt.milliTimestamp() - start_ms;
+    try testing.expect(took >= 100 and took < 1000);
 }
