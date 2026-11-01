@@ -29,11 +29,13 @@ const rt = @import("rt.zig");
 pub fn main(init: std.process.Init) !void {
     compat.initNetworking();
 
-    // One Threaded Io for the whole process: proxy (64) + HTTP (8) workers
-    // plus headroom for replay/TUI helpers. Worker stacks match the old pool.
+    // One Threaded Io for the whole process. Worker counts are capped by the
+    // proxy (64) and HTTP (8) atomic counters, not here: a global limit would
+    // also count io.async work (e.g. HostName.connect) and could refuse
+    // connections on many-core machines. Worker stacks match the old pool.
     var threaded: std.Io.Threaded = .init(init.gpa, .{
         .stack_size = if (builtin.cpu.arch == .x86_64) 4 * 1024 * 1024 else 1024 * 1024,
-        .concurrent_limit = .limited(96),
+        .concurrent_limit = .unlimited,
         .environ = init.minimal.environ,
         .argv0 = .init(init.minimal.args),
     });

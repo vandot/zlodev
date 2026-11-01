@@ -309,6 +309,10 @@ var readerDoneCount: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 // Windows job object holding the child tree; killing it takes grandchildren
 // (e.g. node under cmd.exe) down too. Unused on other platforms.
 var job_handle: ?std.os.windows.HANDLE = null;
+// Process group of the running child (== its pid, set at spawn). Kept separately
+// because wait() on the reader thread clears child.id, but group members can
+// outlive the shell. Unused on Windows.
+var child_pgid: i32 = 0;
 
 pub fn start(allocator: std.mem.Allocator, command: []const u8) !void {
     _ = allocator; // std.process.spawn no longer takes an allocator
@@ -365,6 +369,8 @@ fn spawnChild() !void {
     });
     if (builtin.os.tag == .windows) {
         job_handle = win32.assignToKillJob(child.id.?);
+    } else {
+        child_pgid = @intCast(child.id.?);
     }
     child_process = child;
     process_running.store(true, .release);
@@ -446,33 +452,32 @@ fn readerThread(pipe: std.Io.File, source: LogSource) void {
 
 fn stopChild() void {
     if (child_process) |*child| {
-        // The reader thread's wait() nulls child.id once the child is reaped,
-        // so only signal while it is still set.
-        if (child.id) |id| {
-            // SIGTERM the group (Unix) / terminate the job (Windows)
-            if (builtin.os.tag == .windows) {
-                // No graceful signal on Windows: terminate the whole job (cmd.exe
-                // and everything it spawned), falling back to the direct child.
-                if (job_handle) |job| {
-                    _ = win32.TerminateJobObject(job, 1);
-                } else {
-                    _ = win32.TerminateProcess(id, 1);
-                }
-            } else {
-                std.posix.kill(-@as(i32, @intCast(id)), .TERM) catch {};
+        // SIGTERM the group (Unix) / terminate the job (Windows)
+        if (builtin.os.tag == .windows) {
+            // No graceful signal on Windows: terminate the whole job (cmd.exe
+            // and everything it spawned), falling back to the direct child.
+            // wait() on the reader thread clears child.id once reaped.
+            if (job_handle) |job| {
+                _ = win32.TerminateJobObject(job, 1);
+            } else if (child.id) |id| {
+                _ = win32.TerminateProcess(id, 1);
             }
+        } else {
+            // Signal the stored group even if the shell itself was already
+            // reaped: group members may outlive it. ESRCH is ignored.
+            std.posix.kill(-child_pgid, .TERM) catch {};
+        }
 
-            // Wait up to 3 seconds for exit
-            const deadline = rt.milliTimestamp() + 3000;
-            while (process_running.load(.acquire) and rt.milliTimestamp() < deadline) {
-                rt.sleepMs(50);
-            }
+        // Wait up to 3 seconds for exit
+        const deadline = rt.milliTimestamp() + 3000;
+        while (process_running.load(.acquire) and rt.milliTimestamp() < deadline) {
+            rt.sleepMs(50);
+        }
 
-            // Force kill if still running
-            if (process_running.load(.acquire)) {
-                if (builtin.os.tag != .windows) {
-                    std.posix.kill(-@as(i32, @intCast(id)), .KILL) catch {};
-                }
+        // Force kill if still running
+        if (process_running.load(.acquire)) {
+            if (builtin.os.tag != .windows) {
+                std.posix.kill(-child_pgid, .KILL) catch {};
             }
         }
 
@@ -609,5 +614,20 @@ test "stopChild kills the whole process group" {
     const pgid: i32 = @intCast(child_process.?.id.?);
     stopChild();
     // kill(-pgid, 0) fails with ESRCH once no process in the group is left
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(-pgid, @enumFromInt(0)));
+}
+
+test "stopChild kills group members that outlive the shell" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // The shell exits at once; the backgrounded sleep keeps running in the
+    // process group with its output detached from our pipes.
+    try start(std.testing.allocator, "sleep 30 >/dev/null 2>&1 &");
+    defer stop();
+    const pgid = child_pgid;
+    const deadline = rt.milliTimestamp() + 5000;
+    while (isRunning() and rt.milliTimestamp() < deadline) rt.sleepMs(20);
+    try std.testing.expect(!isRunning());
+    stopChild();
+    rt.sleepMs(100);
     try std.testing.expectError(error.ProcessNotFound, std.posix.kill(-pgid, @enumFromInt(0)));
 }
