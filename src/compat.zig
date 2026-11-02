@@ -56,6 +56,24 @@ pub fn poll(fds: []pollfd, timeout_ms: i32) !usize {
     return posix.poll(fds, timeout_ms);
 }
 
+pub const WaitResult = enum { ready, timeout, stopped, failed };
+
+/// poll() `fds` in slices of at most 1s until one is ready, `timeout_ms`
+/// passes, or `running()` turns false — so a blocked worker notices shutdown
+/// within a second. A poll error returns `.failed` (callers stop on anything
+/// but `.ready`; reporting it as ready would spin loops whose revents stay 0).
+pub fn pollWhileRunning(fds: []pollfd, timeout_ms: u32, running: *const fn () bool) WaitResult {
+    var waited: u32 = 0;
+    while (running()) {
+        if (waited >= timeout_ms) return .timeout;
+        const slice = @min(1000, timeout_ms - waited);
+        const n = poll(fds, @intCast(slice)) catch return .failed;
+        if (n > 0) return .ready;
+        waited += slice;
+    }
+    return .stopped;
+}
+
 /// Initialize Winsock. Must be called before any socket operations on Windows.
 /// No-op on other platforms.
 pub fn initNetworking() void {
@@ -487,4 +505,76 @@ test "sockets are close-on-exec so the dev server doesn't inherit them" {
     defer closeSocket(sock);
     const fd_flags = posix.system.fcntl(sock, posix.F.GETFD, @as(usize, 0));
     try std.testing.expect(fd_flags & posix.FD_CLOEXEC != 0);
+}
+
+const TestFlag = struct {
+    var running: std.atomic.Value(bool) = .init(true);
+    fn isRunning() bool {
+        return running.load(.acquire);
+    }
+    fn stopAfter(ms: u64) void {
+        @import("rt.zig").sleepMs(ms);
+        running.store(false, .release);
+    }
+};
+
+test "pollWhileRunning returns ready when the socket has data" {
+    const addr = try Ip.parseIp4("127.0.0.1", 18085);
+    const listener = try tcpListen(addr);
+    defer closeSocket(listener);
+    const client = try tcpConnect(addr);
+    defer closeSocket(client);
+    const conn = try accept(listener);
+    defer closeSocket(conn.sock);
+
+    try (SocketStream{ .handle = client }).writeAll("x");
+    TestFlag.running.store(true, .release);
+    var fds = [1]pollfd{.{ .fd = conn.sock, .events = POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(WaitResult.ready, pollWhileRunning(&fds, 5000, TestFlag.isRunning));
+}
+
+test "pollWhileRunning times out on an idle socket" {
+    const rt = @import("rt.zig");
+    const addr = try Ip.parseIp4("127.0.0.1", 18086);
+    const listener = try tcpListen(addr);
+    defer closeSocket(listener);
+    const client = try tcpConnect(addr);
+    defer closeSocket(client);
+    const conn = try accept(listener);
+    defer closeSocket(conn.sock);
+
+    TestFlag.running.store(true, .release);
+    var fds = [1]pollfd{.{ .fd = conn.sock, .events = POLL.IN, .revents = 0 }};
+    const start = rt.milliTimestamp();
+    try std.testing.expectEqual(WaitResult.timeout, pollWhileRunning(&fds, 150, TestFlag.isRunning));
+    const took = rt.milliTimestamp() - start;
+    try std.testing.expect(took >= 140 and took < 1000);
+}
+
+test "pollWhileRunning returns stopped within a slice when shutdown is requested mid-wait" {
+    const rt = @import("rt.zig");
+    const addr = try Ip.parseIp4("127.0.0.1", 18087);
+    const listener = try tcpListen(addr);
+    defer closeSocket(listener);
+    const client = try tcpConnect(addr);
+    defer closeSocket(client);
+    const conn = try accept(listener);
+    defer closeSocket(conn.sock);
+
+    TestFlag.running.store(true, .release);
+    defer TestFlag.running.store(true, .release);
+    const t = try std.Thread.spawn(.{}, TestFlag.stopAfter, .{200});
+    defer t.join();
+
+    var fds = [1]pollfd{.{ .fd = conn.sock, .events = POLL.IN, .revents = 0 }};
+    const start = rt.milliTimestamp();
+    try std.testing.expectEqual(WaitResult.stopped, pollWhileRunning(&fds, 30_000, TestFlag.isRunning));
+    try std.testing.expect(rt.milliTimestamp() - start < 1500);
+}
+
+test "pollWhileRunning returns stopped immediately when already shut down" {
+    TestFlag.running.store(false, .release);
+    defer TestFlag.running.store(true, .release);
+    var fds = [0]pollfd{};
+    try std.testing.expectEqual(WaitResult.stopped, pollWhileRunning(&fds, 30_000, TestFlag.isRunning));
 }
