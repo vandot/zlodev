@@ -282,18 +282,7 @@ fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool,
             }
         },
         .linux => {
-            // Check systemd and systemd-resolved
-            const systemd_result = try runCmdOutput(allocator, &.{ "ps", "--no-headers", "-o", "comm", "1" });
-            defer allocator.free(systemd_result);
-            const resolved_result = try runCmdOutput(allocator, &.{ "systemctl", "is-active", "systemd-resolved.service" });
-            defer allocator.free(resolved_result);
-            const systemd = std.mem.trim(u8, systemd_result, "\n\r ");
-            const resolved = std.mem.trim(u8, resolved_result, "\n\r ");
-
-            if (!std.mem.eql(u8, systemd, "systemd") or !std.mem.eql(u8, resolved, "active")) {
-                std.debug.print("linux initialization is supported only for systemd using systemd-resolved\n", .{});
-                std.process.exit(1);
-            }
+            try requireSystemdResolved(allocator);
 
             // Check avahi for mDNS config
             const avahi_result = try runCmdOutput(allocator, &.{ "systemctl", "is-active", "avahi-daemon.service" });
@@ -326,8 +315,22 @@ fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool,
 }
 
 fn doInstallDns(allocator: std.mem.Allocator, tld: []const u8) !void {
+    if (builtin.os.tag == .linux) try requireSystemdResolved(allocator);
     const probe = dns.systemProbe();
     try dns.install(allocator, probe.ip, probe.port, tld);
+}
+
+/// Linux DNS setup goes through systemd-resolved; refuse early otherwise
+/// rather than writing config nothing reads.
+fn requireSystemdResolved(allocator: std.mem.Allocator) !void {
+    const systemd_result = try runCmdOutput(allocator, &.{ "ps", "--no-headers", "-o", "comm", "1" });
+    defer allocator.free(systemd_result);
+    const resolved_result = try runCmdOutput(allocator, &.{ "systemctl", "is-active", "systemd-resolved.service" });
+    defer allocator.free(resolved_result);
+    if (!dns.systemdResolvedReady(systemd_result, resolved_result)) {
+        std.debug.print("linux initialization is supported only for systemd using systemd-resolved\n", .{});
+        std.process.exit(1);
+    }
 }
 
 fn doInstallCert(allocator: std.mem.Allocator, full_domain: []const u8, force: bool) !void {

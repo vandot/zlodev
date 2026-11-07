@@ -310,6 +310,14 @@ fn parseAddr(ip: []const u8, port: u16) !std.Io.net.IpAddress {
     return try std.Io.net.IpAddress.parseIp4(ip, port);
 }
 
+/// Linux DNS install needs systemd as PID 1 and systemd-resolved active.
+/// Inputs are raw `ps -o comm 1` / `systemctl is-active` output.
+pub fn systemdResolvedReady(pid1_comm: []const u8, resolved_state: []const u8) bool {
+    const ws = "\n\r ";
+    return std.mem.eql(u8, std.mem.trim(u8, pid1_comm, ws), "systemd") and
+        std.mem.eql(u8, std.mem.trim(u8, resolved_state, ws), "active");
+}
+
 pub fn systemProbe() struct { ip: []const u8, port: u16 } {
     switch (builtin.os.tag) {
         .linux => {
@@ -353,8 +361,11 @@ pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []c
             const tmp_netdev = try sys.writeTmpFile(allocator, "dns_netdev", netdev_text);
             defer allocator.free(tmp_netdev);
             try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_netdev, "/etc/systemd/network/zlodev0.netdev" });
-            // Best-effort: services may not be running
-            sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" }) catch {};
+            // networkd creates the zlodev0 dummy interface; without it .lo never resolves.
+            sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" }) catch |e| {
+                std.debug.print("could not restart systemd-networkd (needed for the zlodev0 interface); is it installed and not masked?\n", .{});
+                return e;
+            };
             sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
         },
         .windows => {
@@ -626,4 +637,16 @@ test "bind reports AddressInUse when the port is taken" {
     const first = try bind("127.0.0.1", 53535);
     defer compat.closeSocket(first);
     try std.testing.expectError(error.AddressInUse, bind("127.0.0.1", 53535));
+}
+
+test "systemdResolvedReady accepts systemd with active resolved" {
+    try std.testing.expect(systemdResolvedReady("systemd\n", "active\n"));
+}
+
+test "systemdResolvedReady rejects inactive resolved" {
+    try std.testing.expect(!systemdResolvedReady("systemd", "inactive"));
+}
+
+test "systemdResolvedReady rejects a non-systemd init" {
+    try std.testing.expect(!systemdResolvedReady("init", "active"));
 }
