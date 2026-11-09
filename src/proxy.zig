@@ -402,9 +402,7 @@ fn handleConnection(
         compat.closeSocket(client_sock);
     }
 
-    if (ssl_c.SSL_accept(ssl) != 1) {
-        return;
-    }
+    if (!acceptTls(ssl, client_sock, handshake_timeout_s)) return;
 
     // Set receive timeout on client socket
     setSocketTimeout(client_sock, .recv, 30);
@@ -1075,6 +1073,19 @@ fn handleWebSocket(
     requests.unpin(ws_backing_idx);
 }
 
+/// Budget for a client to start and complete the TLS handshake. Without it a
+/// TCP client that never sends a ClientHello pins a worker forever.
+const handshake_timeout_s = 10;
+
+/// Wait (shutdown-aware) for the ClientHello, then handshake with a per-read
+/// receive timeout so a stalled client can't block SSL_accept either.
+fn acceptTls(ssl: *ssl_c.SSL, client_sock: compat.socket_t, timeout_s: u32) bool {
+    setSocketTimeout(client_sock, .recv, timeout_s);
+    var fds = [1]compat.pollfd{.{ .fd = client_sock, .events = compat.POLL.IN, .revents = 0 }};
+    if (compat.pollWhileRunning(&fds, timeout_s * 1000, shutdown.isRunning) != .ready) return false;
+    return ssl_c.SSL_accept(ssl) == 1;
+}
+
 const SO_TIMEOUT = enum { recv, send };
 
 fn setSocketTimeout(fd: posix.socket_t, which: SO_TIMEOUT, seconds: u32) void {
@@ -1385,4 +1396,53 @@ test "drainWorkers gives up after the deadline when a worker never finishes" {
     try testing.expect(!drainWorkers(100));
     const took = rt.milliTimestamp() - start_ms;
     try testing.expect(took >= 100 and took < 1000);
+}
+
+const HandshakeTest = struct {
+    listener: compat.socket_t,
+    client: compat.socket_t,
+    server: compat.socket_t,
+    ctx: *ssl_c.SSL_CTX,
+    ssl: *ssl_c.SSL,
+
+    fn init(port: u16) !HandshakeTest {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+        const listener = try compat.tcpListen(addr);
+        errdefer compat.closeSocket(listener);
+        const client = try compat.tcpConnect(addr);
+        errdefer compat.closeSocket(client);
+        const conn = try compat.accept(listener);
+        errdefer compat.closeSocket(conn.sock);
+        const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_server_method()) orelse return error.SslCtx;
+        errdefer ssl_c.SSL_CTX_free(ctx);
+        const ssl = ssl_c.SSL_new(ctx) orelse return error.SslNew;
+        _ = ssl_c.SSL_set_fd(ssl, compat.socketToFd(conn.sock));
+        return .{ .listener = listener, .client = client, .server = conn.sock, .ctx = ctx, .ssl = ssl };
+    }
+
+    fn deinit(self: *HandshakeTest) void {
+        ssl_c.SSL_free(self.ssl);
+        ssl_c.SSL_CTX_free(self.ctx);
+        compat.closeSocket(self.server);
+        compat.closeSocket(self.client);
+        compat.closeSocket(self.listener);
+    }
+};
+
+test "acceptTls gives up on a client that never sends a ClientHello" {
+    var h = try HandshakeTest.init(18090);
+    defer h.deinit();
+    const start_ms = rt.milliTimestamp();
+    try testing.expect(!acceptTls(h.ssl, h.server, 1));
+    const took = rt.milliTimestamp() - start_ms;
+    try testing.expect(took >= 900 and took < 3000);
+}
+
+test "acceptTls fails fast on a client that sends plain HTTP" {
+    var h = try HandshakeTest.init(18091);
+    defer h.deinit();
+    try (compat.SocketStream{ .handle = h.client }).writeAll("GET / HTTP/1.1\r\nHost: dev.lo\r\n\r\n");
+    const start_ms = rt.milliTimestamp();
+    try testing.expect(!acceptTls(h.ssl, h.server, 10));
+    try testing.expect(rt.milliTimestamp() - start_ms < 1000);
 }
