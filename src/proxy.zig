@@ -1039,8 +1039,13 @@ fn handleWebSocket(
         return;
     };
 
-    // Bidirectional pipe: SSL client <-> upstream socket
-    // Use poll to wait for data on either side
+    relayWebSocket(ssl, upstream);
+    requests.unpin(ws_backing_idx);
+}
+
+/// Bidirectional pipe between the TLS client and the upstream socket until
+/// either side closes, 30s pass with no traffic, or shutdown starts.
+fn relayWebSocket(ssl: *ssl_c.SSL, upstream: compat.SocketStream) void {
     const raw_fd = ssl_c.SSL_get_fd(ssl);
     if (raw_fd < 0) return;
     const client_fd = compat.fdToSocket(raw_fd);
@@ -1049,16 +1054,22 @@ fn handleWebSocket(
     while (true) {
         var fds = [2]compat.pollfd{
             .{ .fd = client_fd, .events = compat.POLL.IN, .revents = 0 },
-            .{ .fd = upstream_sock, .events = compat.POLL.IN, .revents = 0 },
+            .{ .fd = upstream.handle, .events = compat.POLL.IN, .revents = 0 },
         };
         // 30s with no traffic either way closes the pipe; shutdown closes it within 1s.
         if (compat.pollWhileRunning(&fds, 30_000, shutdown.isRunning) != .ready) break;
 
         // Client -> upstream
         if (fds[0].revents & compat.POLL.IN != 0) {
-            const n = ssl_c.SSL_read(ssl, @ptrCast(&pipe_buf), @intCast(pipe_buf.len));
-            if (n <= 0) break;
-            upstream.writeAll(pipe_buf[0..@intCast(n)]) catch break;
+            // A TLS record (up to 16 KB) can outsize pipe_buf; drain what BoringSSL
+            // already decrypted, since poll() only sees the socket.
+            const ok = while (true) {
+                const n = ssl_c.SSL_read(ssl, @ptrCast(&pipe_buf), @intCast(pipe_buf.len));
+                if (n <= 0) break false;
+                upstream.writeAll(pipe_buf[0..@intCast(n)]) catch break false;
+                if (ssl_c.SSL_pending(ssl) == 0) break true;
+            };
+            if (!ok) break;
         }
         if (fds[0].revents & (compat.POLL.HUP | compat.POLL.ERR) != 0) break;
 
@@ -1070,7 +1081,6 @@ fn handleWebSocket(
         }
         if (fds[1].revents & (compat.POLL.HUP | compat.POLL.ERR) != 0) break;
     }
-    requests.unpin(ws_backing_idx);
 }
 
 /// Budget for a client to start and complete the TLS handshake. Without it a
@@ -1445,4 +1455,127 @@ test "acceptTls fails fast on a client that sends plain HTTP" {
     const start_ms = rt.milliTimestamp();
     try testing.expect(!acceptTls(h.ssl, h.server, 10));
     try testing.expect(rt.milliTimestamp() - start_ms < 1000);
+}
+
+/// Server context with a throwaway self-signed certificate, for tests that need
+/// a real TLS session (clients in these tests don't verify).
+fn testServerCtx() !*ssl_c.SSL_CTX {
+    const kctx = ssl_c.EVP_PKEY_CTX_new_id(ssl_c.EVP_PKEY_RSA, null) orelse return error.KeyGen;
+    defer ssl_c.EVP_PKEY_CTX_free(kctx);
+    if (ssl_c.EVP_PKEY_keygen_init(kctx) != 1) return error.KeyGen;
+    if (ssl_c.EVP_PKEY_CTX_set_rsa_keygen_bits(kctx, 2048) != 1) return error.KeyGen;
+    var pkey: ?*ssl_c.EVP_PKEY = null;
+    if (ssl_c.EVP_PKEY_keygen(kctx, &pkey) != 1) return error.KeyGen;
+    defer ssl_c.EVP_PKEY_free(pkey);
+
+    const x509 = ssl_c.X509_new() orelse return error.Cert;
+    defer ssl_c.X509_free(x509);
+    if (ssl_c.X509_set_version(x509, 2) != 1) return error.Cert;
+    if (ssl_c.ASN1_INTEGER_set(ssl_c.X509_get_serialNumber(x509), 1) != 1) return error.Cert;
+    if (ssl_c.X509_gmtime_adj(ssl_c.X509_getm_notBefore(x509), 0) == null) return error.Cert;
+    if (ssl_c.X509_gmtime_adj(ssl_c.X509_getm_notAfter(x509), 3600) == null) return error.Cert;
+    if (ssl_c.X509_set_pubkey(x509, pkey) != 1) return error.Cert;
+    if (ssl_c.X509_sign(x509, pkey, ssl_c.EVP_sha256()) == 0) return error.Cert;
+
+    const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_server_method()) orelse return error.SslCtx;
+    errdefer ssl_c.SSL_CTX_free(ctx);
+    if (ssl_c.SSL_CTX_use_certificate(ctx, x509) != 1) return error.Cert;
+    if (ssl_c.SSL_CTX_use_PrivateKey(ctx, pkey) != 1) return error.Cert;
+    return ctx;
+}
+
+/// A loopback TCP connection: `a` is the connecting end, `b` the accepted end.
+const TcpPair = struct {
+    listener: compat.socket_t,
+    a: compat.socket_t,
+    b: compat.socket_t,
+
+    fn init(port: u16) !TcpPair {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+        const listener = try compat.tcpListen(addr);
+        errdefer compat.closeSocket(listener);
+        const a = try compat.tcpConnect(addr);
+        errdefer compat.closeSocket(a);
+        const conn = try compat.accept(listener);
+        return .{ .listener = listener, .a = a, .b = conn.sock };
+    }
+
+    fn deinit(self: *TcpPair) void {
+        compat.closeSocket(self.a);
+        compat.closeSocket(self.b);
+        compat.closeSocket(self.listener);
+    }
+};
+
+/// A completed TLS session over loopback: `client` talks to `server`.
+const TlsPair = struct {
+    tcp: TcpPair,
+    server_ctx: *ssl_c.SSL_CTX,
+    client_ctx: *ssl_c.SSL_CTX,
+    server: *ssl_c.SSL,
+    client: *ssl_c.SSL,
+
+    fn init(port: u16) !TlsPair {
+        var tcp = try TcpPair.init(port);
+        errdefer tcp.deinit();
+        const server_ctx = try testServerCtx();
+        errdefer ssl_c.SSL_CTX_free(server_ctx);
+        const client_ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_client_method()) orelse return error.SslCtx;
+        errdefer ssl_c.SSL_CTX_free(client_ctx);
+        const server = ssl_c.SSL_new(server_ctx) orelse return error.SslNew;
+        errdefer ssl_c.SSL_free(server);
+        const client = ssl_c.SSL_new(client_ctx) orelse return error.SslNew;
+        errdefer ssl_c.SSL_free(client);
+        _ = ssl_c.SSL_set_fd(server, compat.socketToFd(tcp.b));
+        _ = ssl_c.SSL_set_fd(client, compat.socketToFd(tcp.a));
+
+        var connect_rc: c_int = 0;
+        const t = try std.Thread.spawn(.{}, struct {
+            fn run(ssl: *ssl_c.SSL, rc: *c_int) void {
+                rc.* = ssl_c.SSL_connect(ssl);
+            }
+        }.run, .{ client, &connect_rc });
+        const accept_rc = ssl_c.SSL_accept(server);
+        t.join();
+        if (accept_rc != 1 or connect_rc != 1) return error.Handshake;
+        return .{ .tcp = tcp, .server_ctx = server_ctx, .client_ctx = client_ctx, .server = server, .client = client };
+    }
+
+    fn deinit(self: *TlsPair) void {
+        ssl_c.SSL_free(self.client);
+        ssl_c.SSL_free(self.server);
+        ssl_c.SSL_CTX_free(self.client_ctx);
+        ssl_c.SSL_CTX_free(self.server_ctx);
+        self.tcp.deinit();
+    }
+};
+
+test "relayWebSocket forwards a client write larger than its read buffer at once" {
+    var tls = try TlsPair.init(18092);
+    defer tls.deinit();
+    var up = try TcpPair.init(18093);
+    defer up.deinit();
+
+    const relay = try std.Thread.spawn(.{}, relayWebSocket, .{ tls.server, compat.SocketStream{ .handle = up.b } });
+    defer relay.join();
+    // close_notify makes the relay's SSL_read return 0, so the deferred join returns.
+    defer _ = ssl_c.SSL_shutdown(tls.client);
+
+    // One 12,000-byte write is one TLS record: more than the relay's 8 KB read,
+    // so the remainder sits inside BoringSSL where poll() can't see it.
+    var payload: [12_000]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+    try testing.expectEqual(@as(c_int, payload.len), ssl_c.SSL_write(tls.client, &payload, payload.len));
+
+    setSocketTimeout(up.a, .recv, 2);
+    var got: [12_000]u8 = undefined;
+    var total: usize = 0;
+    const upstream = compat.SocketStream{ .handle = up.a };
+    while (total < got.len) {
+        const n = upstream.read(got[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    try testing.expectEqual(payload.len, total);
+    try testing.expectEqualSlices(u8, &payload, &got);
 }
