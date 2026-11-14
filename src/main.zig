@@ -421,6 +421,16 @@ fn doStart(
         std.process.exit(1);
     }
 
+    // Renew the leaf from the kept CA when it's close to expiry (no sudo needed).
+    cert.ensureLeaf(allocator, full_domain) catch |e| {
+        switch (e) {
+            error.CaExpired => std.debug.print("CA expired, run 'zlodev install -f'\n", .{}),
+            error.CaNotFound => std.debug.print("certificates not found, run 'zlodev install' first\n", .{}),
+            else => std.debug.print("certificate renewal failed ({s}), run 'zlodev install -f'\n", .{@errorName(e)}),
+        }
+        std.process.exit(1);
+    };
+
     // Get certificate paths
     var cert_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var key_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
