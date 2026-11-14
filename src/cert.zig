@@ -358,19 +358,12 @@ fn leafNotAfter(crt_path: [:0]const u8, key_path: [:0]const u8) ?i64 {
     return notAfter(crt) catch null;
 }
 
-fn renewLeaf(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []const u8, now: i64) !i64 {
-    const ca_pem = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
-    defer allocator.free(ca_pem);
+fn renewLeaf(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []const u8, ca_cert: *c.X509, now: i64) !i64 {
     const ca_key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.key", .{cert_dir});
     defer allocator.free(ca_key_path);
-
-    const ca_cert = readPemCert(ca_pem) orelse return error.CaNotFound;
-    const ca_key = readPemKey(ca_key_path) orelse {
-        c.X509_free(ca_cert);
-        return error.CaNotFound;
-    };
+    const ca_key = readPemKey(ca_key_path) orelse return error.CaKeyNotFound;
+    defer c.EVP_PKEY_free(ca_key);
     const ca: CertKey = .{ .cert = ca_cert, .key = ca_key };
-    defer ca.deinit();
 
     const ca_not_after = try notAfter(ca.cert);
     if (ca_not_after <= now) return error.CaExpired;
@@ -384,16 +377,22 @@ fn renewLeaf(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []const
 fn ensureLeafIn(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []const u8, now: i64) !Renewal {
     tightenPrivateFiles(cert_dir);
 
+    // The proxy loads the CA cert as a chain cert, so without it start can't serve at all.
+    const ca_pem = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
+    defer allocator.free(ca_pem);
+    const ca_cert = readPemCert(ca_pem) orelse return error.CaNotFound;
+    defer c.X509_free(ca_cert);
+
     const crt_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.crt", .{cert_dir});
     defer allocator.free(crt_path);
     const key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.key", .{cert_dir});
     defer allocator.free(key_path);
 
-    const old = leafNotAfter(crt_path, key_path);
-    if (old) |na| if (!needsRenewal(na, now)) return .current;
+    if (leafNotAfter(crt_path, key_path)) |na| if (!needsRenewal(na, now)) return .current;
 
-    const not_after = renewLeaf(allocator, domain, cert_dir, now) catch |e| {
-        if (old) |na| if (na > now) return .{ .kept = .{ .err = e, .not_after = na } };
+    const not_after = renewLeaf(allocator, domain, cert_dir, ca_cert, now) catch |e| {
+        // Re-read: a failed writeLeaf may have replaced the key but not the cert.
+        if (leafNotAfter(crt_path, key_path)) |na| if (na > now) return .{ .kept = .{ .err = e, .not_after = na } };
         return e;
     };
     return .{ .renewed = not_after };
@@ -923,7 +922,7 @@ test "ensureLeafIn fails with CaExpired and leaves the leaf untouched" {
     try std.testing.expectEqualSlices(u8, before, after);
 }
 
-test "ensureLeafIn keeps a still-valid leaf when the CA is missing" {
+test "ensureLeafIn keeps a still-valid leaf when the CA key is missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var dir_buf: [256]u8 = undefined;
@@ -932,7 +931,7 @@ test "ensureLeafIn keeps a still-valid leaf when the CA is missing" {
     try writeFixture(dir, now, now + 3000 * day_s, now + 10 * day_s);
     try tmp.dir.deleteFile(rt.io(), "zlodevCA.key");
     const r = try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now);
-    try std.testing.expectEqual(error.CaNotFound, r.kept.err);
+    try std.testing.expectEqual(error.CaKeyNotFound, r.kept.err);
     try std.testing.expectEqual(now + 10 * day_s, r.kept.not_after);
 }
 
@@ -943,6 +942,29 @@ test "ensureLeafIn fails when the leaf is expired and the CA is missing" {
     const dir = try tmpDirPath(&dir_buf, &tmp);
     const now: i64 = 1794614400;
     try writeFixture(dir, now, now + 3000 * day_s, now - day_s);
+    try tmp.dir.deleteFile(rt.io(), "zlodevCA.pem");
+    try std.testing.expectError(error.CaNotFound, ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+}
+
+test "ensureLeafIn fails with CaKeyNotFound when the leaf is expired and the CA key is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now - day_s);
+    try tmp.dir.deleteFile(rt.io(), "zlodevCA.key");
+    try std.testing.expectError(error.CaKeyNotFound, ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+}
+
+test "ensureLeafIn fails when the CA cert is missing, even with a current leaf" {
+    // The proxy loads zlodevCA.pem as a chain cert, so start can't serve without it.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 200 * day_s);
     try tmp.dir.deleteFile(rt.io(), "zlodevCA.pem");
     try std.testing.expectError(error.CaNotFound, ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
 }

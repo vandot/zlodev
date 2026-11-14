@@ -426,6 +426,7 @@ fn doStart(
         switch (e) {
             error.CaExpired => std.debug.print("CA expired, run 'zlodev install -f'\n", .{}),
             error.CaNotFound => std.debug.print("certificates not found, run 'zlodev install' first\n", .{}),
+            error.CaKeyNotFound => std.debug.print("CA key missing or unreadable, run 'zlodev install -f'\n", .{}),
             else => std.debug.print("certificate renewal failed ({s}), run 'zlodev install -f'\n", .{@errorName(e)}),
         }
         std.process.exit(1);
