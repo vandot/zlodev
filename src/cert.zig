@@ -87,12 +87,24 @@ fn generateRsaKey() !*c.EVP_PKEY {
     return pkey orelse error.KeyGenFailed;
 }
 
+/// Write a private key readable only by the owner. The PEM is built in memory so
+/// the file is created 0600 rather than with the umask's 0644, and an existing
+/// key from an older install is tightened before the new key is written into it.
 fn writePemKey(path: [:0]const u8, pkey: *c.EVP_PKEY) !void {
-    const bio = c.BIO_new_file(path.ptr, "w") orelse return error.FileWriteFailed;
+    const bio = c.BIO_new(c.BIO_s_mem()) orelse return error.FileWriteFailed;
     defer _ = c.BIO_free(bio);
     if (c.PEM_write_bio_PrivateKey(bio, pkey, null, null, 0, null, null) != 1)
         return error.FileWriteFailed;
-    // Note: Key file should be chmod 0600 (owner-only) — handle via system/installation wrapper
+    var pem_ptr: [*c]const u8 = undefined;
+    var pem_len: usize = 0;
+    if (c.BIO_mem_contents(bio, &pem_ptr, &pem_len) != 1) return error.FileWriteFailed;
+
+    const io = rt.io();
+    const owner_only: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .permissions = owner_only }) catch return error.FileWriteFailed;
+    defer file.close(io);
+    if (builtin.os.tag != .windows) file.setPermissions(io, owner_only) catch return error.FileWriteFailed;
+    file.writeStreamingAll(io, pem_ptr[0..pem_len]) catch return error.FileWriteFailed;
 }
 
 fn writePemCert(path: [:0]const u8, x509: *c.X509) !void {
@@ -267,15 +279,19 @@ fn generateDomainCert(allocator: std.mem.Allocator, domain: []const u8, ca_cert:
     try writePemKey(key_path, domain_key);
 }
 
+/// Create the cert dir (and parents) and restrict it to the owner, including a
+/// dir left 0755 by an older install. Windows relies on the user-profile ACL.
+fn makePrivateDir(path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(rt.io(), path);
+    if (builtin.os.tag != .windows) try cwd.setFilePermissions(rt.io(), path, .fromMode(0o700), .{});
+}
+
 pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cert_dir = try getCertPath(&path_buf, domain);
 
-    // Create directories (recursively, in case intermediate dirs don't exist)
-    std.Io.Dir.createDirAbsolute(rt.io(), cert_dir, .default_dir) catch {
-        // If single-level create failed, try creating the full path
-        std.Io.Dir.cwd().createDirPath(rt.io(), cert_dir) catch return error.CertCreateFailed;
-    };
+    makePrivateDir(cert_dir) catch return error.CertCreateFailed;
 
     // Generate CA certificate and key
     const ca = try generateCA(allocator, domain, cert_dir);
@@ -536,3 +552,57 @@ fn getFingerprint(ca_path: []const u8) ![40]u8 {
     return hex;
 }
 
+
+fn testKey() !*c.EVP_PKEY {
+    return generateRsaKey();
+}
+
+fn tmpPathZ(buf: []u8, tmp: *const std.testing.TmpDir, name: []const u8) ![:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, ".zig-cache" ++ sep ++ "tmp" ++ sep ++ "{s}" ++ sep ++ "{s}", .{ &tmp.sub_path, name }, 0);
+}
+
+fn modeOf(dir: std.Io.Dir, sub_path: []const u8) !std.posix.mode_t {
+    const st = try dir.statFile(rt.io(), sub_path, .{});
+    return st.permissions.toMode() & 0o777;
+}
+
+test "writePemKey creates a key file only the owner can read" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const key = try testKey();
+    defer c.EVP_PKEY_free(key);
+    var buf: [256]u8 = undefined;
+    try writePemKey(try tmpPathZ(&buf, &tmp, "k.key"), key);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "k.key"));
+}
+
+test "writePemKey tightens an existing world-readable key file" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Keys written by older versions are 0644; O_CREAT's mode won't touch them.
+    const old = try tmp.dir.createFile(rt.io(), "k.key", .{ .permissions = .fromMode(0o644) });
+    old.close(rt.io());
+    const key = try testKey();
+    defer c.EVP_PKEY_free(key);
+    var buf: [256]u8 = undefined;
+    try writePemKey(try tmpPathZ(&buf, &tmp, "k.key"), key);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "k.key"));
+    const contents = try tmp.dir.readFileAlloc(rt.io(), "k.key", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expect(std.mem.startsWith(u8, contents, "-----BEGIN PRIVATE KEY-----"));
+}
+
+test "makePrivateDir creates the cert dir and tightens an existing one to 0700" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    try makePrivateDir(try tmpPathZ(&buf, &tmp, "a" ++ sep ++ "b"));
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), try modeOf(tmp.dir, "a" ++ sep ++ "b"));
+
+    try tmp.dir.createDir(rt.io(), "open", .fromMode(0o755));
+    try makePrivateDir(try tmpPathZ(&buf, &tmp, "open"));
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), try modeOf(tmp.dir, "open"));
+}
