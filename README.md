@@ -36,6 +36,14 @@ Pre-built binaries have no external dependencies — single binary, nothing to i
 curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh
 ```
 
+The script checks the download against the release's `SHA256SUMS`. Release archives also carry a signed [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), which you can check with the GitHub CLI after downloading an archive by hand:
+
+```sh
+gh attestation verify zlodev-linux-amd64.tar.gz --repo vandot/zlodev
+```
+
+Checksums and attestations are published for releases after v0.5.1.
+
 ### Build from source
 
 Building from source requires [Zig](https://ziglang.org/download/) 0.17.0. No other dependencies — BoringSSL is compiled from source automatically.

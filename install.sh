@@ -20,6 +20,15 @@ case "$ARCH" in
     *)             echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
+# fetch URL DEST
+fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" -o "$2"
+    else
+        wget -qO "$2" "$1"
+    fi
+}
+
 # Get latest version
 if command -v curl >/dev/null 2>&1; then
     LATEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
@@ -41,10 +50,32 @@ echo "Downloading zlodev v${LATEST} for ${os}/${arch}..."
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$URL" -o "${TMPDIR}/zlodev.tar.gz"
+fetch "$URL" "${TMPDIR}/zlodev.tar.gz"
+
+# Verify the download against the release's SHA256SUMS. Releases before
+# checksums were published have no such file; those install unverified.
+SUMS_URL="https://github.com/${REPO}/releases/download/v${LATEST}/SHA256SUMS"
+if fetch "$SUMS_URL" "${TMPDIR}/SHA256SUMS" 2>/dev/null; then
+    expected=$(awk -v f="${ARTIFACT}.tar.gz" '$2 == f || $2 == "*" f { print $1 }' "${TMPDIR}/SHA256SUMS")
+    if [ -z "$expected" ]; then
+        echo "Checksum for ${ARTIFACT}.tar.gz not found in SHA256SUMS"; exit 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "${TMPDIR}/zlodev.tar.gz" | awk '{ print $1 }')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "${TMPDIR}/zlodev.tar.gz" | awk '{ print $1 }')
+    else
+        echo "sha256sum or shasum is required to verify the download"; exit 1
+    fi
+    if [ "$actual" != "$expected" ]; then
+        echo "Checksum mismatch for ${ARTIFACT}.tar.gz"
+        echo "  expected: $expected"
+        echo "  actual:   $actual"
+        exit 1
+    fi
+    echo "Checksum verified."
 else
-    wget -qO "${TMPDIR}/zlodev.tar.gz" "$URL"
+    echo "Warning: v${LATEST} has no SHA256SUMS; skipping checksum verification."
 fi
 
 tar -xzf "${TMPDIR}/zlodev.tar.gz" -C "$TMPDIR"
