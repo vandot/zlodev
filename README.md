@@ -140,6 +140,7 @@ zlodev start --dns          start DNS server only (log mode)
 -c=PATH, --config=PATH     config file path [default .zlodev]
 --max-body=SIZE            max request body size [default 10M]
 --no-tui                   disable TUI, log to stderr
+--insecure-upstream        don't verify external route certificates
 -l, --local                use .local domain (mDNS)
 --dns                      DNS only (install/uninstall/start)
 --cert                     certificates only (install/uninstall)
@@ -202,6 +203,8 @@ zlodev start --route=/payments=payments.stripe.com:443
 Priority: subdomain match > longest path prefix > default port.
 
 External routes connect via TLS, rewrite the `Host` header to the upstream hostname, and rewrite `Set-Cookie` domain attributes to `dev.lo` so cookies work correctly in the browser. If no port is specified, defaults to 443.
+
+The upstream's certificate is verified against your system's trusted roots and must match the route's hostname; otherwise the request gets a 502 that says so. On macOS and Linux the roots come from the system PEM bundle (`/etc/ssl/cert.pem`, `/etc/ssl/certs/ca-certificates.crt`, …), on Windows from the system root store; set `SSL_CERT_FILE` to use your own bundle. For a staging server with a self-signed certificate, pass `--insecure-upstream` (or `insecure-upstream` in `.zlodev`) to skip verification.
 
 > **Note:** Subdomain routes are not supported in local mode (`-l`), since mDNS does not support arbitrary subdomains.
 
