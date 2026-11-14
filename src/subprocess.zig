@@ -362,6 +362,8 @@ fn spawnChild() !void {
         &.{ "/bin/sh", "-c", cmd };
     const child = try std.process.spawn(rt.io(), .{
         .argv = argv,
+        // The TUI owns the terminal; a background-group child reading it gets SIGTTIN.
+        .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         // Own process group so stop/restart can signal grandchildren (npm workers).
@@ -605,6 +607,24 @@ test "start runs command through platform shell and logs output + exit" {
     }
     try std.testing.expect(saw_hello);
     try std.testing.expect(saw_exit);
+}
+
+test "child stdin is /dev/null so terminal reads can't stop it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // A background-group child reading the TUI's terminal gets SIGTTIN and stops.
+    try start(std.testing.allocator, "if [ /dev/fd/0 -ef /dev/null ]; then echo stdin=null; else echo stdin=other; fi");
+    defer stop();
+    const deadline = rt.milliTimestamp() + 5000;
+    while (isRunning() and rt.milliTimestamp() < deadline) rt.sleepMs(20);
+    try std.testing.expect(!isRunning());
+
+    var dest: [max_log_lines]LogLine = undefined;
+    const n = copyRange(&dest, 0, dest.len);
+    var saw_null = false;
+    for (dest[0..n]) |line| {
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, line.bytes[0..line.len], " "), "stdin=null")) saw_null = true;
+    }
+    try std.testing.expect(saw_null);
 }
 
 test "stopChild kills the whole process group" {
