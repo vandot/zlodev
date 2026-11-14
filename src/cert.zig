@@ -142,32 +142,60 @@ fn setNameEntry(name: *c.X509_NAME, nid: c_int, value: []const u8) !void {
         return error.CertCreateFailed;
 }
 
-fn generateCA(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []const u8) !struct { cert_x509: *c.X509, key: *c.EVP_PKEY } {
-    // Generate CA key
-    const ca_key = try generateRsaKey();
-    errdefer c.EVP_PKEY_free(ca_key);
+const day_s: i64 = 24 * 60 * 60;
+const ca_days: i64 = 3650;
+const leaf_days: i64 = 398;
 
-    // Create certificate
-    const ca_cert = c.X509_new() orelse return error.CertCreateFailed;
-    errdefer c.X509_free(ca_cert);
+const CertKey = struct {
+    cert: *c.X509,
+    key: *c.EVP_PKEY,
 
-    // Version 3
-    if (c.X509_set_version(ca_cert, 2) != 1) return error.CertCreateFailed;
+    fn deinit(self: CertKey) void {
+        c.X509_free(self.cert);
+        c.EVP_PKEY_free(self.key);
+    }
+};
 
-    // Random serial number
+fn setValidity(x509: *c.X509, not_before: i64, not_after: i64) !void {
+    if (c.ASN1_TIME_set_posix(c.X509_getm_notBefore(x509), not_before) == null) return error.CertCreateFailed;
+    if (c.ASN1_TIME_set_posix(c.X509_getm_notAfter(x509), not_after) == null) return error.CertCreateFailed;
+}
+
+fn setRandomSerial(x509: *c.X509) !void {
     const serial_bn = c.BN_new() orelse return error.CertCreateFailed;
     defer c.BN_free(serial_bn);
     if (c.BN_rand(serial_bn, 64, 0, 0) != 1) return error.CertCreateFailed;
-    const serial_asn1 = c.X509_get_serialNumber(ca_cert);
-    if (c.BN_to_ASN1_INTEGER(serial_bn, serial_asn1) == null) return error.CertCreateFailed;
+    if (c.BN_to_ASN1_INTEGER(serial_bn, c.X509_get_serialNumber(x509)) == null) return error.CertCreateFailed;
+}
 
-    // Validity: now to +3650 days
-    const not_before = c.X509_get_notBefore(ca_cert);
-    if (c.X509_gmtime_adj(not_before, 0) == null) return error.CertCreateFailed;
-    const not_after = c.X509_get_notAfter(ca_cert);
-    if (c.X509_gmtime_adj(not_after, 3650 * 24 * 60 * 60) == null) return error.CertCreateFailed;
+fn notAfter(x509: *c.X509) !i64 {
+    var t: i64 = 0;
+    if (c.ASN1_TIME_to_posix(c.X509_get0_notAfter(x509), &t) != 1) return error.CertReadFailed;
+    return t;
+}
 
-    // Subject name
+fn readPemCert(path: [:0]const u8) ?*c.X509 {
+    const bio = c.BIO_new_file(path.ptr, "r") orelse return null;
+    defer _ = c.BIO_free(bio);
+    return c.PEM_read_bio_X509(bio, null, null, null);
+}
+
+fn readPemKey(path: [:0]const u8) ?*c.EVP_PKEY {
+    const bio = c.BIO_new_file(path.ptr, "r") orelse return null;
+    defer _ = c.BIO_free(bio);
+    return c.PEM_read_bio_PrivateKey(bio, null, null, null);
+}
+
+fn buildCA(allocator: std.mem.Allocator, domain: []const u8, not_before: i64, not_after: i64) !CertKey {
+    const ca_key = try generateRsaKey();
+    errdefer c.EVP_PKEY_free(ca_key);
+    const ca_cert = c.X509_new() orelse return error.CertCreateFailed;
+    errdefer c.X509_free(ca_cert);
+
+    if (c.X509_set_version(ca_cert, 2) != 1) return error.CertCreateFailed;
+    try setRandomSerial(ca_cert);
+    try setValidity(ca_cert, not_before, not_after);
+
     const name = c.X509_get_subject_name(ca_cert) orelse return error.CertCreateFailed;
     try setNameEntry(name, c.NID_countryName, "LO");
     try setNameEntry(name, c.NID_stateOrProvinceName, "Dev");
@@ -183,19 +211,17 @@ fn generateCA(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []cons
 
     // Self-signed: issuer = subject
     if (c.X509_set_issuer_name(ca_cert, name) != 1) return error.CertCreateFailed;
-
-    // Set public key
     if (c.X509_set_pubkey(ca_cert, ca_key) != 1) return error.CertCreateFailed;
 
-    // Extensions
     try addExtension(ca_cert, null, c.NID_basic_constraints, "critical,CA:TRUE,pathlen:0");
     try addExtension(ca_cert, null, c.NID_key_usage, "critical,keyCertSign");
     try addExtension(ca_cert, null, c.NID_subject_key_identifier, "hash");
 
-    // Sign
     if (c.X509_sign(ca_cert, ca_key, c.EVP_sha256()) == 0) return error.SignFailed;
+    return .{ .cert = ca_cert, .key = ca_key };
+}
 
-    // Write files directly to cert_dir
+fn writeCA(allocator: std.mem.Allocator, cert_dir: []const u8, ca: CertKey) !void {
     const ca_pem_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
     defer allocator.free(ca_pem_path);
     const ca_key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.key", .{cert_dir});
@@ -203,80 +229,75 @@ fn generateCA(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []cons
     const ca_der_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.der", .{cert_dir});
     defer allocator.free(ca_der_path);
 
-    try writePemCert(ca_pem_path, ca_cert);
-    try writePemKey(ca_key_path, ca_key);
-    try writeDerCert(ca_der_path, ca_cert);
-
-    return .{ .cert_x509 = ca_cert, .key = ca_key };
+    try writePemCert(ca_pem_path, ca.cert);
+    try writePemKey(ca_key_path, ca.key);
+    try writeDerCert(ca_der_path, ca.cert);
 }
 
-fn generateDomainCert(allocator: std.mem.Allocator, domain: []const u8, ca_cert: *c.X509, ca_key: *c.EVP_PKEY, cert_dir: []const u8) !void {
-    // Generate domain key
-    const domain_key = try generateRsaKey();
-    defer c.EVP_PKEY_free(domain_key);
+fn buildCert(allocator: std.mem.Allocator, cn: []const u8, san: [:0]const u8, ca: CertKey, not_before: i64, not_after: i64) !CertKey {
+    const key = try generateRsaKey();
+    errdefer c.EVP_PKEY_free(key);
+    const cert_x509 = c.X509_new() orelse return error.CertCreateFailed;
+    errdefer c.X509_free(cert_x509);
 
-    // Create certificate
-    const domain_cert = c.X509_new() orelse return error.CertCreateFailed;
-    defer c.X509_free(domain_cert);
+    if (c.X509_set_version(cert_x509, 2) != 1) return error.CertCreateFailed;
+    try setRandomSerial(cert_x509);
+    try setValidity(cert_x509, not_before, not_after);
 
-    // Version 3
-    if (c.X509_set_version(domain_cert, 2) != 1) return error.CertCreateFailed;
-
-    // Random serial
-    const serial_bn = c.BN_new() orelse return error.CertCreateFailed;
-    defer c.BN_free(serial_bn);
-    if (c.BN_rand(serial_bn, 64, 0, 0) != 1) return error.CertCreateFailed;
-    const serial_asn1 = c.X509_get_serialNumber(domain_cert);
-    if (c.BN_to_ASN1_INTEGER(serial_bn, serial_asn1) == null) return error.CertCreateFailed;
-
-    // Validity: now to +398 days
-    const not_before = c.X509_get_notBefore(domain_cert);
-    if (c.X509_gmtime_adj(not_before, 0) == null) return error.CertCreateFailed;
-    const not_after = c.X509_get_notAfter(domain_cert);
-    if (c.X509_gmtime_adj(not_after, 398 * 24 * 60 * 60) == null) return error.CertCreateFailed;
-
-    // Subject name
-    const name = c.X509_get_subject_name(domain_cert) orelse return error.CertCreateFailed;
+    const name = c.X509_get_subject_name(cert_x509) orelse return error.CertCreateFailed;
     try setNameEntry(name, c.NID_countryName, "LO");
     try setNameEntry(name, c.NID_stateOrProvinceName, "Dev");
     try setNameEntry(name, c.NID_localityName, "Local");
     try setNameEntry(name, c.NID_organizationName, "Dev");
     try setNameEntry(name, c.NID_organizationalUnitName, "Local");
 
-    const cn_z = try allocPrintZ(allocator, "{s}", .{domain});
+    const cn_z = try allocPrintZ(allocator, "{s}", .{cn});
     defer allocator.free(cn_z);
     const cn_z_truncated = if (cn_z.len > 64) cn_z[0..64] else @as([]const u8, cn_z);
     try setNameEntry(name, c.NID_commonName, cn_z_truncated);
 
-    // Issuer = CA subject
-    const ca_subject = c.X509_get_subject_name(ca_cert) orelse return error.CertCreateFailed;
-    if (c.X509_set_issuer_name(domain_cert, ca_subject) != 1) return error.CertCreateFailed;
+    const ca_subject = c.X509_get_subject_name(ca.cert) orelse return error.CertCreateFailed;
+    if (c.X509_set_issuer_name(cert_x509, ca_subject) != 1) return error.CertCreateFailed;
+    if (c.X509_set_pubkey(cert_x509, key) != 1) return error.CertCreateFailed;
 
-    // Set public key
-    if (c.X509_set_pubkey(domain_cert, domain_key) != 1) return error.CertCreateFailed;
+    try addExtension(cert_x509, ca.cert, c.NID_authority_key_identifier, "keyid:always");
+    try addExtension(cert_x509, ca.cert, c.NID_basic_constraints, "critical,CA:FALSE");
+    try addExtension(cert_x509, ca.cert, c.NID_key_usage, "critical,digitalSignature,keyEncipherment");
+    try addExtension(cert_x509, ca.cert, c.NID_ext_key_usage, "serverAuth");
+    try addExtension(cert_x509, ca.cert, c.NID_subject_alt_name, san);
 
-    // Extensions
-    try addExtension(domain_cert, ca_cert, c.NID_authority_key_identifier, "keyid:always");
-    try addExtension(domain_cert, ca_cert, c.NID_basic_constraints, "critical,CA:FALSE");
-    try addExtension(domain_cert, ca_cert, c.NID_key_usage, "critical,digitalSignature,keyEncipherment");
-    try addExtension(domain_cert, ca_cert, c.NID_ext_key_usage, "serverAuth");
+    if (c.X509_sign(cert_x509, ca.key, c.EVP_sha256()) == 0) return error.SignFailed;
+    return .{ .cert = cert_x509, .key = key };
+}
 
-    // SAN
+fn buildLeaf(allocator: std.mem.Allocator, domain: []const u8, ca: CertKey, not_before: i64, not_after: i64) !CertKey {
     const san = try allocPrintZ(allocator, "DNS:*.{s},DNS:{s}", .{ domain, domain });
     defer allocator.free(san);
-    try addExtension(domain_cert, ca_cert, c.NID_subject_alt_name, san);
+    return buildCert(allocator, domain, san, ca, not_before, not_after);
+}
 
-    // Sign with CA key
-    if (c.X509_sign(domain_cert, ca_key, c.EVP_sha256()) == 0) return error.SignFailed;
-
-    // Write files
-    const cert_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.crt", .{cert_dir});
-    defer allocator.free(cert_path);
+/// Write the leaf next to the old one, then rename over it, so a failed write never
+/// leaves a half-written cert. Key goes first: a crash between the renames leaves a
+/// mismatched pair, which ensureLeafIn detects and renews on the next start.
+fn writeLeaf(allocator: std.mem.Allocator, cert_dir: []const u8, leaf: CertKey) !void {
+    const crt_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.crt", .{cert_dir});
+    defer allocator.free(crt_path);
     const key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.key", .{cert_dir});
     defer allocator.free(key_path);
+    const crt_tmp = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.crt.tmp", .{cert_dir});
+    defer allocator.free(crt_tmp);
+    const key_tmp = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.key.tmp", .{cert_dir});
+    defer allocator.free(key_tmp);
 
-    try writePemCert(cert_path, domain_cert);
-    try writePemKey(key_path, domain_key);
+    const io = rt.io();
+    const cwd = std.Io.Dir.cwd();
+    errdefer cwd.deleteFile(io, crt_tmp) catch {};
+    errdefer cwd.deleteFile(io, key_tmp) catch {};
+
+    try writePemKey(key_tmp, leaf.key);
+    try writePemCert(crt_tmp, leaf.cert);
+    cwd.rename(key_tmp, cwd, key_path, io) catch return error.FileWriteFailed;
+    cwd.rename(crt_tmp, cwd, crt_path, io) catch return error.FileWriteFailed;
 }
 
 /// Create the cert dir (and parents) and restrict it to the owner, including a
@@ -293,13 +314,14 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
 
     makePrivateDir(cert_dir) catch return error.CertCreateFailed;
 
-    // Generate CA certificate and key
-    const ca = try generateCA(allocator, domain, cert_dir);
-    defer c.X509_free(ca.cert_x509);
-    defer c.EVP_PKEY_free(ca.key);
+    const now = rt.timestamp();
+    const ca = try buildCA(allocator, domain, now, now + ca_days * day_s);
+    defer ca.deinit();
+    try writeCA(allocator, cert_dir, ca);
 
-    // Generate domain certificate signed by CA
-    try generateDomainCert(allocator, domain, ca.cert_x509, ca.key, cert_dir);
+    const leaf = try buildLeaf(allocator, domain, ca, now, now + leaf_days * day_s);
+    defer leaf.deinit();
+    try writeLeaf(allocator, cert_dir, leaf);
 
     // Install CA to system trust store
     const ca_path = try std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
@@ -605,4 +627,48 @@ test "makePrivateDir creates the cert dir and tightens an existing one to 0700" 
     try tmp.dir.createDir(rt.io(), "open", .fromMode(0o755));
     try makePrivateDir(try tmpPathZ(&buf, &tmp, "open"));
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), try modeOf(tmp.dir, "open"));
+}
+
+fn tmpDirPath(buf: []u8, tmp: *const std.testing.TmpDir) ![]const u8 {
+    return std.fmt.bufPrint(buf, ".zig-cache" ++ sep ++ "tmp" ++ sep ++ "{s}", .{&tmp.sub_path});
+}
+
+test "buildLeaf uses the requested validity and the CA as issuer" {
+    const now: i64 = 1794614400; // 2026-11-14
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now, now + ca_days * day_s);
+    defer ca.deinit();
+    const leaf = try buildLeaf(std.testing.allocator, "dev.lo", ca, now, now + 10 * day_s);
+    defer leaf.deinit();
+    try std.testing.expectEqual(now + 10 * day_s, try notAfter(leaf.cert));
+    try std.testing.expectEqual(@as(c_int, 0), c.X509_NAME_cmp(c.X509_get_issuer_name(leaf.cert), c.X509_get_subject_name(ca.cert)));
+    try std.testing.expectEqual(@as(c_int, 1), c.X509_verify(leaf.cert, ca.key));
+}
+
+test "writeLeaf replaces both files and leaves no tmp files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    // Old files from a previous leaf, plus a stale world-readable tmp key from a crashed run.
+    for ([_][]const u8{ "zlodev.crt", "zlodev.key", "zlodev.key.tmp" }) |name| {
+        const f = try tmp.dir.createFile(rt.io(), name, .{ .permissions = .fromMode(0o644) });
+        f.close(rt.io());
+    }
+    const now: i64 = 1794614400;
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now, now + ca_days * day_s);
+    defer ca.deinit();
+    const leaf = try buildLeaf(std.testing.allocator, "dev.lo", ca, now, now + leaf_days * day_s);
+    defer leaf.deinit();
+    try writeLeaf(std.testing.allocator, dir, leaf);
+
+    var buf: [256]u8 = undefined;
+    const crt = readPemCert(try tmpPathZ(&buf, &tmp, "zlodev.crt")) orelse return error.TestUnexpectedResult;
+    defer c.X509_free(crt);
+    const key = readPemKey(try tmpPathZ(&buf, &tmp, "zlodev.key")) orelse return error.TestUnexpectedResult;
+    defer c.EVP_PKEY_free(key);
+    try std.testing.expectEqual(@as(c_int, 1), c.X509_check_private_key(crt, key));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(rt.io(), "zlodev.crt.tmp", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(rt.io(), "zlodev.key.tmp", .{}));
+    if (builtin.os.tag != .windows)
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "zlodev.key"));
 }
