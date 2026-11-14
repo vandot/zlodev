@@ -216,6 +216,10 @@ fn buildCA(allocator: std.mem.Allocator, domain: []const u8, not_before: i64, no
     try addExtension(ca_cert, null, c.NID_basic_constraints, "critical,CA:TRUE,pathlen:0");
     try addExtension(ca_cert, null, c.NID_key_usage, "critical,keyCertSign");
     try addExtension(ca_cert, null, c.NID_subject_key_identifier, "hash");
+    // Limit the CA to the zlodev domain, so a leaked CA key can't mint certs for other sites or IPs.
+    const nc = try allocPrintZ(allocator, "critical,permitted;DNS:{s},excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:0:0:0:0:0:0:0:0/0:0:0:0:0:0:0:0", .{domain});
+    defer allocator.free(nc);
+    try addExtension(ca_cert, null, c.NID_name_constraints, nc);
 
     if (c.X509_sign(ca_cert, ca_key, c.EVP_sha256()) == 0) return error.SignFailed;
     return .{ .cert = ca_cert, .key = ca_key };
@@ -958,4 +962,58 @@ test "ensureLeafIn tightens key files and the dir left open by older versions" {
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "zlodevCA.key"));
     const st = try std.Io.Dir.cwd().statFile(rt.io(), dir, .{});
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), st.permissions.toMode() & 0o777);
+}
+
+/// X509_V_* result of verifying `leaf` with `ca` as the only trust anchor (0 = OK).
+fn verifyError(ca: *c.X509, leaf: *c.X509) !c_int {
+    const store = c.X509_STORE_new() orelse return error.OutOfMemory;
+    defer c.X509_STORE_free(store);
+    if (c.X509_STORE_add_cert(store, ca) != 1) return error.CertReadFailed;
+    const ctx = c.X509_STORE_CTX_new() orelse return error.OutOfMemory;
+    defer c.X509_STORE_CTX_free(ctx);
+    if (c.X509_STORE_CTX_init(ctx, store, leaf, null) != 1) return error.CertReadFailed;
+    _ = c.X509_verify_cert(ctx);
+    return c.X509_STORE_CTX_get_error(ctx);
+}
+
+test "CA name constraint allows dev.lo and *.dev.lo" {
+    const now = rt.timestamp();
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now - day_s, now + ca_days * day_s);
+    defer ca.deinit();
+    const leaf = try buildLeaf(std.testing.allocator, "dev.lo", ca, now - day_s, now + leaf_days * day_s);
+    defer leaf.deinit();
+    try std.testing.expectEqual(@as(c_int, c.X509_V_OK), try verifyError(ca.cert, leaf.cert));
+}
+
+test "CA name constraint rejects other domains" {
+    const now = rt.timestamp();
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now - day_s, now + ca_days * day_s);
+    defer ca.deinit();
+    const leaf = try buildLeaf(std.testing.allocator, "evil.com", ca, now - day_s, now + leaf_days * day_s);
+    defer leaf.deinit();
+    try std.testing.expectEqual(@as(c_int, c.X509_V_ERR_PERMITTED_VIOLATION), try verifyError(ca.cert, leaf.cert));
+}
+
+test "CA name constraint rejects IP address certificates" {
+    const now = rt.timestamp();
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now - day_s, now + ca_days * day_s);
+    defer ca.deinit();
+    const leaf = try buildCert(std.testing.allocator, "x.dev.lo", "IP:127.0.0.1", ca, now - day_s, now + leaf_days * day_s);
+    defer leaf.deinit();
+    // BoringSSL doesn't evaluate IP subtrees and rejects with UNSUPPORTED_CONSTRAINT_TYPE;
+    // other verifiers report EXCLUDED_VIOLATION. Either way the leaf is refused.
+    const err = try verifyError(ca.cert, leaf.cert);
+    try std.testing.expect(err == c.X509_V_ERR_EXCLUDED_VIOLATION or err == c.X509_V_ERR_UNSUPPORTED_CONSTRAINT_TYPE);
+}
+
+test "CA name constraint follows the -l domain" {
+    const now = rt.timestamp();
+    const ca = try buildCA(std.testing.allocator, "mybox.local", now - day_s, now + ca_days * day_s);
+    defer ca.deinit();
+    const ok = try buildLeaf(std.testing.allocator, "mybox.local", ca, now - day_s, now + leaf_days * day_s);
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(c_int, c.X509_V_OK), try verifyError(ca.cert, ok.cert));
+    const bad = try buildLeaf(std.testing.allocator, "dev.lo", ca, now - day_s, now + leaf_days * day_s);
+    defer bad.deinit();
+    try std.testing.expectEqual(@as(c_int, c.X509_V_ERR_PERMITTED_VIOLATION), try verifyError(ca.cert, bad.cert));
 }
