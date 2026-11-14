@@ -310,6 +310,19 @@ fn listenTcp(ip: Ip, reuse: bool) SocketError!socket_t {
 
 pub const Accepted = struct { sock: socket_t, addr: Ip };
 
+/// True for 127.0.0.0/8, ::1 and IPv4-mapped 127.x (::ffff:127.x.x.x).
+pub fn isLoopback(addr: Ip) bool {
+    switch (addr) {
+        .ip4 => |a| return a.bytes[0] == 127,
+        .ip6 => |a| {
+            const b = a.bytes;
+            if (std.mem.allEqual(u8, b[0..15], 0) and b[15] == 1) return true;
+            const mapped = std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff;
+            return mapped and b[12] == 127;
+        },
+    }
+}
+
 /// Accept one connection (blocking).
 pub fn accept(listener: socket_t) SocketError!Accepted {
     var sa: SockAddr = .{};
@@ -577,4 +590,15 @@ test "pollWhileRunning returns stopped immediately when already shut down" {
     defer TestFlag.running.store(true, .release);
     var fds = [0]pollfd{};
     try std.testing.expectEqual(WaitResult.stopped, pollWhileRunning(&fds, 30_000, TestFlag.isRunning));
+}
+
+test "isLoopback accepts 127/8, ::1 and IPv4-mapped loopback only" {
+    try std.testing.expect(isLoopback(try Ip.parse("127.0.0.1", 0)));
+    try std.testing.expect(isLoopback(try Ip.parse("127.1.2.3", 0)));
+    try std.testing.expect(isLoopback(try Ip.parse("::1", 0)));
+    try std.testing.expect(isLoopback(try Ip.parse("::ffff:127.0.0.1", 0)));
+    try std.testing.expect(!isLoopback(try Ip.parse("192.168.1.20", 0)));
+    try std.testing.expect(!isLoopback(try Ip.parse("10.0.0.1", 0)));
+    try std.testing.expect(!isLoopback(try Ip.parse("::ffff:192.168.1.20", 0)));
+    try std.testing.expect(!isLoopback(try Ip.parse("fe80::1", 0)));
 }

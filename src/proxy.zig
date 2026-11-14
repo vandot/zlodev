@@ -28,6 +28,8 @@ pub const ProxyConfig = struct {
     target_host: []const u8,
     target_port: u16,
     listen_addr: []const u8,
+    /// Drop clients that aren't on this machine (default mode, no explicit bind).
+    loopback_only: bool = false,
     cert_path: [:0]const u8,
     key_path: [:0]const u8,
     ca_path: [:0]const u8,
@@ -240,6 +242,12 @@ pub fn start(config: *const ProxyConfig, listener: compat.socket_t) !void {
             continue;
         };
         consecutive_failures = 0;
+        if (config.loopback_only and !compat.isLoopback(conn.addr)) {
+            var addr_buf: [46]u8 = undefined;
+            log.info("component=proxy op=reject_remote client={s}", .{formatAddress(conn.addr, &addr_buf)});
+            compat.closeSocket(conn.sock);
+            continue;
+        }
 
         const ssl = ssl_c.SSL_new(ctx) orelse {
             log.err("component=proxy op=ssl_new error=alloc_failed", .{});
