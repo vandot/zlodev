@@ -107,5 +107,6 @@ win32.zig         Win32/Winsock bindings Zig 0.17 std no longer exposes (console
 - Proxy rejects any request whose body overflows entry's 32KB `req_body` (413 status) instead of forwarding partial data — forwarding still goes through fixed-size `Entry`, so `--max-body` above 32KB no effect yet.
 - Linux `install` and `install --dns` both call `requireSystemdResolved` (PID 1 = systemd and systemd-resolved active, checked by `dns.systemdResolvedReady`); failed `systemd-networkd` restart aborts install, not ignored.
 - After `sslSendError`, always `return` (never `continue` in keep-alive loop) — TLS state may be corrupted.
-- `forwardResponseFromEntry` always emits `Content-Length`, even for zero-length bodies.
+- `forwardResponseFromEntry` emits recomputed `Content-Length`, even for zero-length bodies, except for bodiless responses (HEAD/1xx/204/304).
+- Responses to HEAD and 1xx/204/304 never carry body (`http_wire.responseHasBody`): proxy reads no body, keeps connection alive, forwards upstream headers unchanged (HEAD keeps `Content-Length`). `readResponseHead` skips interim 1xx heads (100 Continue, 103 Early Hints), returns 101 as final. Proxy tests needing full `handleConnection` path use `ProxyHarness` + `FakeUpstream`.
 - TUI split-pane layout uses `win.child()` for clipping; requests pane rendered into child window w/ `draw_footer=false` so footer not drawn mid-split.
