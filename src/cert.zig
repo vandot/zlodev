@@ -781,7 +781,8 @@ test "writeLeaf replaces both files and leaves no tmp files" {
     const dir = try tmpDirPath(&dir_buf, &tmp);
     // Old files from a previous leaf, plus a stale world-readable tmp key from a crashed run.
     for ([_][]const u8{ "zlodev.crt", "zlodev.key", "zlodev.key.tmp" }) |name| {
-        const f = try tmp.dir.createFile(rt.io(), name, .{ .permissions = .fromMode(0o644) });
+        const open: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o644);
+        const f = try tmp.dir.createFile(rt.io(), name, .{ .permissions = open });
         f.close(rt.io());
     }
     const now: i64 = 1794614400;
