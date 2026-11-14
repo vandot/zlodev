@@ -300,6 +300,122 @@ fn writeLeaf(allocator: std.mem.Allocator, cert_dir: []const u8, leaf: CertKey) 
     cwd.rename(crt_tmp, cwd, crt_path, io) catch return error.FileWriteFailed;
 }
 
+const renew_before_s: i64 = 30 * day_s;
+
+/// True when the leaf has under 30 days left (or already expired).
+pub fn needsRenewal(not_after: i64, now: i64) bool {
+    return not_after - now < renew_before_s;
+}
+
+fn formatDate(buf: *[10]u8, posix: i64) []const u8 {
+    const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(posix, 0)) };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ yd.year, md.month.numeric(), @as(u8, md.day_index) + 1 }) catch unreachable;
+}
+
+/// Restrict the cert dir and key files written world-readable by older versions.
+/// Missing files are skipped; failures only warn, start goes on.
+fn tightenPrivateFiles(cert_dir: []const u8) void {
+    if (builtin.os.tag == .windows) return;
+    tightenPath(cert_dir, 0o700);
+    for ([_][]const u8{ "zlodev.key", "zlodevCA.key" }) |name| {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}" ++ sep ++ "{s}", .{ cert_dir, name }) catch continue;
+        tightenPath(path, 0o600);
+    }
+}
+
+fn tightenPath(path: []const u8, mode: std.posix.mode_t) void {
+    const cwd = std.Io.Dir.cwd();
+    const st = cwd.statFile(rt.io(), path, .{}) catch return;
+    if (st.permissions.toMode() & 0o077 == 0) return;
+    cwd.setFilePermissions(rt.io(), path, .fromMode(mode), .{}) catch |e| {
+        std.debug.print("warning: could not restrict {s}: {s}\n", .{ path, @errorName(e) });
+    };
+}
+
+const Renewal = union(enum) {
+    /// Leaf has 30+ days left and matches its key.
+    current,
+    /// New leaf written; payload is its notAfter.
+    renewed: i64,
+    /// Renewal failed but the old leaf hasn't expired yet.
+    kept: struct { err: anyerror, not_after: i64 },
+};
+
+/// notAfter of the leaf at crt/key, or null if either is unreadable or they don't match.
+fn leafNotAfter(crt_path: [:0]const u8, key_path: [:0]const u8) ?i64 {
+    const crt = readPemCert(crt_path) orelse return null;
+    defer c.X509_free(crt);
+    const key = readPemKey(key_path) orelse return null;
+    defer c.EVP_PKEY_free(key);
+    if (c.X509_check_private_key(crt, key) != 1) return null;
+    return notAfter(crt) catch null;
+}
+
+fn renewLeaf(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []const u8, now: i64) !i64 {
+    const ca_pem = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
+    defer allocator.free(ca_pem);
+    const ca_key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.key", .{cert_dir});
+    defer allocator.free(ca_key_path);
+
+    const ca_cert = readPemCert(ca_pem) orelse return error.CaNotFound;
+    const ca_key = readPemKey(ca_key_path) orelse {
+        c.X509_free(ca_cert);
+        return error.CaNotFound;
+    };
+    const ca: CertKey = .{ .cert = ca_cert, .key = ca_key };
+    defer ca.deinit();
+
+    const ca_not_after = try notAfter(ca.cert);
+    if (ca_not_after <= now) return error.CaExpired;
+    const not_after = @min(now + leaf_days * day_s, ca_not_after);
+    const leaf = try buildLeaf(allocator, domain, ca, now, not_after);
+    defer leaf.deinit();
+    try writeLeaf(allocator, cert_dir, leaf);
+    return not_after;
+}
+
+fn ensureLeafIn(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []const u8, now: i64) !Renewal {
+    tightenPrivateFiles(cert_dir);
+
+    const crt_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.crt", .{cert_dir});
+    defer allocator.free(crt_path);
+    const key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.key", .{cert_dir});
+    defer allocator.free(key_path);
+
+    const old = leafNotAfter(crt_path, key_path);
+    if (old) |na| if (!needsRenewal(na, now)) return .current;
+
+    const not_after = renewLeaf(allocator, domain, cert_dir, now) catch |e| {
+        if (old) |na| if (na > now) return .{ .kept = .{ .err = e, .not_after = na } };
+        return e;
+    };
+    return .{ .renewed = not_after };
+}
+
+/// Re-sign the leaf with the kept CA key when it has under 30 days left. No sudo:
+/// the CA and trust store are untouched. Errors mean there is no usable leaf.
+pub fn ensureLeaf(allocator: std.mem.Allocator, domain: []const u8) !void {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cert_dir = try getCertPath(&path_buf, domain);
+    var date_buf: [10]u8 = undefined;
+    switch (try ensureLeafIn(allocator, domain, cert_dir, rt.timestamp())) {
+        .current => {},
+        .renewed => |na| {
+            const date = formatDate(&date_buf, na);
+            log.info("component=cert op=renew domain={s} not_after={s}", .{ domain, date });
+            std.debug.print("renewed certificate for {s}, valid until {s}\n", .{ domain, date });
+        },
+        .kept => |k| {
+            const date = formatDate(&date_buf, k.not_after);
+            log.err("component=cert op=renew domain={s} error={s}", .{ domain, @errorName(k.err) });
+            std.debug.print("warning: could not renew certificate for {s} ({s}), current one valid until {s}\n", .{ domain, @errorName(k.err), date });
+        },
+    }
+}
+
 /// Create the cert dir (and parents) and restrict it to the owner, including a
 /// dir left 0755 by an older install. Windows relies on the user-profile ACL.
 fn makePrivateDir(path: []const u8) !void {
@@ -671,4 +787,175 @@ test "writeLeaf replaces both files and leaves no tmp files" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(rt.io(), "zlodev.key.tmp", .{}));
     if (builtin.os.tag != .windows)
         try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "zlodev.key"));
+}
+
+test "needsRenewal renews under 30 days left, including expired" {
+    const now: i64 = 1794614400;
+    try std.testing.expect(!needsRenewal(now + 200 * day_s, now));
+    try std.testing.expect(!needsRenewal(now + 30 * day_s, now));
+    try std.testing.expect(needsRenewal(now + 29 * day_s, now));
+    try std.testing.expect(needsRenewal(now - day_s, now));
+}
+
+test "formatDate prints UTC YYYY-MM-DD" {
+    var buf: [10]u8 = undefined;
+    try std.testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0));
+    try std.testing.expectEqualStrings("2026-11-14", formatDate(&buf, 1794614400));
+}
+
+/// Writes a CA and a leaf into `dir` with the given expiry times.
+fn writeFixture(dir: []const u8, now: i64, ca_not_after: i64, leaf_not_after: i64) !void {
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now - 400 * day_s, ca_not_after);
+    defer ca.deinit();
+    try writeCA(std.testing.allocator, dir, ca);
+    const leaf = try buildLeaf(std.testing.allocator, "dev.lo", ca, now - 388 * day_s, leaf_not_after);
+    defer leaf.deinit();
+    try writeLeaf(std.testing.allocator, dir, leaf);
+}
+
+fn readFixtureFile(tmp: *const std.testing.TmpDir, name: []const u8) ![]u8 {
+    return tmp.dir.readFileAlloc(rt.io(), name, std.testing.allocator, .unlimited);
+}
+
+test "ensureLeafIn renews a leaf with 10 days left" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 10 * day_s);
+    const old_key = try readFixtureFile(&tmp, "zlodev.key");
+    defer std.testing.allocator.free(old_key);
+
+    const r = try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now);
+    try std.testing.expectEqual(now + leaf_days * day_s, r.renewed);
+
+    var buf: [256]u8 = undefined;
+    const crt = readPemCert(try tmpPathZ(&buf, &tmp, "zlodev.crt")) orelse return error.TestUnexpectedResult;
+    defer c.X509_free(crt);
+    const ca_key = readPemKey(try tmpPathZ(&buf, &tmp, "zlodevCA.key")) orelse return error.TestUnexpectedResult;
+    defer c.EVP_PKEY_free(ca_key);
+    try std.testing.expectEqual(@as(c_int, 1), c.X509_verify(crt, ca_key));
+    try std.testing.expectEqual(now + leaf_days * day_s, try notAfter(crt));
+    const new_key = try readFixtureFile(&tmp, "zlodev.key");
+    defer std.testing.allocator.free(new_key);
+    try std.testing.expect(!std.mem.eql(u8, old_key, new_key));
+    if (builtin.os.tag != .windows)
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "zlodev.key"));
+}
+
+test "ensureLeafIn leaves a leaf with 200 days left untouched" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 200 * day_s);
+    const before = try readFixtureFile(&tmp, "zlodev.crt");
+    defer std.testing.allocator.free(before);
+
+    try std.testing.expectEqual(Renewal.current, try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+    const after = try readFixtureFile(&tmp, "zlodev.crt");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "ensureLeafIn clamps the renewed leaf to the CA's expiry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 100 * day_s, now + 10 * day_s);
+    const r = try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now);
+    try std.testing.expectEqual(now + 100 * day_s, r.renewed);
+}
+
+test "ensureLeafIn renews again when the CA itself has under 30 days left" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 20 * day_s, now + 10 * day_s);
+    try std.testing.expectEqual(now + 20 * day_s, (try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now)).renewed);
+    // Clamped leaf still has under 30 days, so the next start renews again and succeeds.
+    try std.testing.expectEqual(now + 20 * day_s, (try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now + 60)).renewed);
+}
+
+test "ensureLeafIn renews a leaf whose key does not match" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 200 * day_s);
+    // Simulate a crash between the key rename and the cert rename.
+    const other = try testKey();
+    defer c.EVP_PKEY_free(other);
+    var buf: [256]u8 = undefined;
+    try writePemKey(try tmpPathZ(&buf, &tmp, "zlodev.key"), other);
+
+    _ = (try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now)).renewed;
+    const crt = readPemCert(try tmpPathZ(&buf, &tmp, "zlodev.crt")) orelse return error.TestUnexpectedResult;
+    defer c.X509_free(crt);
+    const key = readPemKey(try tmpPathZ(&buf, &tmp, "zlodev.key")) orelse return error.TestUnexpectedResult;
+    defer c.EVP_PKEY_free(key);
+    try std.testing.expectEqual(@as(c_int, 1), c.X509_check_private_key(crt, key));
+}
+
+test "ensureLeafIn fails with CaExpired and leaves the leaf untouched" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now - day_s, now - day_s);
+    const before = try readFixtureFile(&tmp, "zlodev.crt");
+    defer std.testing.allocator.free(before);
+    try std.testing.expectError(error.CaExpired, ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+    const after = try readFixtureFile(&tmp, "zlodev.crt");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "ensureLeafIn keeps a still-valid leaf when the CA is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 10 * day_s);
+    try tmp.dir.deleteFile(rt.io(), "zlodevCA.key");
+    const r = try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now);
+    try std.testing.expectEqual(error.CaNotFound, r.kept.err);
+    try std.testing.expectEqual(now + 10 * day_s, r.kept.not_after);
+}
+
+test "ensureLeafIn fails when the leaf is expired and the CA is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now - day_s);
+    try tmp.dir.deleteFile(rt.io(), "zlodevCA.pem");
+    try std.testing.expectError(error.CaNotFound, ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+}
+
+test "ensureLeafIn tightens key files and the dir left open by older versions" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 200 * day_s);
+    try tmp.dir.setFilePermissions(rt.io(), "zlodev.key", .fromMode(0o644), .{});
+    try tmp.dir.setFilePermissions(rt.io(), "zlodevCA.key", .fromMode(0o644), .{});
+    try std.testing.expectEqual(Renewal.current, try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "zlodev.key"));
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "zlodevCA.key"));
+    const st = try std.Io.Dir.cwd().statFile(rt.io(), dir, .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), st.permissions.toMode() & 0o777);
 }
