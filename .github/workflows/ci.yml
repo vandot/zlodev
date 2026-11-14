@@ -10,22 +10,21 @@ on:
       - 'build.zig.zon'
       - 'tests/**'
       - '.github/workflows/**'
+  # No paths filter here: linux/macos/windows are required checks on main,
+  # and a PR that skips them could never merge.
   pull_request:
-    paths:
-      - 'src/**'
-      - 'build.zig'
-      - 'build.zig.zon'
-      - 'tests/**'
-      - '.github/workflows/**'
+
+permissions:
+  contents: read
 
 jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
 
@@ -93,13 +92,13 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set HostName to match LocalHostName
         run: sudo scutil --set HostName "$(scutil --get LocalHostName)"
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
 
@@ -157,10 +156,10 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
 
