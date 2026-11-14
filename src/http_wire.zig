@@ -268,42 +268,58 @@ pub const ResponseHead = struct {
     initial_body: []const u8,
 };
 
+/// Responses that never carry a body regardless of their framing headers
+/// (RFC 9110 6.4.1): any response to HEAD, and 1xx, 204 and 304.
+pub fn responseHasBody(method: []const u8, status: u16) bool {
+    if (std.mem.eql(u8, method, "HEAD")) return false;
+    return !((status >= 100 and status < 200) or status == 204 or status == 304);
+}
+
+fn parseStatus(status_line: []const u8) u16 {
+    var parts = std.mem.splitScalar(u8, status_line, ' ');
+    _ = parts.next(); // skip HTTP version
+    const status_str = parts.next() orelse return 0;
+    return std.fmt.parseInt(u16, status_str, 10) catch 0;
+}
+
 /// Read from `src` (`read([]u8) !usize`) into `buf` until the end of the response
 /// head (CRLFCRLF), then parse the status line and slice out the header block and
-/// any leftover body bytes. Returns null if the connection yielded nothing or no
-/// complete head fit in `buf`. The returned slices point into `buf`.
+/// any leftover body bytes. Interim 1xx heads (100 Continue, 103 Early Hints) are
+/// skipped; 101 is final (protocol switch). Returns null if the connection yielded
+/// nothing or no complete head fit in `buf`. The returned slices point into `buf`.
 pub fn readResponseHead(src: anytype, buf: []u8) ?ResponseHead {
     var total: usize = 0;
-    var headers_end: ?usize = null;
-    while (total < buf.len) {
-        const n = src.read(buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |pos| {
-            headers_end = pos;
-            break;
+    while (true) {
+        var headers_end: ?usize = std.mem.indexOf(u8, buf[0..total], "\r\n\r\n");
+        while (headers_end == null and total < buf.len) {
+            const n = src.read(buf[total..]) catch break;
+            if (n == 0) break;
+            total += n;
+            headers_end = std.mem.indexOf(u8, buf[0..total], "\r\n\r\n");
         }
-    }
-    if (total == 0 or headers_end == null) return null;
-    const hdr_end = headers_end.?;
+        if (total == 0) return null;
+        const hdr_end = headers_end orelse return null;
 
-    const first_line_end = std.mem.indexOf(u8, buf[0..total], "\r\n") orelse return null;
-    var status: u16 = 0;
-    var parts = std.mem.splitScalar(u8, buf[0..first_line_end], ' ');
-    _ = parts.next(); // skip HTTP version
-    if (parts.next()) |status_str| {
-        status = std.fmt.parseInt(u16, status_str, 10) catch 0;
-    }
+        const first_line_end = std.mem.indexOf(u8, buf[0..total], "\r\n") orelse return null;
+        const status = parseStatus(buf[0..first_line_end]);
+        const body_start = hdr_end + 4;
 
-    const body_start = hdr_end + 4;
-    return .{
-        .status = status,
-        .status_line = buf[0 .. first_line_end + 2],
-        // A headerless response (status line immediately followed by CRLFCRLF) has
-        // first_line_end == hdr_end — yield an empty header block, not a bad slice.
-        .headers = if (first_line_end + 2 <= hdr_end) buf[first_line_end + 2 .. hdr_end] else buf[0..0],
-        .initial_body = if (body_start < total) buf[body_start..total] else buf[0..0],
-    };
+        if (status >= 100 and status < 200 and status != 101) {
+            // Drop the interim head and look for the next one in what's left.
+            std.mem.copyForwards(u8, buf[0 .. total - body_start], buf[body_start..total]);
+            total -= body_start;
+            continue;
+        }
+
+        return .{
+            .status = status,
+            .status_line = buf[0 .. first_line_end + 2],
+            // A headerless response (status line immediately followed by CRLFCRLF) has
+            // first_line_end == hdr_end — yield an empty header block, not a bad slice.
+            .headers = if (first_line_end + 2 <= hdr_end) buf[first_line_end + 2 .. hdr_end] else buf[0..0],
+            .initial_body = if (body_start < total) buf[body_start..total] else buf[0..0],
+        };
+    }
 }
 
 pub const BodyResult = struct {
@@ -866,4 +882,39 @@ test "isHealthCheck answers only the namespaced path, leaving /health to the app
     try testing.expect(isHealthCheck("/.zlodev/health"));
     try testing.expect(!isHealthCheck("/health"));
     try testing.expect(!isHealthCheck("/.zlodev/health/x"));
+}
+
+test "responseHasBody is false for HEAD, 1xx, 204 and 304" {
+    try testing.expect(!responseHasBody("HEAD", 200));
+    try testing.expect(!responseHasBody("GET", 100));
+    try testing.expect(!responseHasBody("GET", 103));
+    try testing.expect(!responseHasBody("GET", 204));
+    try testing.expect(!responseHasBody("GET", 304));
+    try testing.expect(responseHasBody("GET", 200));
+    try testing.expect(responseHasBody("POST", 201));
+    try testing.expect(responseHasBody("GET", 404));
+}
+
+test "readResponseHead skips interim 1xx heads" {
+    var reader = SliceReader{ .data = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" };
+    var buf: [256]u8 = undefined;
+    const head = readResponseHead(&reader, &buf).?;
+    try testing.expectEqual(@as(u16, 200), head.status);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", head.status_line);
+    try testing.expectEqualStrings("Content-Length: 2", head.headers);
+    try testing.expectEqualStrings("ok", head.initial_body);
+}
+
+test "readResponseHead skips a 100 Continue that arrives in its own read" {
+    var reader = ChunkedReader{ .data = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n", .chunk = 25 };
+    var buf: [256]u8 = undefined;
+    const head = readResponseHead(&reader, &buf).?;
+    try testing.expectEqual(@as(u16, 204), head.status);
+}
+
+test "readResponseHead returns 101 Switching Protocols as final" {
+    var reader = SliceReader{ .data = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n" };
+    var buf: [256]u8 = undefined;
+    const head = readResponseHead(&reader, &buf).?;
+    try testing.expectEqual(@as(u16, 101), head.status);
 }
