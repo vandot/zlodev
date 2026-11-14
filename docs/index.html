@@ -1019,15 +1019,15 @@
     <div class="details-grid">
       <div class="detail-card reveal">
         <h3>DNS resolver</h3>
-        <p>A lightweight UDP server resolves <code>*.lo</code> queries to <code>127.0.0.1</code>. Registers via <code>/etc/resolver/</code> on macOS, <code>systemd-resolved</code> on Linux, and NRPT rules on Windows.</p>
+        <p>A lightweight UDP server resolves <code>*.lo</code> queries to <code>127.0.0.1</code>. Registers via <code>/etc/resolver/</code> on macOS, <code>systemd-resolved</code> on Linux (requires systemd-resolved and systemd-networkd), and NRPT rules on Windows.</p>
       </div>
       <div class="detail-card reveal">
         <h3>Certificate authority</h3>
-        <p>On install, zlodev generates a local CA and domain certificate. The CA is added to your system trust store, unique to your machine.</p>
+        <p>On install, zlodev generates a local CA and domain certificate. The CA is added to your system trust store, unique to your machine. Private keys are readable only by you.</p>
       </div>
       <div class="detail-card reveal">
         <h3>TLS proxy</h3>
-        <p>An HTTPS reverse proxy on port 443 terminates TLS, forwards plain HTTP to your dev server, and relays responses back over the encrypted connection. On Linux, file capabilities (<code>cap_net_bind_service</code>) allow binding to privileged ports without running as root.</p>
+        <p>An HTTPS reverse proxy on port 443 terminates TLS, forwards plain HTTP to your dev server, and relays responses back over the encrypted connection. Only your own machine can connect unless you choose otherwise with <code>-l</code> or <code>--bind</code>. On Linux, file capabilities (<code>cap_net_bind_service</code>) allow binding to privileged ports without running as root.</p>
       </div>
       <div class="detail-card reveal">
         <h3>HTTP server</h3>
@@ -1078,7 +1078,7 @@
       </div>
       <div class="detail-card reveal">
         <h3>Local network / mDNS</h3>
-        <p>Use <code>-l</code> to bind to <code>.local</code> via mDNS. Access your dev server from mobile devices on the same network.</p>
+        <p>Use <code>-l</code> to bind to <code>.local</code> via mDNS. Access your dev server from mobile devices on the same network. Without <code>-l</code>, other devices are refused.</p>
       </div>
       <div class="detail-card reveal">
         <h3>Config file</h3>
