@@ -62,7 +62,7 @@ fn pollUrl(url: []const u8, timeout_ms: u64, insecure: bool) !void {
     }
 }
 
-// --- Windows: minimal /health test ---
+// --- Windows: minimal health check test ---
 
 test "windows: health endpoint" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
@@ -73,18 +73,18 @@ test "windows: health endpoint" {
         _ = runCmd(&.{ binary_path, "uninstall" }) catch {};
     }
 
-    // Start proxy (no upstream needed for /health)
+    // Start proxy (no upstream needed for the health check)
     var proxy = try startBackground(&.{ binary_path, "start", "--no-tui" });
     defer killProcess(&proxy);
 
     // Poll for readiness
-    try pollUrl("https://dev.lo/health", 30_000, true);
+    try pollUrl("https://dev.lo/.zlodev/health", 30_000, true);
 
-    // Test HTTPS /health (--ssl-no-revoke: Schannel can't check CRL for local CA)
-    try runCmdExpectSuccess(&.{ "curl", "-sf", "--ssl-no-revoke", "https://dev.lo/health" });
+    // Test HTTPS health check (--ssl-no-revoke: Schannel can't check CRL for local CA)
+    try runCmdExpectSuccess(&.{ "curl", "-sf", "--ssl-no-revoke", "https://dev.lo/.zlodev/health" });
 
-    // Test HTTP /health
-    try runCmdExpectSuccess(&.{ "curl", "-sf", "http://dev.lo/health" });
+    // Test HTTP health check
+    try runCmdExpectSuccess(&.{ "curl", "-sf", "http://dev.lo/.zlodev/health" });
 }
 
 // --- Local mode (mDNS) smoke test ---
@@ -111,7 +111,7 @@ test "local mode: mDNS smoke test" {
     var hostname_buf: [hostname_max]u8 = undefined;
     const hostname = getHostname(&hostname_buf);
     var url_buf: [512]u8 = undefined;
-    const health_url = std.fmt.bufPrint(&url_buf, "https://{s}.local/health", .{hostname}) catch return error.SkipZigTest;
+    const health_url = std.fmt.bufPrint(&url_buf, "https://{s}.local/.zlodev/health", .{hostname}) catch return error.SkipZigTest;
 
     // Poll — if mDNS doesn't work (Linux CI), skip gracefully
     pollUrl(health_url, 30_000, true) catch |e| {
@@ -165,7 +165,7 @@ test "dev.lo: full integration" {
     defer killProcess(&proxy);
 
     // Poll for proxy readiness
-    try pollUrl("https://dev.lo/health", 30_000, true);
+    try pollUrl("https://dev.lo/.zlodev/health", 30_000, true);
 
     // Run hurl test files (macOS only — Linux system trust store may be stale)
     if (builtin.os.tag == .macos) {

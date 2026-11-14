@@ -52,6 +52,9 @@ pub fn main(init: std.process.Init) !void {
     var target_port: u16 = 3000;
     var bind_addr: []const u8 = "0.0.0.0";
     var bind_set = false;
+    // Set when -b/--bind or a config `bind=` chose the address; otherwise the
+    // default 0.0.0.0 (needed for sudo-less :80/:443 on macOS) serves loopback only.
+    var bind_explicit = false;
     var no_tui: bool = false;
     var no_tui_set = false;
     var dns_only: bool = false;
@@ -90,6 +93,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (flagValue(arg, "-b", "--bind")) |val| {
             bind_addr = val;
             bind_set = true;
+            bind_explicit = true;
         } else if (flagValue(arg, null, "--max-body")) |val| {
             max_body = parseSize(val) orelse {
                 std.debug.print("invalid max-body value: {s}\n", .{val});
@@ -136,6 +140,7 @@ pub fn main(init: std.process.Init) !void {
             if (!bind_set) {
                 if (cfg.bind) |b| {
                     bind_addr = b;
+                    bind_explicit = true;
                 }
             } else {
                 // CLI override used — free config bind if allocated
@@ -232,7 +237,7 @@ pub fn main(init: std.process.Init) !void {
             if (dns_only) {
                 try doStartDns(tld);
             } else {
-                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, no_tui, max_body, routes[0..route_count], command_str);
+                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, !local and !bind_explicit, no_tui, max_body, routes[0..route_count], command_str);
             }
         },
         .uninstall => {
@@ -400,6 +405,7 @@ fn doStart(
     tld: []const u8,
     target_port: u16,
     bind_addr: []const u8,
+    loopback_only: bool,
     no_tui: bool,
     max_request_body: usize,
     routes: []const proxy.Route,
@@ -487,16 +493,17 @@ fn doStart(
 
     // Start HTTP server
     const http_thread = try std.Thread.spawn(.{}, struct {
-        fn run(l: compat.socket_t, addr: []const u8, d: []const u8, ca_pem: []const u8, ca_der: []const u8) void {
-            http_server.serve(l, addr, d, ca_pem, ca_der);
+        fn run(l: compat.socket_t, addr: []const u8, lo_only: bool, d: []const u8, ca_pem: []const u8, ca_der: []const u8) void {
+            http_server.serve(l, addr, lo_only, d, ca_pem, ca_der);
         }
-    }.run, .{ http_listener, bind_owned, domain_owned, ca_pem_owned, ca_der_owned });
+    }.run, .{ http_listener, bind_owned, loopback_only, domain_owned, ca_pem_owned, ca_der_owned });
 
     // Start HTTPS proxy on its own thread
     const config = proxy.ProxyConfig{
         .target_host = "127.0.0.1",
         .target_port = target_port,
         .listen_addr = bind_owned,
+        .loopback_only = loopback_only,
         .cert_path = cert_path_z,
         .key_path = key_path_z,
         .ca_path = ca_path_z,
@@ -597,7 +604,7 @@ fn printHelp() void {
         \\
         \\Options:
         \\  -p=PORT, --port=PORT       target port [auto-detect or 3000]
-        \\  -b=ADDR, --bind=ADDR       listen address [default 0.0.0.0]
+        \\  -b=ADDR, --bind=ADDR       listen address [default 0.0.0.0, local clients only]
         \\  --route=PATTERN=TARGET     route by subdomain or path (repeatable)
         \\  -c=PATH, --config=PATH     config file path [default .zlodev]
         \\  --max-body=SIZE            max request body size [default 10M]

@@ -126,7 +126,7 @@ zlodev start --dns          start DNS server only (log mode)
 
 ```
 -p=PORT, --port=PORT       target port [auto-detect or 3000]
--b=ADDR, --bind=ADDR       listen address [default 0.0.0.0]
+-b=ADDR, --bind=ADDR       listen address [default 0.0.0.0, local clients only]
 --route=PATTERN=TARGET     route by subdomain or path (repeatable)
 --command=CMD              dev server command to launch and monitor
 -c=PATH, --config=PATH     config file path [default .zlodev]
@@ -142,13 +142,14 @@ zlodev start --dns          start DNS server only (log mode)
 
 `SIZE` accepts suffixes: `K` (KB), `M` (MB), `G` (GB). Example: `--max-body=50M`
 
+By default zlodev listens on `0.0.0.0` (on macOS that is what lets it use ports 80 and 443 without sudo) but only answers connections from your own machine. Other devices on your network are refused. To let them in, use `-l` (see [Local network](#local-network-mdns)) or set the address explicitly, for example `-b=0.0.0.0`.
+
 ### Config file
 
 Place a `.zlodev` file in your project directory instead of repeating CLI flags:
 
 ```
 port=3000
-bind=127.0.0.1
 route=api=3001
 route=/webhooks=8080
 command=npm run dev
@@ -240,6 +241,12 @@ zlodev start -l
 ```sh
 # Run without TUI, logs to stderr (useful for scripts/CI)
 zlodev start --no-tui
+```
+
+zlodev answers `/.zlodev/health` itself on ports 443 and 80 with `ok`, which is handy for waiting until it is up. Every other path, including `/health`, goes to your dev server.
+
+```sh
+until curl -sf https://dev.lo/.zlodev/health; do sleep 0.2; done
 ```
 
 ### Intercept
@@ -339,15 +346,15 @@ intercept=resp:POST /api
 
 ## How it works
 
-1. **DNS** — A lightweight DNS server resolves `*.lo` queries to `127.0.0.1`. On macOS it registers via `/etc/resolver/`, on Linux via `systemd-resolved`, on Windows via NRPT rules.
+1. **DNS** — A lightweight DNS server resolves `*.lo` queries to `127.0.0.1`. On macOS it registers via `/etc/resolver/`, on Linux via `systemd-resolved` (with a `systemd-networkd` dummy interface, so Linux needs systemd, systemd-resolved and systemd-networkd), on Windows via NRPT rules.
 
-2. **Certificates** — On `install`, zlodev generates a local CA and domain certificate, then adds the CA to your system trust store. The CA is unique to your machine.
+2. **Certificates** — On `install`, zlodev generates a local CA and domain certificate, then adds the CA to your system trust store. The CA is unique to your machine. Private keys are written readable only by you (`0600`, in a `0700` directory).
 
-3. **Proxy** — An HTTPS reverse proxy accepts connections on port 443, terminates TLS, and forwards plain HTTP to your dev server. Responses are relayed back over TLS.
+3. **Proxy** — An HTTPS reverse proxy accepts connections on port 443, terminates TLS, and forwards plain HTTP to your dev server. Responses are relayed back over TLS. A client that doesn't finish the TLS handshake within 10 seconds is dropped.
 
 4. **HTTP server** — A plain HTTP server on port 80 serves the CA certificate download page (for mobile devices) and redirects other requests to HTTPS.
 
-5. **Dev server integration** — When `--command` is provided, zlodev spawns a shell process running your dev server command. stdout and stderr are captured into a bounded ring buffer and displayed in a split-pane logs view. The dev server restarts when you press `R` in the logs pane, or shuts down cleanly when you quit zlodev.
+5. **Dev server integration** — When `--command` is provided, zlodev spawns a shell process running your dev server command. stdout and stderr are captured into a bounded ring buffer and displayed in a split-pane logs view. Its stdin is `/dev/null`, since the TUI owns the terminal. The dev server restarts when you press `R` in the logs pane, or shuts down cleanly when you quit zlodev.
 
 ## Troubleshooting
 
@@ -397,12 +404,14 @@ If missing, reinstall DNS:
 zlodev install --dns
 ```
 
+On Linux, `install` stops with an error unless systemd is PID 1 and `systemd-resolved` is active, and fails if `systemd-networkd` can't be restarted (for example when it is masked). If the restart failed, run `zlodev uninstall --dns` to remove the half-written `zlodev0` interface files before trying again.
+
 On Windows, make sure "Use secure DNS" is disabled in your browser — Chromium browsers bypass the system DNS resolver when this is enabled.
 
 ### Mobile device can't connect
 
 1. Make sure the phone is on the same network
-2. Start zlodev with `--local` flag: `zlodev start -l`
+2. Start zlodev with `--local` flag: `zlodev start -l` (without `-l`, zlodev only answers your own machine)
 3. Open `http://yourhostname.local/ca` on the phone to install the CA certificate
 4. Follow the platform-specific instructions on the download page
 

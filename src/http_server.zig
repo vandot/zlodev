@@ -3,6 +3,7 @@ const posix = std.posix;
 const log = @import("log.zig");
 const shutdown = @import("shutdown.zig");
 const compat = @import("compat.zig");
+const http_wire = @import("http_wire.zig");
 const rt = @import("rt.zig");
 const builtin = @import("builtin");
 const win32 = @import("win32.zig");
@@ -24,7 +25,7 @@ var http_workers: std.atomic.Value(u32) = .init(0);
 const max_http_workers = 8;
 
 /// Serve on a listener from `listen` until shutdown. Takes ownership of `listener`.
-pub fn serve(listener: compat.socket_t, bind_addr: []const u8, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {
+pub fn serve(listener: compat.socket_t, bind_addr: []const u8, loopback_only: bool, domain: []const u8, ca_pem_path: []const u8, ca_der_path: []const u8) void {
     defer compat.closeSocket(listener);
 
     var group: std.Io.Group = .init;
@@ -52,6 +53,12 @@ pub fn serve(listener: compat.socket_t, bind_addr: []const u8, domain: []const u
             continue;
         };
         consecutive_failures = 0;
+        // Default mode: only this machine may connect (see ProxyConfig.loopback_only).
+        if (loopback_only and !compat.isLoopback(conn.addr)) {
+            log.info("component=http op=reject_remote", .{});
+            compat.closeSocket(conn.sock);
+            continue;
+        }
 
         // Set receive timeout to prevent slow clients from exhausting the workers
         setRecvTimeout(conn.sock, 5);
@@ -149,7 +156,7 @@ fn handleRequest(stream: compat.SocketStream, domain: []const u8, ca_pem_path: [
         serveFile(stream, ca_pem_path, "application/x-pem-file", "zlodevCA.pem") catch {
             sendError(stream, "500 Internal Server Error");
         };
-    } else if (std.mem.eql(u8, path, "/health")) {
+    } else if (http_wire.isHealthCheck(path)) {
         const health_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         stream.writeAll(health_response) catch return;
     } else {
