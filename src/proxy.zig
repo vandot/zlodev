@@ -631,14 +631,18 @@ fn handleConnection(
         @memcpy(entry.resp_headers[0..rsh_len], resp_headers_section[0..rsh_len]);
         entry.resp_headers_len = @intCast(rsh_len);
 
+        // HEAD, 1xx, 204 and 304 never carry a body, whatever their framing headers
+        // say; reading one would wait for bytes that never come.
+        const has_body = http_wire.responseHasBody(method, head.status);
+
         // Determine if we must close after this response
-        const is_chunked = http_wire.isChunkedEncoding(resp_headers_section);
-        const resp_content_length = http_wire.getContentLength(resp_headers_section);
+        const is_chunked = has_body and http_wire.isChunkedEncoding(resp_headers_section);
+        const resp_content_length: ?usize = if (has_body) http_wire.getContentLength(resp_headers_section) else 0;
         const upstream_conn = http_wire.getConnectionHeader(resp_headers_section);
         const response_has_defined_length = is_chunked or resp_content_length != null;
         const must_close = !keep_alive or upstream_conn == .close or !response_has_defined_length;
 
-        const initial_body = head.initial_body;
+        const initial_body = if (has_body) head.initial_body else head.initial_body[0..0];
 
         // Check if we should intercept the response
         const intercept_resp = intercept.shouldInterceptResponse(method, uri);
@@ -693,7 +697,7 @@ fn handleConnection(
                         };
                         defer std.heap.page_allocator.destroy(resp_snap);
                         requests.snapshotByBackingIndex(h.index(), resp_snap);
-                        forwardResponseFromEntry(ssl, resp_snap, is_external, config.domain, must_close);
+                        forwardResponseFromEntry(ssl, resp_snap, is_external, config.domain, must_close, has_body);
 
                         // Duration = hold time only
                         const hold_elapsed = rt.milliTimestamp() - resp_received_time;
@@ -712,7 +716,7 @@ fn handleConnection(
             }
 
             // Fell through: intercept skipped, forward buffered response normally.
-            forwardResponseFromEntry(ssl, &entry, is_external, config.domain, must_close);
+            forwardResponseFromEntry(ssl, &entry, is_external, config.domain, must_close, has_body);
 
             if (must_close) return;
             setSocketTimeout(client_sock, .recv, 15);
@@ -838,7 +842,9 @@ fn forwardRequest(sink: anytype, e: *const requests.Entry, ctx: RequestForward) 
 
 /// Forward a buffered response from an entry to the client.
 /// Used after response intercept (accept) to send the (possibly edited) response.
-fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_external: bool, domain: []const u8, must_close: bool) void {
+/// `has_body` false (HEAD, 1xx, 204, 304): the upstream's Content-Length is kept
+/// as-is (for HEAD it describes the GET body) and no body is sent.
+fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_external: bool, domain: []const u8, must_close: bool, has_body: bool) void {
     // Build and send status line
     var status_buf: [64]u8 = undefined;
     const status_line = std.fmt.bufPrint(&status_buf, "HTTP/1.1 {d} {s}\r\n", .{ e.status, http_wire.reasonPhrase(e.status) }) catch return;
@@ -847,15 +853,17 @@ fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_extern
     // Forward response headers. Connection, Content-Length, and Transfer-Encoding
     // are dropped — Content-Length is recomputed below and Connection appended.
     http_wire.forwardHeaders(e.getRespHeaders(), SslSink{ .ssl = ssl }, .{
-        .skip = &.{ "connection:", "content-length:", "transfer-encoding:" },
+        .skip = if (has_body) &.{ "connection:", "content-length:", "transfer-encoding:" } else &.{"connection:"},
         .rewrite_set_cookie = is_external,
     }, domain);
 
     // Set Content-Length to match actual body (may have been edited)
-    const body = e.getRespBody();
-    var cl_buf: [64]u8 = undefined;
-    const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch "";
-    sslWriteAll(ssl, cl_hdr);
+    const body = if (has_body) e.getRespBody() else e.getRespBody()[0..0];
+    if (has_body) {
+        var cl_buf: [64]u8 = undefined;
+        const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch "";
+        sslWriteAll(ssl, cl_hdr);
+    }
 
     if (must_close) {
         sslWriteAll(ssl, "Connection: close\r\n");
@@ -1586,4 +1594,161 @@ test "relayWebSocket forwards a client write larger than its read buffer at once
     }
     try testing.expectEqual(payload.len, total);
     try testing.expectEqualSlices(u8, &payload, &got);
+}
+
+/// Fake dev server for proxy tests: answers each accepted connection's request with
+/// `bodiless` when it starts with HEAD or `If-None-Match` (then holds the socket
+/// open, like Node's keep-alive), otherwise with a 2-byte "ok" body.
+const FakeUpstream = struct {
+    listener: compat.socket_t,
+    bodiless: []const u8,
+    held: [4]compat.socket_t = undefined,
+    held_len: usize = 0,
+    thread: std.Thread = undefined,
+
+    var running: std.atomic.Value(bool) = .init(true);
+    fn isRunning() bool {
+        return running.load(.acquire);
+    }
+
+    fn start(self: *FakeUpstream, port: u16) !void {
+        running.store(true, .release);
+        self.listener = try compat.tcpListen(try std.Io.net.IpAddress.parseIp4("127.0.0.1", port));
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn serve(self: *FakeUpstream) void {
+        while (true) {
+            var fds = [1]compat.pollfd{.{ .fd = self.listener, .events = compat.POLL.IN, .revents = 0 }};
+            switch (compat.pollWhileRunning(&fds, 100, isRunning)) {
+                .ready => {},
+                .timeout => continue,
+                else => return,
+            }
+            const conn = compat.accept(self.listener) catch return;
+            const s = compat.SocketStream{ .handle = conn.sock };
+            var buf: [4096]u8 = undefined;
+            var total: usize = 0;
+            while (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") == null and total < buf.len) {
+                const n = s.read(buf[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+            }
+            const req = buf[0..total];
+            if (std.mem.startsWith(u8, req, "HEAD") or std.mem.indexOf(u8, req, "If-None-Match") != null) {
+                s.writeAll(self.bodiless) catch {};
+                if (self.held_len < self.held.len) {
+                    self.held[self.held_len] = conn.sock;
+                    self.held_len += 1;
+                    continue;
+                }
+            } else {
+                s.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") catch {};
+            }
+            compat.closeSocket(conn.sock);
+        }
+    }
+
+    fn stop(self: *FakeUpstream) void {
+        running.store(false, .release);
+        self.thread.join();
+        for (self.held[0..self.held_len]) |s| compat.closeSocket(s);
+        compat.closeSocket(self.listener);
+    }
+};
+
+/// Runs `handleConnection` against a fake upstream and returns the client's TLS
+/// session, so a test can send requests through the real proxy path.
+const ProxyHarness = struct {
+    tcp: TcpPair,
+    server_ctx: *ssl_c.SSL_CTX,
+    client_ctx: *ssl_c.SSL_CTX,
+    client: *ssl_c.SSL,
+    config: ProxyConfig,
+    thread: std.Thread,
+
+    fn start(self: *ProxyHarness, port: u16, upstream_port: u16) !void {
+        self.tcp = try TcpPair.init(port);
+        self.server_ctx = try testServerCtx();
+        self.client_ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_client_method()) orelse return error.SslCtx;
+        const server = ssl_c.SSL_new(self.server_ctx) orelse return error.SslNew;
+        _ = ssl_c.SSL_set_fd(server, compat.socketToFd(self.tcp.b));
+        self.client = ssl_c.SSL_new(self.client_ctx) orelse return error.SslNew;
+        _ = ssl_c.SSL_set_fd(self.client, compat.socketToFd(self.tcp.a));
+        self.config = .{
+            .target_host = "127.0.0.1",
+            .target_port = upstream_port,
+            .listen_addr = "127.0.0.1",
+            .cert_path = "",
+            .key_path = "",
+            .ca_path = "",
+            .server_ident = "test",
+        };
+        _ = proxy_workers.fetchAdd(1, .acq_rel);
+        const client_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        // handleConnection owns the server SSL and the server-side socket from here.
+        self.thread = try std.Thread.spawn(.{}, handleConnection, .{ server, self.tcp.b, client_addr, &self.config, @as(u64, 1), @as(?*ssl_c.SSL_CTX, null) });
+        if (ssl_c.SSL_connect(self.client) != 1) return error.Handshake;
+        setSocketTimeout(self.tcp.a, .recv, 3);
+    }
+
+    /// Send `request` and read until the response ends with `want_suffix`.
+    fn roundTrip(self: *ProxyHarness, request: []const u8, want_suffix: []const u8, out: []u8) ![]const u8 {
+        if (ssl_c.SSL_write(self.client, request.ptr, @intCast(request.len)) <= 0) return error.WriteFailed;
+        var total: usize = 0;
+        while (total < out.len) {
+            const n = ssl_c.SSL_read(self.client, out[total..].ptr, @intCast(out.len - total));
+            if (n <= 0) return error.ReadFailed;
+            total += @intCast(n);
+            if (std.mem.indexOf(u8, out[0..total], "\r\n\r\n") != null and std.mem.endsWith(u8, out[0..total], want_suffix)) return out[0..total];
+        }
+        return error.ResponseTooLarge;
+    }
+
+    fn stop(self: *ProxyHarness) void {
+        _ = ssl_c.SSL_shutdown(self.client);
+        compat.closeSocket(self.tcp.a);
+        self.thread.join();
+        ssl_c.SSL_free(self.client);
+        ssl_c.SSL_CTX_free(self.client_ctx);
+        ssl_c.SSL_CTX_free(self.server_ctx);
+        compat.closeSocket(self.tcp.listener);
+    }
+};
+
+test "HEAD response with Content-Length doesn't stall the next request on the connection" {
+    var up = FakeUpstream{ .listener = undefined, .bodiless = "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n" };
+    try up.start(18095);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18094, 18095);
+    defer px.stop();
+
+    var buf: [4096]u8 = undefined;
+    const head = try px.roundTrip("HEAD / HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "\r\n\r\n", &buf);
+    try testing.expect(std.mem.indexOf(u8, head, "Content-Length: 1234") != null);
+    try testing.expect(std.mem.indexOf(u8, head, "Connection: keep-alive") != null);
+
+    const t0 = rt.milliTimestamp();
+    const get = try px.roundTrip("GET / HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "ok", &buf);
+    try testing.expect(std.mem.startsWith(u8, get, "HTTP/1.1 200"));
+    try testing.expect(rt.milliTimestamp() - t0 < 1000);
+}
+
+test "304 without Content-Length is answered at once and keeps the connection" {
+    var up = FakeUpstream{ .listener = undefined, .bodiless = "HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n" };
+    try up.start(18097);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18096, 18097);
+    defer px.stop();
+
+    var buf: [4096]u8 = undefined;
+    const t0 = rt.milliTimestamp();
+    const resp = try px.roundTrip("GET /a.js HTTP/1.1\r\nHost: dev.lo\r\nIf-None-Match: \"x\"\r\n\r\n", "\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 304"));
+    try testing.expect(std.mem.indexOf(u8, resp, "Connection: keep-alive") != null);
+    const get = try px.roundTrip("GET / HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "ok", &buf);
+    try testing.expect(std.mem.startsWith(u8, get, "HTTP/1.1 200"));
+    try testing.expect(rt.milliTimestamp() - t0 < 1000);
 }
