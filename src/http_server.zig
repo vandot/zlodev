@@ -3,6 +3,7 @@ const posix = std.posix;
 const log = @import("log.zig");
 const shutdown = @import("shutdown.zig");
 const compat = @import("compat.zig");
+const http_wire = @import("http_wire.zig");
 const rt = @import("rt.zig");
 const builtin = @import("builtin");
 const win32 = @import("win32.zig");
@@ -149,7 +150,7 @@ fn handleRequest(stream: compat.SocketStream, domain: []const u8, ca_pem_path: [
         serveFile(stream, ca_pem_path, "application/x-pem-file", "zlodevCA.pem") catch {
             sendError(stream, "500 Internal Server Error");
         };
-    } else if (std.mem.eql(u8, path, "/health")) {
+    } else if (http_wire.isHealthCheck(path)) {
         const health_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         stream.writeAll(health_response) catch return;
     } else {

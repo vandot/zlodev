@@ -419,6 +419,14 @@ pub fn writeCookieWithDomain(sink: anytype, header: []const u8, domain: []const 
 
 const testing = std.testing;
 
+/// Path zlodev answers itself on :443 and :80. Namespaced so an app's own
+/// `/health` route still reaches the dev server.
+pub const health_path = "/.zlodev/health";
+
+pub fn isHealthCheck(path: []const u8) bool {
+    return std.mem.eql(u8, path, health_path);
+}
+
 test "getContentLength present" {
     try testing.expectEqual(@as(?usize, 42), getContentLength("Content-Length: 42\r\nHost: dev.lo\r\n"));
     try testing.expectEqual(@as(?usize, 0), getContentLength("Content-Length: 0\r\n"));
@@ -852,4 +860,10 @@ test "writeCookieWithDomain passes through a cookie with no Domain attribute" {
     var len: usize = 0;
     writeCookieWithDomain(CaptureSink{ .buf = &out, .len = &len }, "Set-Cookie: id=abc; Path=/; HttpOnly", "dev.lo");
     try testing.expectEqualStrings("Set-Cookie: id=abc; Path=/; HttpOnly", out[0..len]);
+}
+
+test "isHealthCheck answers only the namespaced path, leaving /health to the app" {
+    try testing.expect(isHealthCheck("/.zlodev/health"));
+    try testing.expect(!isHealthCheck("/health"));
+    try testing.expect(!isHealthCheck("/.zlodev/health/x"));
 }

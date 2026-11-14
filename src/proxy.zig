@@ -451,7 +451,7 @@ fn handleConnection(
         log.info("component=proxy conn={d} method={s} uri={s} client={s}", .{ conn_id, method, uri, formatAddress(client_addr, &addr_buf) });
 
         // Health check — return immediately, bypass everything
-        if (std.mem.eql(u8, uri, "/health")) {
+        if (http_wire.isHealthCheck(uri)) {
             const health_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
             sslWriteAll(ssl, health_response);
             return;
