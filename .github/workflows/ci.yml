@@ -10,13 +10,12 @@ on:
       - 'build.zig.zon'
       - 'tests/**'
       - '.github/workflows/**'
+  # No paths filter here: linux/macos/windows are required checks on main,
+  # and a PR that skips them could never merge.
   pull_request:
-    paths:
-      - 'src/**'
-      - 'build.zig'
-      - 'build.zig.zon'
-      - 'tests/**'
-      - '.github/workflows/**'
+
+permissions:
+  contents: read
 
 jobs:
   linux:
