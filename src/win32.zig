@@ -120,3 +120,16 @@ pub fn assignToKillJob(process: HANDLE) ?HANDLE {
     }
     return job;
 }
+
+// crypt32: the system ROOT store, copied into BoringSSL for verifying external upstreams.
+pub const HCERTSTORE = *opaque {};
+pub const CERT_CONTEXT = extern struct {
+    dwCertEncodingType: DWORD,
+    pbCertEncoded: [*]const u8,
+    cbCertEncoded: DWORD,
+    pCertInfo: *anyopaque,
+    hCertStore: HCERTSTORE,
+};
+pub extern "crypt32" fn CertOpenSystemStoreW(prov: usize, protocol: [*:0]const u16) callconv(.winapi) ?HCERTSTORE;
+pub extern "crypt32" fn CertEnumCertificatesInStore(store: HCERTSTORE, prev: ?*const CERT_CONTEXT) callconv(.winapi) ?*const CERT_CONTEXT;
+pub extern "crypt32" fn CertCloseStore(store: HCERTSTORE, flags: DWORD) callconv(.winapi) BOOL;

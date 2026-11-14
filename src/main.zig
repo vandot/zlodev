@@ -57,6 +57,7 @@ pub fn main(init: std.process.Init) !void {
     var bind_explicit = false;
     var no_tui: bool = false;
     var no_tui_set = false;
+    var insecure_upstream = false;
     var dns_only: bool = false;
     var cert_only: bool = false;
     var max_body: usize = proxy.default_max_request_body;
@@ -107,6 +108,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--no-tui")) {
             no_tui = true;
             no_tui_set = true;
+        } else if (std.mem.eql(u8, arg, "--insecure-upstream")) {
+            insecure_upstream = true;
         } else if (std.mem.eql(u8, arg, "--dns")) {
             dns_only = true;
         } else if (std.mem.eql(u8, arg, "--cert")) {
@@ -149,6 +152,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
             if (!no_tui_set and cfg.no_tui) no_tui = true;
+            if (cfg.insecure_upstream) insecure_upstream = true;
             if (!max_body_set) if (cfg.max_body) |mb| {
                 max_body = mb;
             };
@@ -168,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
 
     // When using --dns with start, no other options apply
     if (command == .start and dns_only) {
-        if (port_set or bind_set or no_tui_set or max_body_set or route_count > 0) {
+        if (port_set or bind_set or no_tui_set or max_body_set or route_count > 0 or insecure_upstream) {
             std.debug.print("--dns cannot be combined with other start options\n", .{});
             std.process.exit(1);
         }
@@ -237,7 +241,7 @@ pub fn main(init: std.process.Init) !void {
             if (dns_only) {
                 try doStartDns(tld);
             } else {
-                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, !local and !bind_explicit, no_tui, max_body, routes[0..route_count], command_str);
+                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, !local and !bind_explicit, no_tui, max_body, routes[0..route_count], command_str, insecure_upstream);
             }
         },
         .uninstall => {
@@ -410,6 +414,7 @@ fn doStart(
     max_request_body: usize,
     routes: []const proxy.Route,
     command: ?[]const u8,
+    insecure_upstream: bool,
 ) !void {
     // Check if another instance is already running
     if (isPortListening(bind_addr, 443)) {
@@ -523,7 +528,12 @@ fn doStart(
         .max_request_body = max_request_body,
         .routes = routes,
         .domain = domain_owned,
+        .insecure_upstream = insecure_upstream,
     };
+    if (insecure_upstream) {
+        std.debug.print("warning: --insecure-upstream: certificates of external routes are not verified\n", .{});
+        log.err("component=main op=start insecure_upstream=true", .{});
+    }
     const proxy_thread = try std.Thread.spawn(.{}, struct {
         fn run(cfg: *const proxy.ProxyConfig, l: compat.socket_t) void {
             proxy.start(cfg, l) catch |e| {
@@ -622,6 +632,7 @@ fn printHelp() void {
         \\  --max-body=SIZE            max request body size [default 10M]
         \\  --command=CMD              run CMD as subprocess (stopped on exit)
         \\  --no-tui                   disable TUI, log to stderr
+        \\  --insecure-upstream        don't verify external route certificates
         \\  -l, --local                use .local domain (mDNS)
         \\  --dns                      DNS only (install/uninstall/start)
         \\  --cert                     certificates only (install/uninstall)
@@ -638,6 +649,7 @@ fn printHelp() void {
         \\    intercept=POST /api
         \\    command=npm run dev
         \\    no-tui
+        \\    insecure-upstream
         \\  CLI arguments override config file values.
         \\
         \\Routes:
@@ -829,6 +841,7 @@ const ConfigResult = struct {
     port: ?u16 = null,
     bind: ?[]const u8 = null,
     no_tui: bool = false,
+    insecure_upstream: bool = false,
     max_body: ?usize = null,
     local: bool = false,
     dns: bool = false,
@@ -869,6 +882,8 @@ fn readConfigFile(
             addRoute(allocator, routes, route_count, val);
         } else if (std.mem.eql(u8, line, "no-tui")) {
             result.no_tui = true;
+        } else if (std.mem.eql(u8, line, "insecure-upstream")) {
+            result.insecure_upstream = true;
         } else if (std.mem.eql(u8, line, "local") or std.mem.eql(u8, line, "l")) {
             result.local = true;
         } else if (std.mem.eql(u8, line, "dns")) {
