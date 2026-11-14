@@ -37,6 +37,8 @@ pub const ProxyConfig = struct {
     max_request_body: usize = default_max_request_body,
     routes: []const Route = &.{},
     domain: []const u8 = "dev.lo",
+    /// Skip certificate verification for external routes (`--insecure-upstream`).
+    insecure_upstream: bool = false,
 };
 
 var conn_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
@@ -139,15 +141,95 @@ const UpstreamConn = struct {
     }
 };
 
-/// Create a TLS client context for connecting to external upstreams.
-fn createClientSslCtx() ?*ssl_c.SSL_CTX {
+/// Root bundles tried after BoringSSL's defaults (`/etc/ssl/cert.pem`, `/etc/ssl/certs`,
+/// `SSL_CERT_FILE`/`SSL_CERT_DIR`). The first that loads wins.
+const root_bundles = [_][:0]const u8{
+    "/etc/ssl/cert.pem", // macOS, Alpine, Arch
+    "/etc/ssl/certs/ca-certificates.crt", // Debian, Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt", // Fedora, RHEL
+    "/etc/ssl/ca-bundle.pem", // openSUSE
+};
+
+/// Load the OS trust store into `ctx` for verifying external upstreams. BoringSSL
+/// built from source doesn't know the platform stores, so macOS and Linux load a
+/// PEM bundle and Windows copies the system ROOT store. False if nothing loaded.
+fn loadSystemRoots(ctx: *ssl_c.SSL_CTX) bool {
+    defer ssl_c.ERR_clear_error();
+    if (builtin.os.tag == .windows) return loadWindowsRoots(ctx) > 0;
+    _ = ssl_c.SSL_CTX_set_default_verify_paths(ctx);
+    if (compat.getenv("SSL_CERT_FILE") != null or compat.getenv("SSL_CERT_DIR") != null) return true;
+    for (root_bundles) |path| {
+        if (ssl_c.SSL_CTX_load_verify_locations(ctx, path.ptr, null) == 1) return true;
+    }
+    return false;
+}
+
+fn loadWindowsRoots(ctx: *ssl_c.SSL_CTX) usize {
+    const store = ssl_c.SSL_CTX_get_cert_store(ctx);
+    const sys_store = win32.CertOpenSystemStoreW(0, std.unicode.utf8ToUtf16LeStringLiteral("ROOT")) orelse return 0;
+    defer _ = win32.CertCloseStore(sys_store, 0);
+    var added: usize = 0;
+    // CertEnumCertificatesInStore frees the previous context on each call.
+    var prev: ?*const win32.CERT_CONTEXT = null;
+    while (win32.CertEnumCertificatesInStore(sys_store, prev)) |cc| : (prev = cc) {
+        var der: [*c]const u8 = cc.pbCertEncoded;
+        const x509 = ssl_c.d2i_X509(null, &der, @intCast(cc.cbCertEncoded)) orelse continue;
+        defer ssl_c.X509_free(x509);
+        if (ssl_c.X509_STORE_add_cert(store, x509) == 1) added += 1;
+    }
+    return added;
+}
+
+/// Create a TLS client context for connecting to external upstreams. Verifies the
+/// upstream's certificate against the OS trust store unless `insecure`
+/// (`--insecure-upstream`).
+fn createClientSslCtx(insecure: bool) ?*ssl_c.SSL_CTX {
     const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_client_method()) orelse return null;
-    // Use system CA certificates for verifying upstream servers
-    if (ssl_c.SSL_CTX_set_default_verify_paths(ctx) != 1) {
-        log.err("component=proxy op=client_ssl error=set_verify_paths_failed", .{});
+    if (insecure) {
+        ssl_c.SSL_CTX_set_verify(ctx, ssl_c.SSL_VERIFY_NONE, null);
+    } else {
+        ssl_c.SSL_CTX_set_verify(ctx, ssl_c.SSL_VERIFY_PEER, null);
+        if (!loadSystemRoots(ctx)) {
+            log.err("component=proxy op=client_ssl error=no_trusted_roots hint=set SSL_CERT_FILE or use --insecure-upstream", .{});
+        }
     }
     _ = ssl_c.SSL_CTX_set_mode(ctx, ssl_c.SSL_MODE_AUTO_RETRY);
     return ctx;
+}
+
+/// TLS-wrap a connected upstream socket: SNI plus verification against `host`
+/// (DNS name or IP literal). A rejected certificate is `UpstreamCertUntrusted`, so
+/// the client gets a 502 that names the fix.
+fn upstreamHandshake(cctx: *ssl_c.SSL_CTX, sock: compat.socket_t, host: []const u8, conn_id: u64) !*ssl_c.SSL {
+    const us = ssl_c.SSL_new(cctx) orelse {
+        log.err("component=proxy conn={d} op=upstream_ssl_new error=alloc_failed", .{conn_id});
+        return error.UpstreamUnavailable;
+    };
+    errdefer ssl_c.SSL_free(us);
+    _ = ssl_c.SSL_set_fd(us, compat.socketToFd(sock));
+
+    var host_buf: [256]u8 = undefined;
+    const host_z = std.fmt.bufPrintSentinel(&host_buf, "{s}", .{host}, 0) catch return error.UpstreamUnavailable;
+    const is_ip = if (std.Io.net.IpAddress.parse(host, 0)) |_| true else |_| false;
+    if (is_ip) {
+        // SNI must not carry an IP literal; match the cert's IP SAN instead.
+        if (ssl_c.X509_VERIFY_PARAM_set1_ip_asc(ssl_c.SSL_get0_param(us), host_z.ptr) != 1) return error.UpstreamUnavailable;
+    } else {
+        _ = ssl_c.SSL_set_tlsext_host_name(us, host_z.ptr);
+        if (ssl_c.SSL_set1_host(us, host_z.ptr) != 1) return error.UpstreamUnavailable;
+    }
+
+    if (ssl_c.SSL_connect(us) != 1) {
+        const verify = ssl_c.SSL_get_verify_result(us);
+        ssl_c.ERR_clear_error();
+        if (verify != ssl_c.X509_V_OK) {
+            log.err("component=proxy conn={d} op=upstream_tls_verify host={s} error=\"{s}\"", .{ conn_id, host, std.mem.span(ssl_c.X509_verify_cert_error_string(verify)) });
+            return error.UpstreamCertUntrusted;
+        }
+        log.err("component=proxy conn={d} op=upstream_tls_handshake host={s} error=failed", .{ conn_id, host });
+        return error.UpstreamUnavailable;
+    }
+    return us;
 }
 
 /// Bind the HTTPS listener on port 443. Separate from `start` so startup can
@@ -215,7 +297,7 @@ pub fn start(config: *const ProxyConfig, listener: compat.socket_t) !void {
             break;
         }
     }
-    const client_ctx: ?*ssl_c.SSL_CTX = if (has_external) createClientSslCtx() else null;
+    const client_ctx: ?*ssl_c.SSL_CTX = if (has_external) createClientSslCtx(config.insecure_upstream) else null;
     defer if (client_ctx) |c| ssl_c.SSL_CTX_free(c);
 
     log.info("component=proxy op=listening ip={s} port=443 target={s}:{d}", .{ config.listen_addr, config.target_host, config.target_port });
@@ -367,25 +449,10 @@ fn connectUpstream(
             compat.closeSocket(upstream_sock);
             return error.UpstreamUnavailable;
         };
-        const us = ssl_c.SSL_new(cctx) orelse {
-            log.err("component=proxy conn={d} op=upstream_ssl_new error=alloc_failed", .{conn_id});
+        const us = upstreamHandshake(cctx, upstream_sock, upstream_host, conn_id) catch |e| {
             compat.closeSocket(upstream_sock);
-            return error.UpstreamUnavailable;
+            return e;
         };
-        _ = ssl_c.SSL_set_fd(us, compat.socketToFd(upstream_sock));
-        // Set SNI hostname
-        var sni_buf: [256]u8 = undefined;
-        if (upstream_host.len < sni_buf.len) {
-            @memcpy(sni_buf[0..upstream_host.len], upstream_host);
-            sni_buf[upstream_host.len] = 0;
-            _ = ssl_c.SSL_set_tlsext_host_name(us, &sni_buf);
-        }
-        if (ssl_c.SSL_connect(us) != 1) {
-            log.err("component=proxy conn={d} op=upstream_tls_handshake host={s} error=failed", .{ conn_id, upstream_host });
-            ssl_c.SSL_free(us);
-            compat.closeSocket(upstream_sock);
-            return error.UpstreamUnavailable;
-        }
         upstream_ssl_obj = us;
     }
 
@@ -578,12 +645,15 @@ fn handleConnection(
         const is_external = route_result.hostname != null;
         const upstream_host = route_result.hostname orelse config.target_host;
 
-        const upstream = connectUpstream(is_external, upstream_host, upstream_port, config, client_ctx, conn_id) catch {
+        const upstream = connectUpstream(is_external, upstream_host, upstream_port, config, client_ctx, conn_id) catch |e| {
             const dur = rt.milliTimestamp() - start_time;
             if (was_intercepted) {
                 requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
             }
-            sslSendError(ssl, 502, "Bad Gateway");
+            sslSendError(ssl, 502, if (e == error.UpstreamCertUntrusted)
+                "Upstream certificate not trusted (use --insecure-upstream to skip verification)"
+            else
+                "Bad Gateway");
             return;
         };
         defer upstream.close();
@@ -1476,6 +1546,16 @@ test "acceptTls fails fast on a client that sends plain HTTP" {
 /// Server context with a throwaway self-signed certificate, for tests that need
 /// a real TLS session (clients in these tests don't verify).
 fn testServerCtx() !*ssl_c.SSL_CTX {
+    const srv = try testServer(null);
+    ssl_c.X509_free(srv.cert);
+    return srv.ctx;
+}
+
+const TestServer = struct { ctx: *ssl_c.SSL_CTX, cert: *ssl_c.X509 };
+
+/// Self-signed RSA server context. With `name`, the cert carries CN and SAN
+/// DNS:`name`, so hostname verification can match it. Caller frees both.
+fn testServer(name: ?[:0]const u8) !TestServer {
     const kctx = ssl_c.EVP_PKEY_CTX_new_id(ssl_c.EVP_PKEY_RSA, null) orelse return error.KeyGen;
     defer ssl_c.EVP_PKEY_CTX_free(kctx);
     if (ssl_c.EVP_PKEY_keygen_init(kctx) != 1) return error.KeyGen;
@@ -1485,19 +1565,29 @@ fn testServerCtx() !*ssl_c.SSL_CTX {
     defer ssl_c.EVP_PKEY_free(pkey);
 
     const x509 = ssl_c.X509_new() orelse return error.Cert;
-    defer ssl_c.X509_free(x509);
+    errdefer ssl_c.X509_free(x509);
     if (ssl_c.X509_set_version(x509, 2) != 1) return error.Cert;
     if (ssl_c.ASN1_INTEGER_set(ssl_c.X509_get_serialNumber(x509), 1) != 1) return error.Cert;
     if (ssl_c.X509_gmtime_adj(ssl_c.X509_getm_notBefore(x509), 0) == null) return error.Cert;
     if (ssl_c.X509_gmtime_adj(ssl_c.X509_getm_notAfter(x509), 3600) == null) return error.Cert;
     if (ssl_c.X509_set_pubkey(x509, pkey) != 1) return error.Cert;
+    if (name) |n| {
+        const subj = ssl_c.X509_get_subject_name(x509);
+        if (ssl_c.X509_NAME_add_entry_by_NID(subj, ssl_c.NID_commonName, ssl_c.MBSTRING_ASC, n.ptr, @intCast(n.len), -1, 0) != 1) return error.Cert;
+        if (ssl_c.X509_set_issuer_name(x509, subj) != 1) return error.Cert;
+        var san_buf: [300]u8 = undefined;
+        const san = std.fmt.bufPrintSentinel(&san_buf, "DNS:{s}", .{n}, 0) catch return error.Cert;
+        const ext = ssl_c.X509V3_EXT_nconf_nid(null, null, ssl_c.NID_subject_alt_name, san.ptr) orelse return error.Cert;
+        defer ssl_c.X509_EXTENSION_free(ext);
+        if (ssl_c.X509_add_ext(x509, ext, -1) != 1) return error.Cert;
+    }
     if (ssl_c.X509_sign(x509, pkey, ssl_c.EVP_sha256()) == 0) return error.Cert;
 
     const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_server_method()) orelse return error.SslCtx;
     errdefer ssl_c.SSL_CTX_free(ctx);
     if (ssl_c.SSL_CTX_use_certificate(ctx, x509) != 1) return error.Cert;
     if (ssl_c.SSL_CTX_use_PrivateKey(ctx, pkey) != 1) return error.Cert;
-    return ctx;
+    return .{ .ctx = ctx, .cert = x509 };
 }
 
 /// A loopback TCP connection: `a` is the connecting end, `b` the accepted end.
@@ -1751,4 +1841,67 @@ test "304 without Content-Length is answered at once and keeps the connection" {
     const get = try px.roundTrip("GET / HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "ok", &buf);
     try testing.expect(std.mem.startsWith(u8, get, "HTTP/1.1 200"));
     try testing.expect(rt.milliTimestamp() - t0 < 1000);
+}
+
+/// Handshake `client_ctx` against `server` over a loopback pair, through the same
+/// upstreamHandshake that connectUpstream uses for external routes.
+fn handshakeUpstream(port: u16, server: TestServer, client_ctx: *ssl_c.SSL_CTX, host: []const u8) !void {
+    var tcp = try TcpPair.init(port);
+    defer tcp.deinit();
+    const srv = ssl_c.SSL_new(server.ctx) orelse return error.SslNew;
+    defer ssl_c.SSL_free(srv);
+    _ = ssl_c.SSL_set_fd(srv, compat.socketToFd(tcp.b));
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(s: *ssl_c.SSL) void {
+            _ = ssl_c.SSL_accept(s);
+        }
+    }.run, .{srv});
+    defer t.join();
+    // A client that rejects the cert sends a fatal alert, which ends SSL_accept.
+    const us = try upstreamHandshake(client_ctx, tcp.a, host, 1);
+    ssl_c.SSL_free(us);
+}
+
+test "upstream TLS rejects a certificate no trusted root vouches for" {
+    const srv = try testServer("localhost");
+    defer ssl_c.SSL_CTX_free(srv.ctx);
+    defer ssl_c.X509_free(srv.cert);
+    const cctx = createClientSslCtx(false) orelse return error.SslCtx;
+    defer ssl_c.SSL_CTX_free(cctx);
+    try testing.expectError(error.UpstreamCertUntrusted, handshakeUpstream(18098, srv, cctx, "localhost"));
+}
+
+test "insecure upstream accepts any certificate" {
+    const srv = try testServer("totally-wrong.example");
+    defer ssl_c.SSL_CTX_free(srv.ctx);
+    defer ssl_c.X509_free(srv.cert);
+    const cctx = createClientSslCtx(true) orelse return error.SslCtx;
+    defer ssl_c.SSL_CTX_free(cctx);
+    try handshakeUpstream(18099, srv, cctx, "localhost");
+}
+
+test "upstream TLS accepts a trusted certificate for the route's host" {
+    const srv = try testServer("localhost");
+    defer ssl_c.SSL_CTX_free(srv.ctx);
+    defer ssl_c.X509_free(srv.cert);
+    const cctx = createClientSslCtx(false) orelse return error.SslCtx;
+    defer ssl_c.SSL_CTX_free(cctx);
+    try testing.expectEqual(@as(c_int, 1), ssl_c.X509_STORE_add_cert(ssl_c.SSL_CTX_get_cert_store(cctx), srv.cert));
+    try handshakeUpstream(18100, srv, cctx, "localhost");
+}
+
+test "upstream TLS rejects a trusted certificate issued for another host" {
+    const srv = try testServer("localhost");
+    defer ssl_c.SSL_CTX_free(srv.ctx);
+    defer ssl_c.X509_free(srv.cert);
+    const cctx = createClientSslCtx(false) orelse return error.SslCtx;
+    defer ssl_c.SSL_CTX_free(cctx);
+    try testing.expectEqual(@as(c_int, 1), ssl_c.X509_STORE_add_cert(ssl_c.SSL_CTX_get_cert_store(cctx), srv.cert));
+    try testing.expectError(error.UpstreamCertUntrusted, handshakeUpstream(18101, srv, cctx, "staging.example.com"));
+}
+
+test "loadSystemRoots finds the OS trust store" {
+    const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_client_method()) orelse return error.SslCtx;
+    defer ssl_c.SSL_CTX_free(ctx);
+    try testing.expect(loadSystemRoots(ctx));
 }

@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
     // Link Winsock on Windows
     if (target.result.os.tag == .windows) {
         exe.root_module.linkSystemLibrary("ws2_32", .{});
+        exe.root_module.linkSystemLibrary("crypt32", .{});
     }
 
     // proxy.zig and cert.zig import translate-c modules, so their tests need the build graph.
@@ -67,6 +68,7 @@ pub fn build(b: *std.Build) void {
         t.root_module.addIncludePath(boringssl.path("include"));
         if (target.result.os.tag == .windows) {
             t.root_module.linkSystemLibrary("ws2_32", .{});
+            t.root_module.linkSystemLibrary("crypt32", .{});
         }
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
