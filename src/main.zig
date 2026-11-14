@@ -422,7 +422,8 @@ fn doStart(
     }
 
     // Renew the leaf from the kept CA when it's close to expiry (no sudo needed).
-    cert.ensureLeaf(allocator, full_domain) catch |e| {
+    var cert_warning_buf: [cert.cert_warning_len]u8 = undefined;
+    const cert_warning = cert.ensureLeaf(allocator, full_domain, &cert_warning_buf) catch |e| {
         switch (e) {
             error.CaExpired => std.debug.print("CA expired, run 'zlodev install -f'\n", .{}),
             error.CaNotFound => std.debug.print("certificates not found, run 'zlodev install' first\n", .{}),
@@ -549,7 +550,7 @@ fn doStart(
         }
     } else {
         // Run TUI on main thread (blocks until user quits)
-        tui.run(allocator, full_domain, target_port, routes, command != null) catch |e| {
+        tui.run(allocator, full_domain, target_port, routes, command != null, cert_warning) catch |e| {
             log.unmute();
             log.err("component=tui op=start error={any}", .{e});
         };

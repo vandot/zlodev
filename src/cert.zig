@@ -398,23 +398,34 @@ fn ensureLeafIn(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []co
     return .{ .renewed = not_after };
 }
 
+pub const cert_warning_len = 128;
+
+/// One-line warning for a leaf that couldn't be renewed, shown in the TUI header.
+fn keptWarning(buf: *[cert_warning_len]u8, err: anyerror, not_after: i64) []const u8 {
+    var date_buf: [10]u8 = undefined;
+    return std.fmt.bufPrint(buf, "renewal failed ({s}), expires {s} - run zlodev install -f", .{ @errorName(err), formatDate(&date_buf, not_after) }) catch buf[0..];
+}
+
 /// Re-sign the leaf with the kept CA key when it has under 30 days left. No sudo:
 /// the CA and trust store are untouched. Errors mean there is no usable leaf.
-pub fn ensureLeaf(allocator: std.mem.Allocator, domain: []const u8) !void {
+/// Returns a warning (in `warning_buf`) when renewal failed but the old leaf still works.
+pub fn ensureLeaf(allocator: std.mem.Allocator, domain: []const u8, warning_buf: *[cert_warning_len]u8) !?[]const u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cert_dir = try getCertPath(&path_buf, domain);
-    var date_buf: [10]u8 = undefined;
     switch (try ensureLeafIn(allocator, domain, cert_dir, rt.timestamp())) {
-        .current => {},
+        .current => return null,
         .renewed => |na| {
+            var date_buf: [10]u8 = undefined;
             const date = formatDate(&date_buf, na);
             log.info("component=cert op=renew domain={s} not_after={s}", .{ domain, date });
             std.debug.print("renewed certificate for {s}, valid until {s}\n", .{ domain, date });
+            return null;
         },
         .kept => |k| {
-            const date = formatDate(&date_buf, k.not_after);
             log.err("component=cert op=renew domain={s} error={s}", .{ domain, @errorName(k.err) });
-            std.debug.print("warning: could not renew certificate for {s} ({s}), current one valid until {s}\n", .{ domain, @errorName(k.err), date });
+            const warning = keptWarning(warning_buf, k.err, k.not_after);
+            std.debug.print("warning: {s}: {s}\n", .{ domain, warning });
+            return warning;
         },
     }
 }
@@ -1038,4 +1049,12 @@ test "CA name constraint follows the -l domain" {
     const bad = try buildLeaf(std.testing.allocator, "dev.lo", ca, now - day_s, now + leaf_days * day_s);
     defer bad.deinit();
     try std.testing.expectEqual(@as(c_int, c.X509_V_ERR_PERMITTED_VIOLATION), try verifyError(ca.cert, bad.cert));
+}
+
+test "keptWarning names the error, expiry date and fix" {
+    var buf: [cert_warning_len]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "renewal failed (CaKeyNotFound), expires 2026-11-14 - run zlodev install -f",
+        keptWarning(&buf, error.CaKeyNotFound, 1794614400),
+    );
 }
