@@ -348,7 +348,7 @@ intercept=resp:POST /api
 
 1. **DNS** — A lightweight DNS server resolves `*.lo` queries to `127.0.0.1`. On macOS it registers via `/etc/resolver/`, on Linux via `systemd-resolved` (with a `systemd-networkd` dummy interface, so Linux needs systemd, systemd-resolved and systemd-networkd), on Windows via NRPT rules.
 
-2. **Certificates** — On `install`, zlodev generates a local CA and domain certificate, then adds the CA to your system trust store. The CA is unique to your machine. Private keys are written readable only by you (`0600`, in a `0700` directory).
+2. **Certificates** — On `install`, zlodev generates a local CA and domain certificate, then adds the CA to your system trust store. The CA is unique to your machine. Private keys are written readable only by you (`0600`, in a `0700` directory). On every `start`, zlodev re-signs the domain certificate with the local CA when it has fewer than 30 days left. This needs no sudo, since the CA in your trust store doesn't change. CAs created by `install` are limited to your zlodev domain (`dev.lo`, or `<host>.local` with `-l`) by an X.509 name constraint, so the CA can't vouch for any other site. Installs from older versions can get the constraint with `zlodev install -f`.
 
 3. **Proxy** — An HTTPS reverse proxy accepts connections on port 443, terminates TLS, and forwards plain HTTP to your dev server. Responses are relayed back over TLS. A client that doesn't finish the TLS handshake within 10 seconds is dropped.
 

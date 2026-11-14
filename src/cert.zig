@@ -142,32 +142,60 @@ fn setNameEntry(name: *c.X509_NAME, nid: c_int, value: []const u8) !void {
         return error.CertCreateFailed;
 }
 
-fn generateCA(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []const u8) !struct { cert_x509: *c.X509, key: *c.EVP_PKEY } {
-    // Generate CA key
-    const ca_key = try generateRsaKey();
-    errdefer c.EVP_PKEY_free(ca_key);
+const day_s: i64 = 24 * 60 * 60;
+const ca_days: i64 = 3650;
+const leaf_days: i64 = 398;
 
-    // Create certificate
-    const ca_cert = c.X509_new() orelse return error.CertCreateFailed;
-    errdefer c.X509_free(ca_cert);
+const CertKey = struct {
+    cert: *c.X509,
+    key: *c.EVP_PKEY,
 
-    // Version 3
-    if (c.X509_set_version(ca_cert, 2) != 1) return error.CertCreateFailed;
+    fn deinit(self: CertKey) void {
+        c.X509_free(self.cert);
+        c.EVP_PKEY_free(self.key);
+    }
+};
 
-    // Random serial number
+fn setValidity(x509: *c.X509, not_before: i64, not_after: i64) !void {
+    if (c.ASN1_TIME_set_posix(c.X509_getm_notBefore(x509), not_before) == null) return error.CertCreateFailed;
+    if (c.ASN1_TIME_set_posix(c.X509_getm_notAfter(x509), not_after) == null) return error.CertCreateFailed;
+}
+
+fn setRandomSerial(x509: *c.X509) !void {
     const serial_bn = c.BN_new() orelse return error.CertCreateFailed;
     defer c.BN_free(serial_bn);
     if (c.BN_rand(serial_bn, 64, 0, 0) != 1) return error.CertCreateFailed;
-    const serial_asn1 = c.X509_get_serialNumber(ca_cert);
-    if (c.BN_to_ASN1_INTEGER(serial_bn, serial_asn1) == null) return error.CertCreateFailed;
+    if (c.BN_to_ASN1_INTEGER(serial_bn, c.X509_get_serialNumber(x509)) == null) return error.CertCreateFailed;
+}
 
-    // Validity: now to +3650 days
-    const not_before = c.X509_get_notBefore(ca_cert);
-    if (c.X509_gmtime_adj(not_before, 0) == null) return error.CertCreateFailed;
-    const not_after = c.X509_get_notAfter(ca_cert);
-    if (c.X509_gmtime_adj(not_after, 3650 * 24 * 60 * 60) == null) return error.CertCreateFailed;
+fn notAfter(x509: *c.X509) !i64 {
+    var t: i64 = 0;
+    if (c.ASN1_TIME_to_posix(c.X509_get0_notAfter(x509), &t) != 1) return error.CertReadFailed;
+    return t;
+}
 
-    // Subject name
+fn readPemCert(path: [:0]const u8) ?*c.X509 {
+    const bio = c.BIO_new_file(path.ptr, "r") orelse return null;
+    defer _ = c.BIO_free(bio);
+    return c.PEM_read_bio_X509(bio, null, null, null);
+}
+
+fn readPemKey(path: [:0]const u8) ?*c.EVP_PKEY {
+    const bio = c.BIO_new_file(path.ptr, "r") orelse return null;
+    defer _ = c.BIO_free(bio);
+    return c.PEM_read_bio_PrivateKey(bio, null, null, null);
+}
+
+fn buildCA(allocator: std.mem.Allocator, domain: []const u8, not_before: i64, not_after: i64) !CertKey {
+    const ca_key = try generateRsaKey();
+    errdefer c.EVP_PKEY_free(ca_key);
+    const ca_cert = c.X509_new() orelse return error.CertCreateFailed;
+    errdefer c.X509_free(ca_cert);
+
+    if (c.X509_set_version(ca_cert, 2) != 1) return error.CertCreateFailed;
+    try setRandomSerial(ca_cert);
+    try setValidity(ca_cert, not_before, not_after);
+
     const name = c.X509_get_subject_name(ca_cert) orelse return error.CertCreateFailed;
     try setNameEntry(name, c.NID_countryName, "LO");
     try setNameEntry(name, c.NID_stateOrProvinceName, "Dev");
@@ -183,19 +211,21 @@ fn generateCA(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []cons
 
     // Self-signed: issuer = subject
     if (c.X509_set_issuer_name(ca_cert, name) != 1) return error.CertCreateFailed;
-
-    // Set public key
     if (c.X509_set_pubkey(ca_cert, ca_key) != 1) return error.CertCreateFailed;
 
-    // Extensions
     try addExtension(ca_cert, null, c.NID_basic_constraints, "critical,CA:TRUE,pathlen:0");
     try addExtension(ca_cert, null, c.NID_key_usage, "critical,keyCertSign");
     try addExtension(ca_cert, null, c.NID_subject_key_identifier, "hash");
+    // Limit the CA to the zlodev domain, so a leaked CA key can't mint certs for other sites or IPs.
+    const nc = try allocPrintZ(allocator, "critical,permitted;DNS:{s},excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:0:0:0:0:0:0:0:0/0:0:0:0:0:0:0:0", .{domain});
+    defer allocator.free(nc);
+    try addExtension(ca_cert, null, c.NID_name_constraints, nc);
 
-    // Sign
     if (c.X509_sign(ca_cert, ca_key, c.EVP_sha256()) == 0) return error.SignFailed;
+    return .{ .cert = ca_cert, .key = ca_key };
+}
 
-    // Write files directly to cert_dir
+fn writeCA(allocator: std.mem.Allocator, cert_dir: []const u8, ca: CertKey) !void {
     const ca_pem_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
     defer allocator.free(ca_pem_path);
     const ca_key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.key", .{cert_dir});
@@ -203,80 +233,201 @@ fn generateCA(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []cons
     const ca_der_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.der", .{cert_dir});
     defer allocator.free(ca_der_path);
 
-    try writePemCert(ca_pem_path, ca_cert);
-    try writePemKey(ca_key_path, ca_key);
-    try writeDerCert(ca_der_path, ca_cert);
-
-    return .{ .cert_x509 = ca_cert, .key = ca_key };
+    try writePemCert(ca_pem_path, ca.cert);
+    try writePemKey(ca_key_path, ca.key);
+    try writeDerCert(ca_der_path, ca.cert);
 }
 
-fn generateDomainCert(allocator: std.mem.Allocator, domain: []const u8, ca_cert: *c.X509, ca_key: *c.EVP_PKEY, cert_dir: []const u8) !void {
-    // Generate domain key
-    const domain_key = try generateRsaKey();
-    defer c.EVP_PKEY_free(domain_key);
+fn buildCert(allocator: std.mem.Allocator, cn: []const u8, san: [:0]const u8, ca: CertKey, not_before: i64, not_after: i64) !CertKey {
+    const key = try generateRsaKey();
+    errdefer c.EVP_PKEY_free(key);
+    const cert_x509 = c.X509_new() orelse return error.CertCreateFailed;
+    errdefer c.X509_free(cert_x509);
 
-    // Create certificate
-    const domain_cert = c.X509_new() orelse return error.CertCreateFailed;
-    defer c.X509_free(domain_cert);
+    if (c.X509_set_version(cert_x509, 2) != 1) return error.CertCreateFailed;
+    try setRandomSerial(cert_x509);
+    try setValidity(cert_x509, not_before, not_after);
 
-    // Version 3
-    if (c.X509_set_version(domain_cert, 2) != 1) return error.CertCreateFailed;
-
-    // Random serial
-    const serial_bn = c.BN_new() orelse return error.CertCreateFailed;
-    defer c.BN_free(serial_bn);
-    if (c.BN_rand(serial_bn, 64, 0, 0) != 1) return error.CertCreateFailed;
-    const serial_asn1 = c.X509_get_serialNumber(domain_cert);
-    if (c.BN_to_ASN1_INTEGER(serial_bn, serial_asn1) == null) return error.CertCreateFailed;
-
-    // Validity: now to +398 days
-    const not_before = c.X509_get_notBefore(domain_cert);
-    if (c.X509_gmtime_adj(not_before, 0) == null) return error.CertCreateFailed;
-    const not_after = c.X509_get_notAfter(domain_cert);
-    if (c.X509_gmtime_adj(not_after, 398 * 24 * 60 * 60) == null) return error.CertCreateFailed;
-
-    // Subject name
-    const name = c.X509_get_subject_name(domain_cert) orelse return error.CertCreateFailed;
+    const name = c.X509_get_subject_name(cert_x509) orelse return error.CertCreateFailed;
     try setNameEntry(name, c.NID_countryName, "LO");
     try setNameEntry(name, c.NID_stateOrProvinceName, "Dev");
     try setNameEntry(name, c.NID_localityName, "Local");
     try setNameEntry(name, c.NID_organizationName, "Dev");
     try setNameEntry(name, c.NID_organizationalUnitName, "Local");
 
-    const cn_z = try allocPrintZ(allocator, "{s}", .{domain});
+    const cn_z = try allocPrintZ(allocator, "{s}", .{cn});
     defer allocator.free(cn_z);
     const cn_z_truncated = if (cn_z.len > 64) cn_z[0..64] else @as([]const u8, cn_z);
     try setNameEntry(name, c.NID_commonName, cn_z_truncated);
 
-    // Issuer = CA subject
-    const ca_subject = c.X509_get_subject_name(ca_cert) orelse return error.CertCreateFailed;
-    if (c.X509_set_issuer_name(domain_cert, ca_subject) != 1) return error.CertCreateFailed;
+    const ca_subject = c.X509_get_subject_name(ca.cert) orelse return error.CertCreateFailed;
+    if (c.X509_set_issuer_name(cert_x509, ca_subject) != 1) return error.CertCreateFailed;
+    if (c.X509_set_pubkey(cert_x509, key) != 1) return error.CertCreateFailed;
 
-    // Set public key
-    if (c.X509_set_pubkey(domain_cert, domain_key) != 1) return error.CertCreateFailed;
+    try addExtension(cert_x509, ca.cert, c.NID_authority_key_identifier, "keyid:always");
+    try addExtension(cert_x509, ca.cert, c.NID_basic_constraints, "critical,CA:FALSE");
+    try addExtension(cert_x509, ca.cert, c.NID_key_usage, "critical,digitalSignature,keyEncipherment");
+    try addExtension(cert_x509, ca.cert, c.NID_ext_key_usage, "serverAuth");
+    try addExtension(cert_x509, ca.cert, c.NID_subject_alt_name, san);
 
-    // Extensions
-    try addExtension(domain_cert, ca_cert, c.NID_authority_key_identifier, "keyid:always");
-    try addExtension(domain_cert, ca_cert, c.NID_basic_constraints, "critical,CA:FALSE");
-    try addExtension(domain_cert, ca_cert, c.NID_key_usage, "critical,digitalSignature,keyEncipherment");
-    try addExtension(domain_cert, ca_cert, c.NID_ext_key_usage, "serverAuth");
+    if (c.X509_sign(cert_x509, ca.key, c.EVP_sha256()) == 0) return error.SignFailed;
+    return .{ .cert = cert_x509, .key = key };
+}
 
-    // SAN
+fn buildLeaf(allocator: std.mem.Allocator, domain: []const u8, ca: CertKey, not_before: i64, not_after: i64) !CertKey {
     const san = try allocPrintZ(allocator, "DNS:*.{s},DNS:{s}", .{ domain, domain });
     defer allocator.free(san);
-    try addExtension(domain_cert, ca_cert, c.NID_subject_alt_name, san);
+    return buildCert(allocator, domain, san, ca, not_before, not_after);
+}
 
-    // Sign with CA key
-    if (c.X509_sign(domain_cert, ca_key, c.EVP_sha256()) == 0) return error.SignFailed;
+/// Write the leaf next to the old one, then rename over it, so a failed write never
+/// leaves a half-written cert. Key goes first: a crash between the renames leaves a
+/// mismatched pair, which ensureLeafIn detects and renews on the next start.
+fn writeLeaf(allocator: std.mem.Allocator, cert_dir: []const u8, leaf: CertKey) !void {
+    const crt_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.crt", .{cert_dir});
+    defer allocator.free(crt_path);
+    const key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.key", .{cert_dir});
+    defer allocator.free(key_path);
+    const crt_tmp = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.crt.tmp", .{cert_dir});
+    defer allocator.free(crt_tmp);
+    const key_tmp = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.key.tmp", .{cert_dir});
+    defer allocator.free(key_tmp);
 
-    // Write files
-    const cert_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.crt", .{cert_dir});
-    defer allocator.free(cert_path);
+    const io = rt.io();
+    const cwd = std.Io.Dir.cwd();
+    errdefer cwd.deleteFile(io, crt_tmp) catch {};
+    errdefer cwd.deleteFile(io, key_tmp) catch {};
+
+    try writePemKey(key_tmp, leaf.key);
+    try writePemCert(crt_tmp, leaf.cert);
+    cwd.rename(key_tmp, cwd, key_path, io) catch return error.FileWriteFailed;
+    cwd.rename(crt_tmp, cwd, crt_path, io) catch return error.FileWriteFailed;
+}
+
+const renew_before_s: i64 = 30 * day_s;
+
+/// True when the leaf has under 30 days left (or already expired).
+pub fn needsRenewal(not_after: i64, now: i64) bool {
+    return not_after - now < renew_before_s;
+}
+
+fn formatDate(buf: *[10]u8, posix: i64) []const u8 {
+    const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(posix, 0)) };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ yd.year, md.month.numeric(), @as(u8, md.day_index) + 1 }) catch unreachable;
+}
+
+/// Restrict the cert dir and key files written world-readable by older versions.
+/// Missing files are skipped; failures only warn, start goes on.
+fn tightenPrivateFiles(cert_dir: []const u8) void {
+    if (builtin.os.tag == .windows) return;
+    tightenPath(cert_dir, 0o700);
+    for ([_][]const u8{ "zlodev.key", "zlodevCA.key" }) |name| {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}" ++ sep ++ "{s}", .{ cert_dir, name }) catch continue;
+        tightenPath(path, 0o600);
+    }
+}
+
+fn tightenPath(path: []const u8, mode: std.posix.mode_t) void {
+    const cwd = std.Io.Dir.cwd();
+    const st = cwd.statFile(rt.io(), path, .{}) catch return;
+    if (st.permissions.toMode() & 0o077 == 0) return;
+    cwd.setFilePermissions(rt.io(), path, .fromMode(mode), .{}) catch |e| {
+        std.debug.print("warning: could not restrict {s}: {s}\n", .{ path, @errorName(e) });
+    };
+}
+
+const Renewal = union(enum) {
+    /// Leaf has 30+ days left and matches its key.
+    current,
+    /// New leaf written; payload is its notAfter.
+    renewed: i64,
+    /// Renewal failed but the old leaf hasn't expired yet.
+    kept: struct { err: anyerror, not_after: i64 },
+};
+
+/// notAfter of the leaf at crt/key, or null if either is unreadable or they don't match.
+fn leafNotAfter(crt_path: [:0]const u8, key_path: [:0]const u8) ?i64 {
+    const crt = readPemCert(crt_path) orelse return null;
+    defer c.X509_free(crt);
+    const key = readPemKey(key_path) orelse return null;
+    defer c.EVP_PKEY_free(key);
+    if (c.X509_check_private_key(crt, key) != 1) return null;
+    return notAfter(crt) catch null;
+}
+
+fn renewLeaf(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []const u8, ca_cert: *c.X509, now: i64) !i64 {
+    const ca_key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.key", .{cert_dir});
+    defer allocator.free(ca_key_path);
+    const ca_key = readPemKey(ca_key_path) orelse return error.CaKeyNotFound;
+    defer c.EVP_PKEY_free(ca_key);
+    const ca: CertKey = .{ .cert = ca_cert, .key = ca_key };
+
+    const ca_not_after = try notAfter(ca.cert);
+    if (ca_not_after <= now) return error.CaExpired;
+    const not_after = @min(now + leaf_days * day_s, ca_not_after);
+    const leaf = try buildLeaf(allocator, domain, ca, now, not_after);
+    defer leaf.deinit();
+    try writeLeaf(allocator, cert_dir, leaf);
+    return not_after;
+}
+
+fn ensureLeafIn(allocator: std.mem.Allocator, domain: []const u8, cert_dir: []const u8, now: i64) !Renewal {
+    tightenPrivateFiles(cert_dir);
+
+    // The proxy loads the CA cert as a chain cert, so without it start can't serve at all.
+    const ca_pem = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
+    defer allocator.free(ca_pem);
+    const ca_cert = readPemCert(ca_pem) orelse return error.CaNotFound;
+    defer c.X509_free(ca_cert);
+
+    const crt_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.crt", .{cert_dir});
+    defer allocator.free(crt_path);
     const key_path = try allocPrintZ(allocator, "{s}" ++ sep ++ "zlodev.key", .{cert_dir});
     defer allocator.free(key_path);
 
-    try writePemCert(cert_path, domain_cert);
-    try writePemKey(key_path, domain_key);
+    if (leafNotAfter(crt_path, key_path)) |na| if (!needsRenewal(na, now)) return .current;
+
+    const not_after = renewLeaf(allocator, domain, cert_dir, ca_cert, now) catch |e| {
+        // Re-read: a failed writeLeaf may have replaced the key but not the cert.
+        if (leafNotAfter(crt_path, key_path)) |na| if (na > now) return .{ .kept = .{ .err = e, .not_after = na } };
+        return e;
+    };
+    return .{ .renewed = not_after };
+}
+
+pub const cert_warning_len = 128;
+
+/// One-line warning for a leaf that couldn't be renewed, shown in the TUI header.
+fn keptWarning(buf: *[cert_warning_len]u8, err: anyerror, not_after: i64) []const u8 {
+    var date_buf: [10]u8 = undefined;
+    return std.fmt.bufPrint(buf, "renewal failed ({s}), expires {s} - run zlodev install -f", .{ @errorName(err), formatDate(&date_buf, not_after) }) catch buf[0..];
+}
+
+/// Re-sign the leaf with the kept CA key when it has under 30 days left. No sudo:
+/// the CA and trust store are untouched. Errors mean there is no usable leaf.
+/// Returns a warning (in `warning_buf`) when renewal failed but the old leaf still works.
+pub fn ensureLeaf(allocator: std.mem.Allocator, domain: []const u8, warning_buf: *[cert_warning_len]u8) !?[]const u8 {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cert_dir = try getCertPath(&path_buf, domain);
+    switch (try ensureLeafIn(allocator, domain, cert_dir, rt.timestamp())) {
+        .current => return null,
+        .renewed => |na| {
+            var date_buf: [10]u8 = undefined;
+            const date = formatDate(&date_buf, na);
+            log.info("component=cert op=renew domain={s} not_after={s}", .{ domain, date });
+            std.debug.print("renewed certificate for {s}, valid until {s}\n", .{ domain, date });
+            return null;
+        },
+        .kept => |k| {
+            log.err("component=cert op=renew domain={s} error={s}", .{ domain, @errorName(k.err) });
+            const warning = keptWarning(warning_buf, k.err, k.not_after);
+            std.debug.print("warning: {s}: {s}\n", .{ domain, warning });
+            return warning;
+        },
+    }
 }
 
 /// Create the cert dir (and parents) and restrict it to the owner, including a
@@ -293,13 +444,14 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
 
     makePrivateDir(cert_dir) catch return error.CertCreateFailed;
 
-    // Generate CA certificate and key
-    const ca = try generateCA(allocator, domain, cert_dir);
-    defer c.X509_free(ca.cert_x509);
-    defer c.EVP_PKEY_free(ca.key);
+    const now = rt.timestamp();
+    const ca = try buildCA(allocator, domain, now, now + ca_days * day_s);
+    defer ca.deinit();
+    try writeCA(allocator, cert_dir, ca);
 
-    // Generate domain certificate signed by CA
-    try generateDomainCert(allocator, domain, ca.cert_x509, ca.key, cert_dir);
+    const leaf = try buildLeaf(allocator, domain, ca, now, now + leaf_days * day_s);
+    defer leaf.deinit();
+    try writeLeaf(allocator, cert_dir, leaf);
 
     // Install CA to system trust store
     const ca_path = try std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
@@ -605,4 +757,305 @@ test "makePrivateDir creates the cert dir and tightens an existing one to 0700" 
     try tmp.dir.createDir(rt.io(), "open", .fromMode(0o755));
     try makePrivateDir(try tmpPathZ(&buf, &tmp, "open"));
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), try modeOf(tmp.dir, "open"));
+}
+
+fn tmpDirPath(buf: []u8, tmp: *const std.testing.TmpDir) ![]const u8 {
+    return std.fmt.bufPrint(buf, ".zig-cache" ++ sep ++ "tmp" ++ sep ++ "{s}", .{&tmp.sub_path});
+}
+
+test "buildLeaf uses the requested validity and the CA as issuer" {
+    const now: i64 = 1794614400; // 2026-11-14
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now, now + ca_days * day_s);
+    defer ca.deinit();
+    const leaf = try buildLeaf(std.testing.allocator, "dev.lo", ca, now, now + 10 * day_s);
+    defer leaf.deinit();
+    try std.testing.expectEqual(now + 10 * day_s, try notAfter(leaf.cert));
+    try std.testing.expectEqual(@as(c_int, 0), c.X509_NAME_cmp(c.X509_get_issuer_name(leaf.cert), c.X509_get_subject_name(ca.cert)));
+    try std.testing.expectEqual(@as(c_int, 1), c.X509_verify(leaf.cert, ca.key));
+}
+
+test "writeLeaf replaces both files and leaves no tmp files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    // Old files from a previous leaf, plus a stale world-readable tmp key from a crashed run.
+    for ([_][]const u8{ "zlodev.crt", "zlodev.key", "zlodev.key.tmp" }) |name| {
+        const open: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o644);
+        const f = try tmp.dir.createFile(rt.io(), name, .{ .permissions = open });
+        f.close(rt.io());
+    }
+    const now: i64 = 1794614400;
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now, now + ca_days * day_s);
+    defer ca.deinit();
+    const leaf = try buildLeaf(std.testing.allocator, "dev.lo", ca, now, now + leaf_days * day_s);
+    defer leaf.deinit();
+    try writeLeaf(std.testing.allocator, dir, leaf);
+
+    var buf: [256]u8 = undefined;
+    const crt = readPemCert(try tmpPathZ(&buf, &tmp, "zlodev.crt")) orelse return error.TestUnexpectedResult;
+    defer c.X509_free(crt);
+    const key = readPemKey(try tmpPathZ(&buf, &tmp, "zlodev.key")) orelse return error.TestUnexpectedResult;
+    defer c.EVP_PKEY_free(key);
+    try std.testing.expectEqual(@as(c_int, 1), c.X509_check_private_key(crt, key));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(rt.io(), "zlodev.crt.tmp", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(rt.io(), "zlodev.key.tmp", .{}));
+    if (builtin.os.tag != .windows)
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "zlodev.key"));
+}
+
+test "needsRenewal renews under 30 days left, including expired" {
+    const now: i64 = 1794614400;
+    try std.testing.expect(!needsRenewal(now + 200 * day_s, now));
+    try std.testing.expect(!needsRenewal(now + 30 * day_s, now));
+    try std.testing.expect(needsRenewal(now + 29 * day_s, now));
+    try std.testing.expect(needsRenewal(now - day_s, now));
+}
+
+test "formatDate prints UTC YYYY-MM-DD" {
+    var buf: [10]u8 = undefined;
+    try std.testing.expectEqualStrings("1970-01-01", formatDate(&buf, 0));
+    try std.testing.expectEqualStrings("2026-11-14", formatDate(&buf, 1794614400));
+}
+
+/// Writes a CA and a leaf into `dir` with the given expiry times.
+fn writeFixture(dir: []const u8, now: i64, ca_not_after: i64, leaf_not_after: i64) !void {
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now - 400 * day_s, ca_not_after);
+    defer ca.deinit();
+    try writeCA(std.testing.allocator, dir, ca);
+    const leaf = try buildLeaf(std.testing.allocator, "dev.lo", ca, now - 388 * day_s, leaf_not_after);
+    defer leaf.deinit();
+    try writeLeaf(std.testing.allocator, dir, leaf);
+}
+
+fn readFixtureFile(tmp: *const std.testing.TmpDir, name: []const u8) ![]u8 {
+    return tmp.dir.readFileAlloc(rt.io(), name, std.testing.allocator, .unlimited);
+}
+
+test "ensureLeafIn renews a leaf with 10 days left" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 10 * day_s);
+    const old_key = try readFixtureFile(&tmp, "zlodev.key");
+    defer std.testing.allocator.free(old_key);
+
+    const r = try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now);
+    try std.testing.expectEqual(now + leaf_days * day_s, r.renewed);
+
+    var buf: [256]u8 = undefined;
+    const crt = readPemCert(try tmpPathZ(&buf, &tmp, "zlodev.crt")) orelse return error.TestUnexpectedResult;
+    defer c.X509_free(crt);
+    const ca_key = readPemKey(try tmpPathZ(&buf, &tmp, "zlodevCA.key")) orelse return error.TestUnexpectedResult;
+    defer c.EVP_PKEY_free(ca_key);
+    try std.testing.expectEqual(@as(c_int, 1), c.X509_verify(crt, ca_key));
+    try std.testing.expectEqual(now + leaf_days * day_s, try notAfter(crt));
+    const new_key = try readFixtureFile(&tmp, "zlodev.key");
+    defer std.testing.allocator.free(new_key);
+    try std.testing.expect(!std.mem.eql(u8, old_key, new_key));
+    if (builtin.os.tag != .windows)
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "zlodev.key"));
+}
+
+test "ensureLeafIn leaves a leaf with 200 days left untouched" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 200 * day_s);
+    const before = try readFixtureFile(&tmp, "zlodev.crt");
+    defer std.testing.allocator.free(before);
+
+    try std.testing.expectEqual(Renewal.current, try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+    const after = try readFixtureFile(&tmp, "zlodev.crt");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "ensureLeafIn clamps the renewed leaf to the CA's expiry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 100 * day_s, now + 10 * day_s);
+    const r = try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now);
+    try std.testing.expectEqual(now + 100 * day_s, r.renewed);
+}
+
+test "ensureLeafIn renews again when the CA itself has under 30 days left" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 20 * day_s, now + 10 * day_s);
+    try std.testing.expectEqual(now + 20 * day_s, (try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now)).renewed);
+    // Clamped leaf still has under 30 days, so the next start renews again and succeeds.
+    try std.testing.expectEqual(now + 20 * day_s, (try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now + 60)).renewed);
+}
+
+test "ensureLeafIn renews a leaf whose key does not match" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 200 * day_s);
+    // Simulate a crash between the key rename and the cert rename.
+    const other = try testKey();
+    defer c.EVP_PKEY_free(other);
+    var buf: [256]u8 = undefined;
+    try writePemKey(try tmpPathZ(&buf, &tmp, "zlodev.key"), other);
+
+    _ = (try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now)).renewed;
+    const crt = readPemCert(try tmpPathZ(&buf, &tmp, "zlodev.crt")) orelse return error.TestUnexpectedResult;
+    defer c.X509_free(crt);
+    const key = readPemKey(try tmpPathZ(&buf, &tmp, "zlodev.key")) orelse return error.TestUnexpectedResult;
+    defer c.EVP_PKEY_free(key);
+    try std.testing.expectEqual(@as(c_int, 1), c.X509_check_private_key(crt, key));
+}
+
+test "ensureLeafIn fails with CaExpired and leaves the leaf untouched" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now - day_s, now - day_s);
+    const before = try readFixtureFile(&tmp, "zlodev.crt");
+    defer std.testing.allocator.free(before);
+    try std.testing.expectError(error.CaExpired, ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+    const after = try readFixtureFile(&tmp, "zlodev.crt");
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "ensureLeafIn keeps a still-valid leaf when the CA key is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 10 * day_s);
+    try tmp.dir.deleteFile(rt.io(), "zlodevCA.key");
+    const r = try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now);
+    try std.testing.expectEqual(error.CaKeyNotFound, r.kept.err);
+    try std.testing.expectEqual(now + 10 * day_s, r.kept.not_after);
+}
+
+test "ensureLeafIn fails when the leaf is expired and the CA is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now - day_s);
+    try tmp.dir.deleteFile(rt.io(), "zlodevCA.pem");
+    try std.testing.expectError(error.CaNotFound, ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+}
+
+test "ensureLeafIn fails with CaKeyNotFound when the leaf is expired and the CA key is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now - day_s);
+    try tmp.dir.deleteFile(rt.io(), "zlodevCA.key");
+    try std.testing.expectError(error.CaKeyNotFound, ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+}
+
+test "ensureLeafIn fails when the CA cert is missing, even with a current leaf" {
+    // The proxy loads zlodevCA.pem as a chain cert, so start can't serve without it.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 200 * day_s);
+    try tmp.dir.deleteFile(rt.io(), "zlodevCA.pem");
+    try std.testing.expectError(error.CaNotFound, ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+}
+
+test "ensureLeafIn tightens key files and the dir left open by older versions" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [256]u8 = undefined;
+    const dir = try tmpDirPath(&dir_buf, &tmp);
+    const now: i64 = 1794614400;
+    try writeFixture(dir, now, now + 3000 * day_s, now + 200 * day_s);
+    try tmp.dir.setFilePermissions(rt.io(), "zlodev.key", .fromMode(0o644), .{});
+    try tmp.dir.setFilePermissions(rt.io(), "zlodevCA.key", .fromMode(0o644), .{});
+    try std.testing.expectEqual(Renewal.current, try ensureLeafIn(std.testing.allocator, "dev.lo", dir, now));
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "zlodev.key"));
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(tmp.dir, "zlodevCA.key"));
+    const st = try std.Io.Dir.cwd().statFile(rt.io(), dir, .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), st.permissions.toMode() & 0o777);
+}
+
+/// X509_V_* result of verifying `leaf` with `ca` as the only trust anchor (0 = OK).
+fn verifyError(ca: *c.X509, leaf: *c.X509) !c_int {
+    const store = c.X509_STORE_new() orelse return error.OutOfMemory;
+    defer c.X509_STORE_free(store);
+    if (c.X509_STORE_add_cert(store, ca) != 1) return error.CertReadFailed;
+    const ctx = c.X509_STORE_CTX_new() orelse return error.OutOfMemory;
+    defer c.X509_STORE_CTX_free(ctx);
+    if (c.X509_STORE_CTX_init(ctx, store, leaf, null) != 1) return error.CertReadFailed;
+    _ = c.X509_verify_cert(ctx);
+    return c.X509_STORE_CTX_get_error(ctx);
+}
+
+test "CA name constraint allows dev.lo and *.dev.lo" {
+    const now = rt.timestamp();
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now - day_s, now + ca_days * day_s);
+    defer ca.deinit();
+    const leaf = try buildLeaf(std.testing.allocator, "dev.lo", ca, now - day_s, now + leaf_days * day_s);
+    defer leaf.deinit();
+    try std.testing.expectEqual(@as(c_int, c.X509_V_OK), try verifyError(ca.cert, leaf.cert));
+}
+
+test "CA name constraint rejects other domains" {
+    const now = rt.timestamp();
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now - day_s, now + ca_days * day_s);
+    defer ca.deinit();
+    const leaf = try buildLeaf(std.testing.allocator, "evil.com", ca, now - day_s, now + leaf_days * day_s);
+    defer leaf.deinit();
+    try std.testing.expectEqual(@as(c_int, c.X509_V_ERR_PERMITTED_VIOLATION), try verifyError(ca.cert, leaf.cert));
+}
+
+test "CA name constraint rejects IP address certificates" {
+    const now = rt.timestamp();
+    const ca = try buildCA(std.testing.allocator, "dev.lo", now - day_s, now + ca_days * day_s);
+    defer ca.deinit();
+    const leaf = try buildCert(std.testing.allocator, "x.dev.lo", "IP:127.0.0.1", ca, now - day_s, now + leaf_days * day_s);
+    defer leaf.deinit();
+    // BoringSSL doesn't evaluate IP subtrees and rejects with UNSUPPORTED_CONSTRAINT_TYPE;
+    // other verifiers report EXCLUDED_VIOLATION. Either way the leaf is refused.
+    const err = try verifyError(ca.cert, leaf.cert);
+    try std.testing.expect(err == c.X509_V_ERR_EXCLUDED_VIOLATION or err == c.X509_V_ERR_UNSUPPORTED_CONSTRAINT_TYPE);
+}
+
+test "CA name constraint follows the -l domain" {
+    const now = rt.timestamp();
+    const ca = try buildCA(std.testing.allocator, "mybox.local", now - day_s, now + ca_days * day_s);
+    defer ca.deinit();
+    const ok = try buildLeaf(std.testing.allocator, "mybox.local", ca, now - day_s, now + leaf_days * day_s);
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(c_int, c.X509_V_OK), try verifyError(ca.cert, ok.cert));
+    const bad = try buildLeaf(std.testing.allocator, "dev.lo", ca, now - day_s, now + leaf_days * day_s);
+    defer bad.deinit();
+    try std.testing.expectEqual(@as(c_int, c.X509_V_ERR_PERMITTED_VIOLATION), try verifyError(ca.cert, bad.cert));
+}
+
+test "keptWarning names the error, expiry date and fix" {
+    var buf: [cert_warning_len]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "renewal failed (CaKeyNotFound), expires 2026-11-14 - run zlodev install -f",
+        keptWarning(&buf, error.CaKeyNotFound, 1794614400),
+    );
 }
