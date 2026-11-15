@@ -1133,9 +1133,9 @@ fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Entry, se
         std.fmt.bufPrint(&dur_buf, "{d}ms", .{entry.duration_ms}) catch "?";
     writeAscii(win, 19, row, dur_text, .{ .fg = dim, .bg = bg });
 
-    // Show response body size
+    // Show response body size: the full size as relayed (the capture holds at most 32KB)
     var size_buf: [10]u8 = undefined;
-    const body_len = entry.resp_body_len;
+    const body_len = @max(entry.resp_body_total, entry.resp_body_len);
     const size_text = if (body_len == 0)
         "0B"
     else if (body_len >= 1048576)
@@ -1240,27 +1240,21 @@ fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const reques
     if (show_body) {
         const req_body = e.getReqBody();
         if (req_body.len > 0) {
-            lines[line_count] = .{ .text = "", .style = .{} };
-            line_count += 1;
-            lines[line_count] = .{ .text = "REQUEST BODY", .style = .{ .fg = blue, .bold = true } };
-            line_count += 1;
+            pushLine(&lines, &line_count, .{ .text = "", .style = .{} });
+            pushLine(&lines, &line_count, .{ .text = "REQUEST BODY", .style = .{ .fg = blue, .bold = true } });
             line_count = splitBodyLines(alloc, req_body, &req_body_scratch, &lines, line_count, .{ .fg = white });
             if (e.req_body_truncated) {
-                lines[line_count] = .{ .text = std.fmt.bufPrint(&req_trunc_buf, "... truncated in view ({d} bytes total)", .{e.req_body_total}) catch "... truncated in view", .style = .{ .fg = dim } };
-                line_count += 1;
+                pushLine(&lines, &line_count, .{ .text = std.fmt.bufPrint(&req_trunc_buf, "... truncated in view ({d} bytes total)", .{e.req_body_total}) catch "... truncated in view", .style = .{ .fg = dim } });
             }
         }
 
         const resp_body = e.getRespBody();
         if (resp_body.len > 0) {
-            lines[line_count] = .{ .text = "", .style = .{} };
-            line_count += 1;
-            lines[line_count] = .{ .text = "RESPONSE BODY", .style = .{ .fg = blue, .bold = true } };
-            line_count += 1;
+            pushLine(&lines, &line_count, .{ .text = "", .style = .{} });
+            pushLine(&lines, &line_count, .{ .text = "RESPONSE BODY", .style = .{ .fg = blue, .bold = true } });
             line_count = splitBodyLines(alloc, resp_body, &resp_body_scratch, &lines, line_count, .{ .fg = white });
             if (e.resp_body_truncated) {
-                lines[line_count] = .{ .text = std.fmt.bufPrint(&resp_trunc_buf, "... truncated in view ({d} bytes total)", .{e.resp_body_total}) catch "... truncated in view", .style = .{ .fg = dim } };
-                line_count += 1;
+                pushLine(&lines, &line_count, .{ .text = std.fmt.bufPrint(&resp_trunc_buf, "... truncated in view ({d} bytes total)", .{e.resp_body_total}) catch "... truncated in view", .style = .{ .fg = dim } });
             }
         }
     }
@@ -1780,6 +1774,14 @@ fn dropOrDeleteEntry(logical: usize) void {
         // remove() no-ops on already-deleted entries.
         else => requests.remove(backing_idx),
     }
+}
+
+/// Append to the detail view's line buffer; once a long body has filled it, extra
+/// lines (headings, truncation notes) are dropped instead of indexing past the end.
+fn pushLine(lines: []DetailLine, count: *usize, line: DetailLine) void {
+    if (count.* >= lines.len) return;
+    lines[count.*] = line;
+    count.* += 1;
 }
 
 /// Replay an entry on a detached thread. Returns false only when refused because
