@@ -279,6 +279,7 @@ const EditState = struct {
         if (hold.phase != .request) return false; // only plain request entries replay
         var snap: requests.Entry = undefined;
         hold.snapshot(&snap);
+        if (snap.requestTruncated()) return false; // would replay something else
         self.loadFromEntry(alloc, &snap, hold, false);
         return true;
     }
@@ -596,8 +597,11 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             if (key.matches('d', .{}) and filtered_count > 0)
                                 dropOrDeleteEntry(filter_map[cursor]);
                             if (key.matches('c', .{}) and filtered_count > 0) {
-                                clipboard.copyAsCurl(alloc, filter_map[cursor], domain);
-                                const msg = "Copied as curl!";
+                                const msg: []const u8 = switch (clipboard.copyAsCurl(alloc, filter_map[cursor], domain)) {
+                                    .copied => "Copied as curl!",
+                                    .truncated => "Request too large to copy: captured copy is truncated",
+                                    .missing => "",
+                                };
                                 @memcpy(flash_buf[0..msg.len], msg);
                                 flash_len = msg.len;
                                 flash_time = rt.milliTimestamp();
@@ -620,7 +624,14 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 flash_time = rt.milliTimestamp();
                             }
                             if (key.matches('r', .{}) and filtered_count > 0) {
-                                if (edit_state.openForReplay(alloc, filter_map[cursor])) view = .edit;
+                                if (edit_state.openForReplay(alloc, filter_map[cursor])) {
+                                    view = .edit;
+                                } else if (requests.getOne(filter_map[cursor])) |re| if (re.requestTruncated()) {
+                                    const msg = "Request too large to replay: captured copy is truncated";
+                                    @memcpy(flash_buf[0..msg.len], msg);
+                                    flash_len = msg.len;
+                                    flash_time = rt.milliTimestamp();
+                                };
                             }
                             if (key.matches('R', .{})) {
                                 if (focus == .logs and logs_visible and has_command) {
@@ -630,8 +641,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                     flash_len = msg.len;
                                     flash_time = rt.milliTimestamp();
                                 } else if (filtered_count > 0) {
-                                    replayEntry(filter_map[cursor]);
-                                    const msg = "Replayed!";
+                                    const msg: []const u8 = if (replayEntry(filter_map[cursor])) "Replayed!" else "Request too large to replay: captured copy is truncated";
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
                                     flash_time = rt.milliTimestamp();
@@ -675,16 +685,25 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             } else if (key.matches('d', .{})) {
                                 dropOrDeleteEntry(detail_index);
                             } else if (key.matches('c', .{})) {
-                                clipboard.copyAsCurl(alloc, detail_index, domain);
-                                const msg = "Copied as curl!";
+                                const msg: []const u8 = switch (clipboard.copyAsCurl(alloc, detail_index, domain)) {
+                                    .copied => "Copied as curl!",
+                                    .truncated => "Request too large to copy: captured copy is truncated",
+                                    .missing => "",
+                                };
                                 @memcpy(flash_buf[0..msg.len], msg);
                                 flash_len = msg.len;
                                 flash_time = rt.milliTimestamp();
                             } else if (key.matches('r', .{})) {
-                                if (edit_state.openForReplay(alloc, detail_index)) view = .edit;
+                                if (edit_state.openForReplay(alloc, detail_index)) {
+                                    view = .edit;
+                                } else if (requests.getOne(detail_index)) |re| if (re.requestTruncated()) {
+                                    const msg = "Request too large to replay: captured copy is truncated";
+                                    @memcpy(flash_buf[0..msg.len], msg);
+                                    flash_len = msg.len;
+                                    flash_time = rt.milliTimestamp();
+                                };
                             } else if (key.matches('R', .{})) {
-                                replayEntry(detail_index);
-                                const msg = "Replayed!";
+                                const msg: []const u8 = if (replayEntry(detail_index)) "Replayed!" else "Request too large to replay: captured copy is truncated";
                                 @memcpy(flash_buf[0..msg.len], msg);
                                 flash_len = msg.len;
                                 flash_time = rt.milliTimestamp();
@@ -1090,6 +1109,8 @@ fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Entry, se
         writeAscii(win, 11, row, hold_label, .{ .fg = orange, .bg = bg, .bold = true });
     } else if (entry.state == .dropped) {
         writeAscii(win, 11, row, "DROP", .{ .fg = red, .bg = bg, .bold = true });
+    } else if (entry.too_large_to_intercept) {
+        writeAscii(win, 11, row, "BIG", .{ .fg = orange, .bg = bg, .bold = true });
     } else {
         var status_buf: [6]u8 = undefined;
         const status_text = std.fmt.bufPrint(&status_buf, "{d}", .{entry.status}) catch "?";
@@ -1161,9 +1182,15 @@ fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const reques
     line_count += 1;
 
     var method_path_buf: [600]u8 = undefined;
+    var req_trunc_buf: [64]u8 = undefined;
+    var resp_trunc_buf: [64]u8 = undefined;
     const method_path = std.fmt.bufPrint(&method_path_buf, "{s} {s}", .{ e.getMethod(), e.getPath() }) catch "";
     lines[line_count] = .{ .text = method_path, .style = .{ .fg = white } };
     line_count += 1;
+    if (e.path_truncated) {
+        lines[line_count] = .{ .text = "... path truncated in view", .style = .{ .fg = dim } };
+        line_count += 1;
+    }
     lines[line_count] = .{ .text = "", .style = .{} };
     line_count += 1;
 
@@ -1189,6 +1216,10 @@ fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const reques
         lines[line_count] = .{ .text = "REQUEST HEADERS", .style = .{ .fg = blue, .bold = true } };
         line_count += 1;
         line_count = splitHeaderLines(req_hdrs, &lines, line_count, .{ .fg = dim });
+        if (e.req_headers_truncated) {
+            lines[line_count] = .{ .text = "... truncated in view", .style = .{ .fg = dim } };
+            line_count += 1;
+        }
         lines[line_count] = .{ .text = "", .style = .{} };
         line_count += 1;
     }
@@ -1199,6 +1230,10 @@ fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const reques
         lines[line_count] = .{ .text = "RESPONSE HEADERS", .style = .{ .fg = blue, .bold = true } };
         line_count += 1;
         line_count = splitHeaderLines(resp_hdrs, &lines, line_count, .{ .fg = dim });
+        if (e.resp_headers_truncated) {
+            lines[line_count] = .{ .text = "... truncated in view", .style = .{ .fg = dim } };
+            line_count += 1;
+        }
     }
 
     // Bodies (toggled with 'b')
@@ -1210,6 +1245,10 @@ fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const reques
             lines[line_count] = .{ .text = "REQUEST BODY", .style = .{ .fg = blue, .bold = true } };
             line_count += 1;
             line_count = splitBodyLines(alloc, req_body, &req_body_scratch, &lines, line_count, .{ .fg = white });
+            if (e.req_body_truncated) {
+                lines[line_count] = .{ .text = std.fmt.bufPrint(&req_trunc_buf, "... truncated in view ({d} bytes total)", .{e.req_body_total}) catch "... truncated in view", .style = .{ .fg = dim } };
+                line_count += 1;
+            }
         }
 
         const resp_body = e.getRespBody();
@@ -1219,6 +1258,10 @@ fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const reques
             lines[line_count] = .{ .text = "RESPONSE BODY", .style = .{ .fg = blue, .bold = true } };
             line_count += 1;
             line_count = splitBodyLines(alloc, resp_body, &resp_body_scratch, &lines, line_count, .{ .fg = white });
+            if (e.resp_body_truncated) {
+                lines[line_count] = .{ .text = std.fmt.bufPrint(&resp_trunc_buf, "... truncated in view ({d} bytes total)", .{e.resp_body_total}) catch "... truncated in view", .style = .{ .fg = dim } };
+                line_count += 1;
+            }
         }
     }
 
@@ -1739,22 +1782,28 @@ fn dropOrDeleteEntry(logical: usize) void {
     }
 }
 
-/// Replay a completed request by re-sending it to upstream.
-fn replayEntry(logical: usize) void {
-    const copy = std.heap.page_allocator.create(requests.Entry) catch return;
+/// Replay an entry on a detached thread. Returns false only when refused because
+/// the captured request is truncated (replaying it would send something else).
+fn replayEntry(logical: usize) bool {
+    const copy = std.heap.page_allocator.create(requests.Entry) catch return true;
     if (!requests.copyEntry(logical, copy)) {
         std.heap.page_allocator.destroy(copy);
-        return;
+        return true;
     }
     if (copy.state == .intercepted or copy.resp_intercepted) {
         std.heap.page_allocator.destroy(copy);
-        return;
+        return true;
+    }
+    if (copy.requestTruncated()) {
+        std.heap.page_allocator.destroy(copy);
+        return false;
     }
     const thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, proxy.replay, .{
         copy,
     }) catch {
         std.heap.page_allocator.destroy(copy);
-        return;
+        return true;
     };
     thread.detach();
+    return true;
 }
