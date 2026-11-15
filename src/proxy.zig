@@ -761,6 +761,7 @@ fn handleConnection(
         const rsh_len = @min(resp_headers_section.len, requests.max_header_len);
         @memcpy(entry.resp_headers[0..rsh_len], resp_headers_section[0..rsh_len]);
         entry.resp_headers_len = @intCast(rsh_len);
+        entry.resp_headers_truncated = resp_headers_section.len > requests.max_header_len;
 
         // HEAD, 1xx, 204 and 304 never carry a body, whatever their framing headers
         // say; reading one would wait for bytes that never come.
@@ -773,25 +774,58 @@ fn handleConnection(
         const response_has_defined_length = is_chunked or resp_content_length != null;
         const must_close = !keep_alive or upstream_conn == .close or !response_has_defined_length;
 
-        const initial_body = if (has_body) head.initial_body else head.initial_body[0..0];
+        const relay_ctx: RelayCtx = .{
+            .is_external = is_external,
+            .domain = config.domain,
+            .must_close = must_close,
+            .is_chunked = is_chunked,
+            .content_length = resp_content_length,
+            .has_body = has_body,
+        };
+        var resp_dec = http_wire.ChunkedDecoder{};
+        var prefetched: []const u8 = "";
+        var resp_probe_buf: ?[]u8 = null;
+        defer if (resp_probe_buf) |b| std.heap.page_allocator.free(b);
 
-        // Check if we should intercept the response
-        const intercept_resp = intercept.shouldInterceptResponse(method, uri);
-
-        if (intercept_resp) {
-            // Buffer entire response body into entry before forwarding
-            var resp_body_captured: usize = 0;
-
-            if (is_chunked) {
-                const pr = http_wire.pumpChunked(initial_body, upstream, http_wire.NullSink{}, &entry.resp_body);
-                resp_body_captured = pr.captured;
-                if (pr.truncated) entry.resp_body_truncated = true;
-            } else {
-                const br = http_wire.streamBody(initial_body, upstream, http_wire.NullSink{}, resp_content_length, &entry.resp_body);
-                resp_body_captured = br.captured;
-                if (br.truncated) entry.resp_body_truncated = true;
+        if (intercept.shouldInterceptResponse(method, uri)) resp_hold: {
+            // Hold only a response whose capture is complete; else relay it unheld.
+            var fits = !entry.resp_headers_truncated;
+            if (fits and has_body) {
+                if (is_chunked or resp_content_length == null) {
+                    const raw = std.heap.page_allocator.alloc(u8, probe_cap) catch break :resp_hold;
+                    resp_probe_buf = raw;
+                    if (is_chunked) {
+                        const p = probeChunked(&resp_dec, head.initial_body, upstream, &entry.resp_body, raw);
+                        if (p.outcome == .complete) {
+                            entry.resp_body_len = @intCast(resp_dec.captured);
+                            entry.resp_body_total = resp_dec.decoded_total;
+                        } else if (p.outcome == .too_large) {
+                            fits = false;
+                            prefetched = p.raw;
+                        } else return; // bad framing or upstream gone before the end
+                    } else {
+                        const p = probeUntilClose(head.initial_body, upstream, raw[0 .. requests.max_body_len + 1]);
+                        if (p.complete) {
+                            @memcpy(entry.resp_body[0..p.raw.len], p.raw);
+                            entry.resp_body_len = @intCast(p.raw.len);
+                            entry.resp_body_total = p.raw.len;
+                        } else {
+                            fits = false;
+                            prefetched = p.raw;
+                        }
+                    }
+                } else if (resp_content_length.? <= requests.max_body_len) {
+                    const br = http_wire.streamBody(head.initial_body, upstream, http_wire.NullSink{}, resp_content_length, &entry.resp_body);
+                    entry.resp_body_len = @intCast(br.captured);
+                    entry.resp_body_total = br.total;
+                } else {
+                    fits = false;
+                }
             }
-            entry.resp_body_len = @intCast(resp_body_captured);
+            if (!fits) {
+                entry.too_large_to_intercept = true;
+                break :resp_hold;
+            }
 
             // Record when upstream response was fully received
             const resp_received_time = rt.milliTimestamp();
@@ -854,38 +888,7 @@ fn handleConnection(
             continue;
         }
 
-        // Normal path: stream response to client as we read it
-        // Forward response status line
-        sslWriteAll(ssl, head.status_line);
-
-        // Forward response headers, dropping Connection (our decision is appended
-        // below). For external routes, rewrite Set-Cookie Domain to proxy domain.
-        http_wire.forwardHeaders(resp_headers_section, SslSink{ .ssl = ssl }, .{
-            .skip = &.{"connection:"},
-            .rewrite_set_cookie = is_external,
-        }, config.domain);
-        if (must_close) {
-            sslWriteAll(ssl, "Connection: close\r\n");
-        } else {
-            sslWriteAll(ssl, "Connection: keep-alive\r\n");
-        }
-        sslWriteAll(ssl, "\r\n");
-
-        var resp_body_captured: usize = 0;
-
-        // Stream response body from upstream
-        if (is_chunked) {
-            // Chunked: forward raw bytes to client, decode chunks for capture
-            const pr = http_wire.pumpChunked(initial_body, upstream, SslSink{ .ssl = ssl }, &entry.resp_body);
-            resp_body_captured = pr.captured;
-            if (pr.truncated) entry.resp_body_truncated = true;
-        } else {
-            // Stream raw bytes to client while decoding into the entry.
-            const br = http_wire.streamBody(initial_body, upstream, SslSink{ .ssl = ssl }, resp_content_length, &entry.resp_body);
-            resp_body_captured = br.captured;
-            if (br.truncated) entry.resp_body_truncated = true;
-        }
-        entry.resp_body_len = @intCast(resp_body_captured);
+        relayResponse(ssl, head, upstream, &entry, relay_ctx, &resp_dec, prefetched);
 
         const elapsed = rt.milliTimestamp() - start_time;
         entry.duration_ms = if (elapsed > 0) @intCast(elapsed) else 0;
@@ -1028,6 +1031,72 @@ fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_extern
     if (body.len > 0) {
         sslWriteAll(ssl, body);
     }
+}
+
+const RelayCtx = struct {
+    is_external: bool,
+    domain: []const u8,
+    must_close: bool,
+    is_chunked: bool,
+    content_length: ?usize,
+    has_body: bool,
+};
+
+/// Stream an upstream response to the client as received: status line, headers
+/// (Connection replaced, Set-Cookie Domain rewritten for external routes), then the
+/// body, capturing up to max_body_len into `entry`. `prefetched` holds body bytes an
+/// intercept probe already read (relayed first); for chunked bodies `dec` carries
+/// the probe's decoder state, else it is fresh.
+fn relayResponse(ssl: *ssl_c.SSL, head: http_wire.ResponseHead, upstream: UpstreamConn, entry: *requests.Entry, ctx: RelayCtx, dec: *http_wire.ChunkedDecoder, prefetched: []const u8) void {
+    const sink = SslSink{ .ssl = ssl };
+    sslWriteAll(ssl, head.status_line);
+    http_wire.forwardHeaders(head.headers, sink, .{
+        .skip = &.{"connection:"},
+        .rewrite_set_cookie = ctx.is_external,
+    }, ctx.domain);
+    sslWriteAll(ssl, if (ctx.must_close) "Connection: close\r\n" else "Connection: keep-alive\r\n");
+    sslWriteAll(ssl, "\r\n");
+    if (!ctx.has_body) return;
+
+    var read_buf: [16384]u8 = undefined;
+    if (ctx.is_chunked) {
+        var initial = head.initial_body;
+        if (prefetched.len > 0) {
+            sink.write(prefetched);
+            initial = "";
+        }
+        const pr = http_wire.pumpChunkedResume(dec, initial, upstream, sink, &entry.resp_body, &read_buf, std.math.maxInt(u64));
+        entry.resp_body_len = @intCast(pr.captured);
+        entry.resp_body_truncated = pr.truncated;
+        entry.resp_body_total = dec.decoded_total;
+    } else if (prefetched.len > 0) {
+        // Read-to-close body the probe outgrew: relay it, capture its head, stream the rest.
+        sink.write(prefetched);
+        const cap = @min(prefetched.len, entry.resp_body.len);
+        @memcpy(entry.resp_body[0..cap], prefetched[0..cap]);
+        const br = http_wire.streamBody("", upstream, sink, null, entry.resp_body[0..0]);
+        entry.resp_body_len = @intCast(cap);
+        entry.resp_body_truncated = true;
+        entry.resp_body_total = prefetched.len + br.total;
+    } else {
+        const br = http_wire.streamBody(head.initial_body, upstream, sink, ctx.content_length, &entry.resp_body);
+        entry.resp_body_len = @intCast(br.captured);
+        entry.resp_body_truncated = br.truncated;
+        entry.resp_body_total = br.total;
+    }
+}
+
+/// Read a read-to-close body into `raw` (starting with `initial`) until `src`
+/// closes or `raw` fills; `complete` means it closed first.
+fn probeUntilClose(initial: []const u8, src: anytype, raw: []u8) struct { complete: bool, raw: []const u8 } {
+    @memcpy(raw[0..initial.len], initial);
+    var len: usize = initial.len;
+    while (len < raw.len) {
+        const n = src.read(raw[len..]) catch 0;
+        if (n == 0) return .{ .complete = true, .raw = raw[0..len] };
+        len += n;
+    }
+    return .{ .complete = false, .raw = raw[0..len] };
 }
 
 /// Forwarding sink for `http_wire` over the client TLS connection — relays bytes
@@ -2600,4 +2669,72 @@ test "held chunked request reaches upstream with Content-Length and no Transfer-
     defer testing.allocator.destroy(e);
     try waitNewestEntry(before, e);
     try testing.expect(!e.too_large_to_intercept);
+}
+
+test "response intercept relays oversized responses intact and unheld" {
+    const body = comptime rep("r", (100 * 1024 - 3)) ++ "END";
+    const chunk = comptime "4000\r\n" ++ rep("k", 16384) ++ "\r\n";
+    const framed = comptime rep(chunk, 4) ++ "0\r\n\r\n";
+    const cases = [_]struct { response: []const u8, want: []const u8 }{
+        .{ .response = "HTTP/1.1 200 OK\r\nContent-Length: 102400\r\n\r\n" ++ body, .want = body },
+        .{ .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++ framed, .want = framed },
+        .{ .response = "HTTP/1.1 200 OK\r\n\r\n" ++ body, .want = body }, // read to close
+    };
+    intercept.enableWithPattern("resp:");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+    const out = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(out);
+    const e = try testing.allocator.create(requests.Entry);
+    defer testing.allocator.destroy(e);
+
+    for (cases, 0..) |c, i| {
+        var up = RecordingUpstream{ .response = c.response };
+        try up.start(@intCast(18331 + 2 * i));
+        defer up.stop();
+        var px: ProxyHarness = undefined;
+        try px.start(@intCast(18330 + 2 * i), @intCast(18331 + 2 * i));
+        defer px.stop();
+        const before = freshRing();
+        const resp = try px.roundTrip("GET /big HTTP/1.1\r\nHost: dev.lo\r\n\r\n", c.want[c.want.len - 5 ..], out);
+        try testing.expect(std.mem.endsWith(u8, resp, c.want));
+        const got_body = resp[(std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return error.NoHead) + 4 ..];
+        try testing.expectEqualSlices(u8, c.want, got_body);
+        try waitNewestEntry(before, e);
+        try testing.expect(e.too_large_to_intercept);
+        try testing.expect(e.resp_body_truncated);
+    }
+}
+
+test "response intercept holds small chunked and read-to-close responses, sent with Content-Length" {
+    const cases = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n\r\nWikipedia",
+    };
+    intercept.enableWithPattern("resp:");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+    const e = try testing.allocator.create(requests.Entry);
+    defer testing.allocator.destroy(e);
+    var buf: [4096]u8 = undefined;
+
+    for (cases, 0..) |response, i| {
+        var up = RecordingUpstream{ .response = response };
+        try up.start(@intCast(18337 + 2 * i));
+        defer up.stop();
+        var px: ProxyHarness = undefined;
+        try px.start(@intCast(18336 + 2 * i), @intCast(18337 + 2 * i));
+        defer px.stop();
+        const before = freshRing();
+        const resp = try px.roundTrip("GET /small HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "Wikipedia", &buf);
+        try testing.expect(std.mem.indexOf(u8, resp, "Content-Length: 9\r\n") != null);
+        try testing.expect(std.mem.indexOf(u8, resp, "Transfer-Encoding") == null);
+        try waitNewestEntry(before, e);
+        try testing.expect(e.resp_intercepted);
+        try testing.expect(!e.too_large_to_intercept);
+    }
 }
