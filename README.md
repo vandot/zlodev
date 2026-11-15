@@ -23,7 +23,7 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 - **HAR export** — export captured traffic as HTTP Archive files
 - **Request starring** — star important requests so they survive ring buffer overflow
 - **Search/filter** — filter requests by path, method, or status code
-- **WebSocket passthrough** — transparent proxying of WebSocket upgrades
+- **WebSocket passthrough** — `wss://dev.lo` upgrades are proxied to your dev server, so HMR and live reload work over HTTPS (see [WebSockets](#websockets))
 - **Cross-platform** — macOS, Linux, and Windows
 
 ## Install
@@ -207,6 +207,16 @@ External routes connect via TLS, rewrite the `Host` header to the upstream hostn
 The upstream's certificate is verified against your system's trusted roots and must match the route's hostname; otherwise the request gets a 502 that says so. On macOS and Linux the roots come from the system PEM bundle (`/etc/ssl/cert.pem`, `/etc/ssl/certs/ca-certificates.crt`, …), on Windows from the system root store; set `SSL_CERT_FILE` to use your own bundle. For a staging server with a self-signed certificate, pass `--insecure-upstream` (or `insecure-upstream` in `.zlodev`) to skip verification.
 
 > **Note:** Subdomain routes are not supported in local mode (`-l`), since mDNS does not support arbitrary subdomains.
+
+### WebSockets
+
+WebSocket connections work through zlodev without any setup. The page at `https://dev.lo` opens `wss://dev.lo/...`. zlodev terminates TLS and forwards the upgrade request unchanged to your dev server as plain `ws://`. After the `101 Switching Protocols` reply, it relays frames in both directions. This is what keeps HMR and live reload (Vite, webpack-dev-server, Next.js, etc.) working over HTTPS.
+
+- Upgrades follow the same routing as other requests: the default port, subdomain routes (`wss://api.dev.lo`) and path routes (`wss://dev.lo/socket` with `--route=/socket=4000`).
+- The TUI lists each upgrade as a request with status `101` and its request and response headers. The entry is kept while the socket is open. Sockets stay open until the browser or the dev server closes them, however long they sit idle. Individual frames are not captured or shown.
+- Interception doesn't apply to WebSocket traffic, and frames can't be edited or replayed.
+
+Limitation: WebSockets are not supported on external routes (`--route=api=example.com`); they only reach local ports.
 
 ### Dev server integration
 

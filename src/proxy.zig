@@ -1142,8 +1142,10 @@ fn relayWebSocket(ssl: *ssl_c.SSL, upstream: compat.SocketStream) void {
             .{ .fd = client_fd, .events = compat.POLL.IN, .revents = 0 },
             .{ .fd = upstream.handle, .events = compat.POLL.IN, .revents = 0 },
         };
-        // 30s with no traffic either way closes the pipe; shutdown closes it within 1s.
-        if (compat.pollWhileRunning(&fds, 30_000, shutdown.isRunning) != .ready) break;
+        // No idle timeout: HMR sockets sit quiet for minutes, and dropping one makes
+        // clients like Vite reload the page. The pipe ends when either side closes;
+        // shutdown still closes it within 1s.
+        if (compat.pollWhileRunning(&fds, std.math.maxInt(u32), shutdown.isRunning) != .ready) break;
 
         // Client -> upstream
         if (fds[0].revents & compat.POLL.IN != 0) {
