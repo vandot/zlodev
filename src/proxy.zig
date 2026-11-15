@@ -706,7 +706,8 @@ fn handleConnection(
             .client_ip = formatAddress(client_addr, &ip_buf),
             .domain = config.domain,
         };
-        const up_sink = UpstreamSink{ .upstream = upstream };
+        var upstream_failed = false;
+        const up_sink = UpstreamSink{ .upstream = upstream, .failed = &upstream_failed };
         if (was_intercepted) {
             forwardRequest(up_sink, fwd_entry, fwd_ctx);
         } else if (body_read) {
@@ -731,7 +732,7 @@ fn handleConnection(
                     discardPendingInput(ssl, client_sock);
                     return;
                 }
-                if (pr.state != .done) {
+                if (pr.state != .done and !upstream_failed) {
                     if (pr.state == .parse_error) {
                         sslSendError(ssl, 400, "Bad Request");
                         discardPendingInput(ssl, client_sock);
@@ -744,9 +745,17 @@ fn handleConnection(
                 entry.req_body_len = @intCast(br.captured);
                 entry.req_body_total = br.total;
                 entry.req_body_truncated = br.truncated;
-                if (br.total < content_length) return; // client gone mid-body
+                if (br.total < content_length and !upstream_failed) return; // client gone mid-body
                 leftover = br.leftover;
             }
+        }
+        if (upstream_failed) {
+            // Upstream stopped taking the request (closed, or a 30s send timeout):
+            // don't drain the rest of the upload into it.
+            log.err("component=proxy conn={d} op=upstream_write error=write_failed", .{conn_id});
+            sslSendError(ssl, 502, "Bad Gateway");
+            discardPendingInput(ssl, client_sock);
+            return;
         }
         @memcpy(carry_buf[0..leftover.len], leftover);
         carry_len = leftover.len;
@@ -1109,13 +1118,20 @@ const SslSink = struct {
     }
 };
 
-/// Forwarding sink for `http_wire.forwardHeaders` over the upstream connection.
-/// Write failures are swallowed; the request line/body writes that follow the
-/// header loop detect the dead connection and abort.
+/// Forwarding sink for request bytes over the upstream connection.
 const UpstreamSink = struct {
     upstream: UpstreamConn,
+    /// Set on the first failed write; later writes are skipped and body relays
+    /// (`http_wire.streamBody`/`pumpChunkedResume`) stop reading the client.
+    failed: ?*bool = null,
     pub fn write(self: UpstreamSink, bytes: []const u8) void {
-        self.upstream.writeAll(bytes) catch {};
+        if (self.isFailed()) return;
+        self.upstream.writeAll(bytes) catch {
+            if (self.failed) |f| f.* = true;
+        };
+    }
+    pub fn isFailed(self: UpstreamSink) bool {
+        return if (self.failed) |f| f.* else false;
     }
 };
 
@@ -1177,6 +1193,36 @@ fn probeChunked(dec: *http_wire.ChunkedDecoder, initial: []const u8, src: anytyp
     }
 }
 
+/// Emit a captured request for replay: request line, stored headers with
+/// Content-Length, Transfer-Encoding and Connection replaced, and the stored body.
+fn writeReplayRequest(sink: anytype, source: *const requests.Entry) void {
+    sink.write(source.getMethod());
+    sink.write(" ");
+    sink.write(source.getPath());
+    sink.write(" HTTP/1.1\r\n");
+    const req_hdrs = source.getReqHeaders();
+    const body = source.getReqBody();
+    if (req_hdrs.len > 0) {
+        var hdr_iter = std.mem.splitSequence(u8, req_hdrs, "\r\n");
+        while (hdr_iter.next()) |header| {
+            if (header.len == 0) continue;
+            if (std.ascii.startsWithIgnoreCase(header, "content-length:")) continue;
+            if (std.ascii.startsWithIgnoreCase(header, "connection:")) continue;
+            // The stored body is de-chunked; sending it under its original
+            // Transfer-Encoding would make the proxy parse it as chunk framing.
+            if (std.ascii.startsWithIgnoreCase(header, "transfer-encoding:")) continue;
+            sink.write(header);
+            sink.write("\r\n");
+        }
+    }
+    var cl_buf: [64]u8 = undefined;
+    const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch return;
+    sink.write(cl_hdr);
+    sink.write("Connection: close\r\n");
+    sink.write("\r\n");
+    if (body.len > 0) sink.write(body);
+}
+
 /// Replay a stored request through the proxy's own TLS endpoint.
 /// Connects to 127.0.0.1:443 over TLS so the request goes through the full
 /// proxy path (TLS termination → upstream → response). The proxy's handleConnection
@@ -1220,35 +1266,7 @@ pub fn replay(source: *const requests.Entry) void {
         return;
     }
 
-    // Send request line
-    sslWriteAll(ssl, source.getMethod());
-    sslWriteAll(ssl, " ");
-    sslWriteAll(ssl, source.getPath());
-    sslWriteAll(ssl, " HTTP/1.1\r\n");
-
-    // Send stored headers, replacing Content-Length and Connection
-    const req_hdrs = source.getReqHeaders();
-    const body = source.getReqBody();
-    if (req_hdrs.len > 0) {
-        var hdr_iter = std.mem.splitSequence(u8, req_hdrs, "\r\n");
-        while (hdr_iter.next()) |header| {
-            if (header.len == 0) continue;
-            if (std.ascii.startsWithIgnoreCase(header, "content-length:")) continue;
-            if (std.ascii.startsWithIgnoreCase(header, "connection:")) continue;
-            sslWriteAll(ssl, header);
-            sslWriteAll(ssl, "\r\n");
-        }
-    }
-    var cl_buf: [64]u8 = undefined;
-    const cl_hdr = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len}) catch return;
-    sslWriteAll(ssl, cl_hdr);
-    sslWriteAll(ssl, "Connection: close\r\n");
-    sslWriteAll(ssl, "\r\n");
-
-    // Send stored body
-    if (body.len > 0) {
-        sslWriteAll(ssl, body);
-    }
+    writeReplayRequest(SslSink{ .ssl = ssl }, source);
 
     // Read and discard the response — the proxy's handleConnection already
     // captures it and pushes the entry to the request log.
@@ -1671,6 +1689,17 @@ test "forwardRequest recomputes Content-Length from the body, ignoring the origi
     try testing.expect(std.mem.endsWith(u8, out[0..len], "\r\n\r\nabcd"));
 }
 
+test "replay sends a captured chunked request de-chunked" {
+    const e = buildEntry("POST", "/c", "Host: dev.lo\r\nTransfer-Encoding: chunked\r\n", "Wikipedia");
+    var out: [512]u8 = undefined;
+    var len: usize = 0;
+    writeReplayRequest(TestSink{ .buf = &out, .len = &len }, &e);
+    try testing.expectEqualStrings(
+        "POST /c HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 9\r\nConnection: close\r\n\r\nWikipedia",
+        out[0..len],
+    );
+}
+
 test "connectUpstream returns UpstreamUnavailable for an unresolvable external host" {
     const cfg = ProxyConfig{
         .target_host = "127.0.0.1",
@@ -1990,6 +2019,8 @@ const FakeUpstream = struct {
 const RecordingUpstream = struct {
     listener: compat.socket_t = undefined,
     response: []const u8 = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    /// False: hang up right after the request head, without reading the body or answering.
+    read_body: bool = true,
     buf: []u8 = &.{},
     len: std.atomic.Value(usize) = .init(0),
     thread: std.Thread = undefined,
@@ -2016,6 +2047,12 @@ const RecordingUpstream = struct {
             }
             const conn = compat.accept(self.listener) catch return;
             const s = compat.SocketStream{ .handle = conn.sock };
+            if (!self.read_body) {
+                var head: [16384]u8 = undefined;
+                _ = s.read(&head) catch {};
+                compat.closeSocket(conn.sock);
+                continue;
+            }
             self.len.store(readRequest(s, self.buf), .release);
             s.writeAll(self.response) catch {};
             compat.closeSocket(conn.sock);
@@ -2737,4 +2774,22 @@ test "response intercept holds small chunked and read-to-close responses, sent w
         try testing.expect(e.resp_intercepted);
         try testing.expect(!e.too_large_to_intercept);
     }
+}
+
+test "upstream that hangs up mid-upload gets the client a 502 at once" {
+    var up = RecordingUpstream{ .read_body = false };
+    try up.start(18317);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18316, 18317);
+    defer px.stop();
+
+    const body = try testing.allocator.alloc(u8, 1024 * 1024);
+    defer testing.allocator.free(body);
+    @memset(body, 'u');
+    const req = try std.mem.concat(testing.allocator, u8, &.{ "POST /up HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 1048576\r\n\r\n", body });
+    defer testing.allocator.free(req);
+    var buf: [4096]u8 = undefined;
+    const resp = try px.roundTrip(req, "Bad Gateway", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 502"));
 }

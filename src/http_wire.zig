@@ -247,6 +247,12 @@ pub const PumpResult = struct {
     over_limit: bool = false,
 };
 
+/// A sink may expose `isFailed() bool` (e.g. a dead upstream); relays stop reading
+/// their source once it reports failure instead of draining it into the void.
+fn sinkFailed(sink: anytype) bool {
+    return if (@hasDecl(@TypeOf(sink), "isFailed")) sink.isFailed() else false;
+}
+
 fn pumpResult(dec: *const ChunkedDecoder, leftover: []const u8, over_limit: bool) PumpResult {
     return .{ .captured = dec.captured, .state = dec.state, .truncated = dec.truncated, .leftover = leftover, .over_limit = over_limit };
 }
@@ -281,7 +287,7 @@ pub fn pumpChunkedResume(dec: *ChunkedDecoder, initial: []const u8, src: anytype
         sink.write(initial[0..used]);
         if (dec.finished()) return pumpResult(dec, initial[used..], false);
     }
-    while (!dec.finished()) {
+    while (!dec.finished() and !sinkFailed(sink)) {
         const n = src.read(read_buf) catch break;
         if (n == 0) break;
         const used = dec.feed(read_buf[0..n], body);
@@ -401,7 +407,7 @@ pub fn streamBody(initial: []const u8, src: anytype, sink: anytype, content_leng
 
     var read_total: usize = first.len;
     var read_buf: [16384]u8 = undefined;
-    while (true) {
+    while (!sinkFailed(sink)) {
         var want: usize = read_buf.len;
         if (content_length) |cl| {
             if (read_total >= cl) break;
@@ -811,6 +817,50 @@ test "streamBody never reads past content-length" {
 
 test "reasonPhrase names 431" {
     try testing.expectEqualStrings("Request Header Fields Too Large", reasonPhrase(431));
+}
+
+/// Sink whose writes start failing after `ok_writes`, recording the failure.
+const FailingSink = struct {
+    ok_writes: usize,
+    writes: *usize,
+    fn write(self: FailingSink, _: []const u8) void {
+        self.writes.* += 1;
+    }
+    pub fn isFailed(self: FailingSink) bool {
+        return self.writes.* > self.ok_writes;
+    }
+};
+
+/// Reader that hands out one byte per read, so a relay takes many iterations.
+const OneByteReader = struct {
+    data: []const u8,
+    pos: usize = 0,
+    fn read(self: *OneByteReader, buf: []u8) !usize {
+        if (self.pos >= self.data.len or buf.len == 0) return 0;
+        buf[0] = self.data[self.pos];
+        self.pos += 1;
+        return 1;
+    }
+};
+
+test "streamBody stops reading once the sink has failed" {
+    var reader = OneByteReader{ .data = "0123456789" };
+    var writes: usize = 0;
+    var body: [4]u8 = undefined;
+    _ = streamBody("", &reader, FailingSink{ .ok_writes = 0, .writes = &writes }, 10, &body);
+    try testing.expectEqual(@as(usize, 1), writes);
+    try testing.expectEqual(@as(usize, 1), reader.pos);
+}
+
+test "pumpChunkedResume stops reading once the sink has failed" {
+    var dec = ChunkedDecoder{};
+    var reader = OneByteReader{ .data = "1\r\na\r\n1\r\nb\r\n0\r\n\r\n" };
+    var writes: usize = 0;
+    var body: [8]u8 = undefined;
+    var read_buf: [4]u8 = undefined;
+    const r = pumpChunkedResume(&dec, "", &reader, FailingSink{ .ok_writes = 0, .writes = &writes }, &body, &read_buf, std.math.maxInt(u64));
+    try testing.expectEqual(@as(usize, 1), writes);
+    try testing.expect(r.state != .done);
 }
 
 test "streamBody captures and forwards a content-length body" {
