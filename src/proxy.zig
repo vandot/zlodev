@@ -590,15 +590,51 @@ fn handleConnection(
         // Bytes past this request's body, handed to the next iteration.
         var leftover: []const u8 = "";
 
-        // Intercept check
+        // Intercept: hold only a request whose capture is complete, so the TUI edits
+        // exactly what will be sent. Anything bigger passes through unheld.
         var was_intercepted = false;
         var intercept_backing_idx: usize = 0;
-        if (intercept.shouldInterceptRequest(method, uri)) {
-            const fit = http_wire.streamBody(buffered, SslSource{ .ssl = ssl }, http_wire.NullSink{}, content_length, &entry.req_body);
-            entry.req_body_len = @intCast(fit.captured);
-            entry.req_body_total = fit.total;
-            entry.req_body_truncated = fit.truncated;
-            leftover = fit.leftover;
+        var dec = http_wire.ChunkedDecoder{};
+        var probe: ?Probe = null;
+        var probe_buf: ?[]u8 = null;
+        defer if (probe_buf) |b| std.heap.page_allocator.free(b);
+        // Body read in full for a hold (complete capture): forwarded from the entry.
+        var body_read = false;
+        if (intercept.shouldInterceptRequest(method, uri)) hold: {
+            const head_fits = method.len <= entry.method.len and !entry.path_truncated and !entry.req_headers_truncated;
+            var fits = head_fits and content_length <= requests.max_body_len;
+            if (fits and req_chunked) {
+                const raw = std.heap.page_allocator.alloc(u8, probe_cap) catch break :hold;
+                probe_buf = raw;
+                const p = probeChunked(&dec, buffered, SslSource{ .ssl = ssl }, &entry.req_body, raw);
+                probe = p;
+                switch (p.outcome) {
+                    .parse_error => {
+                        sslSendError(ssl, 400, "Bad Request");
+                        discardPendingInput(ssl, client_sock);
+                        return;
+                    },
+                    .ended => return, // client gone mid-body
+                    .too_large => fits = false,
+                    .complete => {
+                        entry.req_body_len = @intCast(dec.captured);
+                        entry.req_body_total = dec.decoded_total;
+                        leftover = p.leftover;
+                        body_read = true;
+                    },
+                }
+            } else if (fits) {
+                const fit = http_wire.streamBody(buffered, SslSource{ .ssl = ssl }, http_wire.NullSink{}, content_length, &entry.req_body);
+                if (fit.total < content_length) return; // client gone mid-body
+                entry.req_body_len = @intCast(fit.captured);
+                entry.req_body_total = fit.total;
+                leftover = fit.leftover;
+                body_read = true;
+            }
+            if (!fits) {
+                entry.too_large_to_intercept = true;
+                break :hold;
+            }
             entry.state = .intercepted;
             if (hold.begin(&entry, false, start_time)) |h| {
                 was_intercepted = true;
@@ -613,8 +649,10 @@ fn handleConnection(
                 }
             } else {
                 // Ring full of pins, or all intercept slots busy — begin restored the
-                // ring entry to normal; continue as an un-intercepted request.
+                // ring entry to normal; the body is already read, so forward the
+                // capture (complete by construction) as a held request would be.
                 entry.state = .normal;
+                was_intercepted = false;
             }
         }
 
@@ -670,16 +708,20 @@ fn handleConnection(
         };
         const up_sink = UpstreamSink{ .upstream = upstream };
         if (was_intercepted) {
-            if (fwd_entry.req_body_truncated) {
-                sslSendError(ssl, 413, "Request body too large for proxy buffer");
-                return;
-            }
             forwardRequest(up_sink, fwd_entry, fwd_ctx);
+        } else if (body_read) {
+            forwardRequest(up_sink, &entry, fwd_ctx); // hold skipped; capture is complete
         } else {
             forwardRequestHead(up_sink, method, uri, req_hdr_section, req_chunked, fwd_ctx);
             if (req_chunked) {
-                var dec = http_wire.ChunkedDecoder{};
-                const pr = http_wire.pumpChunkedResume(&dec, buffered, SslSource{ .ssl = ssl }, up_sink, &entry.req_body, &body_buf, config.max_request_body);
+                // A probe that overflowed already read part of the body: relay it,
+                // then let the same decoder finish from the client stream.
+                var initial: []const u8 = buffered;
+                if (probe) |pb| {
+                    up_sink.write(pb.raw);
+                    initial = pb.leftover;
+                }
+                const pr = http_wire.pumpChunkedResume(&dec, initial, SslSource{ .ssl = ssl }, up_sink, &entry.req_body, &body_buf, config.max_request_body);
                 entry.req_body_len = @intCast(pr.captured);
                 entry.req_body_total = dec.decoded_total;
                 entry.req_body_truncated = pr.truncated;
@@ -1032,6 +1074,37 @@ fn discardPendingInput(ssl: *ssl_c.SSL, sock: compat.socket_t) void {
         const n = ssl_c.SSL_read(ssl, @ptrCast(&scratch), scratch.len);
         if (n <= 0) return;
         budget -|= @intCast(n);
+    }
+}
+
+/// Most raw bytes a probe buffers while deciding whether a chunked or read-to-close
+/// body fits the capture. Framing can outweigh the payload (tiny chunks); a body
+/// whose framing fills this is treated as too large to hold.
+const probe_cap = 4 * requests.max_body_len;
+
+const Probe = struct {
+    outcome: enum { complete, too_large, parse_error, ended },
+    /// The message bytes read so far, framing included — relayed first if not held.
+    raw: []const u8,
+    /// Bytes read past the end of the message (a pipelined request).
+    leftover: []const u8,
+};
+
+/// Read a chunked body into `raw` (starting with `initial`) while `dec` decodes it
+/// into `capture`, until the message ends, the capture overflows, `raw` fills, or
+/// `src` ends. `initial.len` must be <= `raw.len`.
+fn probeChunked(dec: *http_wire.ChunkedDecoder, initial: []const u8, src: anytype, capture: []u8, raw: []u8) Probe {
+    @memcpy(raw[0..initial.len], initial);
+    var len: usize = initial.len;
+    var scan: usize = 0;
+    while (true) {
+        scan += dec.feed(raw[scan..len], capture);
+        if (dec.state == .parse_error) return .{ .outcome = .parse_error, .raw = raw[0..scan], .leftover = "" };
+        if (dec.state == .done) return .{ .outcome = if (dec.truncated) .too_large else .complete, .raw = raw[0..scan], .leftover = raw[scan..len] };
+        if (dec.truncated or len == raw.len) return .{ .outcome = .too_large, .raw = raw[0..scan], .leftover = "" };
+        const n = src.read(raw[len..]) catch 0;
+        if (n == 0) return .{ .outcome = .ended, .raw = raw[0..scan], .leftover = "" };
+        len += n;
     }
 }
 
@@ -1937,6 +2010,13 @@ fn rep(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
     return &T.value;
 }
 
+/// Empty the shared entry ring so the next request's entry is found by count
+/// (a full ring stops counting). Returns the count to pass to waitNewestEntry.
+fn freshRing() usize {
+    requests.clearAll();
+    return requests.getCount();
+}
+
 /// Wait for the proxy to record a new entry (it pushes after relaying the
 /// response) and copy the newest into `dest`.
 fn waitNewestEntry(prev_count: usize, dest: *requests.Entry) !void {
@@ -2255,7 +2335,7 @@ test "long headers, URLs and methods reach upstream intact" {
 
     const cookie = rep("a", 3000);
     const path = "/" ++ rep("p", 900);
-    const before = requests.getCount();
+    const before = freshRing();
     var buf: [4096]u8 = undefined;
     _ = try px.roundTrip("PROPFIND " ++ path ++ " HTTP/1.1\r\nHost: dev.lo\r\nCookie: " ++ cookie ++ "\r\n\r\n", "ok", &buf);
 
@@ -2291,7 +2371,7 @@ test "request bodies over the capture size are forwarded whole" {
         defer testing.allocator.free(head);
         const req = try std.mem.concat(testing.allocator, u8, &.{ head, body[0..size] });
         defer testing.allocator.free(req);
-        const before = requests.getCount();
+        const before = freshRing();
         _ = try px.roundTrip(req, "ok", &buf);
 
         const got = up.received();
@@ -2365,7 +2445,7 @@ test "chunked request body is relayed with its framing and without Content-Lengt
     defer px.stop();
 
     const chunked = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-    const before = requests.getCount();
+    const before = freshRing();
     var buf: [4096]u8 = undefined;
     _ = try px.roundTrip("POST /c HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\nContent-Length: 99\r\n\r\n" ++ chunked, "ok", &buf);
 
@@ -2401,4 +2481,123 @@ test "pipelined requests after Content-Length and chunked bodies are both answer
     if (ssl_c.SSL_write(px.client, chunked_two.ptr, chunked_two.len) <= 0) return error.WriteFailed;
     _ = try px.readResponses(2, "ok", &buf);
     try testing.expect(std.mem.startsWith(u8, up.received(), "GET /d "));
+}
+
+/// Accepts every intercept hold as it appears, so held requests don't stall tests.
+const AutoAccept = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn start(self: *AutoAccept) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+    fn run(self: *AutoAccept) void {
+        while (!self.done.load(.acquire)) {
+            if (intercept.getPendingCount() > 0) intercept.acceptAll();
+            rt.sleepMs(5);
+        }
+    }
+    fn stop(self: *AutoAccept) void {
+        self.done.store(true, .release);
+        self.thread.join();
+    }
+};
+
+test "intercept passes oversized requests through unheld" {
+    var up = RecordingUpstream{};
+    try up.start(18321);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18320, 18321);
+    defer px.stop();
+    intercept.enableWithPattern("req:");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+
+    const e = try testing.allocator.create(requests.Entry);
+    defer testing.allocator.destroy(e);
+    var buf: [4096]u8 = undefined;
+
+    // Content-Length body over 32 KB
+    const big = rep("z", (100 * 1024));
+    var before = freshRing();
+    _ = try px.roundTrip("POST /big HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 102400\r\n\r\n" ++ big, "ok", &buf);
+    try testing.expect(std.mem.endsWith(u8, up.received(), "\r\n\r\n" ++ big));
+    try waitNewestEntry(before, e);
+    try testing.expect(e.too_large_to_intercept);
+    try testing.expectEqual(requests.EntryState.normal, e.state);
+
+    // Chunked body over 32 KB, in 16 KB chunks
+    const chunk = comptime "4000\r\n" ++ rep("c", 16384) ++ "\r\n";
+    const framed = rep(chunk, 4) ++ "0\r\n\r\n";
+    before = freshRing();
+    _ = try px.roundTrip("POST /bigc HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n" ++ framed, "ok", &buf);
+    try testing.expect(std.mem.endsWith(u8, up.received(), "\r\n\r\n" ++ framed));
+    try waitNewestEntry(before, e);
+    try testing.expect(e.too_large_to_intercept);
+    try testing.expectEqual(@as(u64, 4 * 16384), e.req_body_total);
+
+    // Tiny chunks: framing fills the probe buffer before the capture does
+    const tiny = rep("1\r\nq\r\n", 30000) ++ "0\r\n\r\n";
+    before = freshRing();
+    _ = try px.roundTrip("POST /tiny HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n" ++ tiny, "ok", &buf);
+    try testing.expect(std.mem.endsWith(u8, up.received(), "\r\n\r\n" ++ tiny));
+    try waitNewestEntry(before, e);
+    try testing.expect(e.too_large_to_intercept);
+
+    // Long URL: the path can't be edited faithfully
+    before = freshRing();
+    _ = try px.roundTrip("GET /" ++ rep("u", 900) ++ " HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "ok", &buf);
+    try testing.expect(std.mem.startsWith(u8, up.received(), "GET /" ++ rep("u", 900) ++ " "));
+    try waitNewestEntry(before, e);
+    try testing.expect(e.too_large_to_intercept);
+}
+
+test "intercept holds a small chunked request and forwards it de-chunked" {
+    var up = RecordingUpstream{};
+    try up.start(18323);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18322, 18323);
+    defer px.stop();
+    intercept.enableWithPattern("req:");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+
+    var buf: [4096]u8 = undefined;
+    const two = "POST /c HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n" ++
+        "GET /next HTTP/1.1\r\nHost: dev.lo\r\n\r\n";
+    if (ssl_c.SSL_write(px.client, two.ptr, two.len) <= 0) return error.WriteFailed;
+    _ = try px.readResponses(2, "ok", &buf);
+    // The held POST was forwarded first, de-chunked; the pipelined GET came after.
+    try testing.expect(std.mem.startsWith(u8, up.received(), "GET /next "));
+}
+
+test "held chunked request reaches upstream with Content-Length and no Transfer-Encoding" {
+    var up = RecordingUpstream{};
+    try up.start(18325);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18324, 18325);
+    defer px.stop();
+    intercept.enableWithPattern("req:");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+
+    var buf: [4096]u8 = undefined;
+    const before = freshRing();
+    _ = try px.roundTrip("POST /c HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n", "ok", &buf);
+    const got = up.received();
+    try testing.expect(std.mem.endsWith(u8, got, "Content-Length: 9\r\n\r\nWikipedia"));
+    try testing.expect(std.mem.indexOf(u8, got, "Transfer-Encoding") == null);
+    const e = try testing.allocator.create(requests.Entry);
+    defer testing.allocator.destroy(e);
+    try waitNewestEntry(before, e);
+    try testing.expect(!e.too_large_to_intercept);
 }
