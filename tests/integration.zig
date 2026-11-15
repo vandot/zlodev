@@ -19,12 +19,25 @@ fn runCmdExpectSuccess(argv: []const []const u8) !void {
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+/// Background processes get their own process group (POSIX), so killProcess can
+/// stop children they fork too, like gunicorn's workers.
 fn startBackground(argv: []const []const u8) !std.process.Child {
-    return std.process.spawn(testing.io, .{ .argv = argv, .stdin = .ignore });
+    return std.process.spawn(testing.io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .pgid = if (builtin.os.tag == .windows) null else 0,
+    });
 }
 
+/// SIGTERM the whole group and reap the leader, then SIGKILL anything left. Killing
+/// only gunicorn's master left its workers running; on Linux CI the runner then had
+/// to clean them up as orphans when the job ended.
 fn killProcess(child: *std.process.Child) void {
-    child.kill(testing.io);
+    if (builtin.os.tag == .windows) return child.kill(testing.io);
+    const pgid: std.posix.pid_t = @intCast(child.id.?);
+    std.posix.kill(-pgid, .TERM) catch {};
+    _ = child.wait(testing.io) catch {};
+    std.posix.kill(-pgid, .KILL) catch {};
 }
 
 fn getHostname(buf: *[hostname_max]u8) []const u8 {
