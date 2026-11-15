@@ -440,6 +440,11 @@ fn connectUpstream(
         }
     };
 
+    // Before the TLS handshake: an upstream that accepts TCP but never answers
+    // the handshake must not pin this worker forever.
+    setSocketTimeout(upstream_sock, .recv, 30);
+    setSocketTimeout(upstream_sock, .send, 30);
+
     // Wrap in TLS for external upstreams; plain socket for local
     var upstream_ssl_obj: ?*ssl_c.SSL = null;
     if (is_external) {
@@ -456,10 +461,7 @@ fn connectUpstream(
         upstream_ssl_obj = us;
     }
 
-    const upstream = UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
-    setSocketTimeout(upstream_sock, .recv, 30);
-    setSocketTimeout(upstream_sock, .send, 30);
-    return upstream;
+    return UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
 }
 
 fn handleConnection(
@@ -1989,7 +1991,9 @@ const FakeWsUpstream = struct {
 
     fn serve(self: *FakeWsUpstream) void {
         var fds = [1]compat.pollfd{.{ .fd = self.listener, .events = compat.POLL.IN, .revents = 0 }};
-        if (compat.pollWhileRunning(&fds, 3000, shutdown.isRunning) != .ready) return;
+        // Generous: on Windows "localhost" tries ::1 first, and a refused loopback
+        // connect there takes ~2s before the proxy falls back to 127.0.0.1.
+        if (compat.pollWhileRunning(&fds, 15_000, shutdown.isRunning) != .ready) return;
         const conn = compat.accept(self.listener) catch return;
         defer compat.closeSocket(conn.sock);
         setSocketTimeout(conn.sock, .recv, 3);
