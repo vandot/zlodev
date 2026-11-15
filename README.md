@@ -424,7 +424,7 @@ If missing, reinstall DNS:
 zlodev install --dns
 ```
 
-On Linux, `install` stops with an error unless systemd is PID 1 and `systemd-resolved` is active, and fails if `systemd-networkd` can't be restarted (for example when it is masked). If the restart failed, run `zlodev uninstall --dns` to remove the half-written `zlodev0` interface files before trying again.
+On Linux, `install` stops with an error unless systemd is PID 1 and `systemd-resolved` is active, and fails if `systemd-networkd` can't be reloaded (for example when it is masked). zlodev reloads networkd with `networkctl reload` rather than restarting it, so your other network interfaces are left alone. If the reload failed, run `zlodev uninstall --dns` to remove the half-written `zlodev0` interface files before trying again.
 
 On Windows, make sure "Use secure DNS" is disabled in your browser — Chromium browsers bypass the system DNS resolver when this is enabled.
 
