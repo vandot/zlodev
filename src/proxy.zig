@@ -440,6 +440,11 @@ fn connectUpstream(
         }
     };
 
+    // Before the TLS handshake: an upstream that accepts TCP but never answers
+    // the handshake must not pin this worker forever.
+    setSocketTimeout(upstream_sock, .recv, 30);
+    setSocketTimeout(upstream_sock, .send, 30);
+
     // Wrap in TLS for external upstreams; plain socket for local
     var upstream_ssl_obj: ?*ssl_c.SSL = null;
     if (is_external) {
@@ -456,10 +461,7 @@ fn connectUpstream(
         upstream_ssl_obj = us;
     }
 
-    const upstream = UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
-    setSocketTimeout(upstream_sock, .recv, 30);
-    setSocketTimeout(upstream_sock, .send, 30);
-    return upstream;
+    return UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
 }
 
 fn handleConnection(
@@ -564,7 +566,11 @@ fn handleConnection(
 
         // Check for WebSocket upgrade
         if (http_wire.isWebSocketUpgrade(req_hdr_section)) {
-            handleWebSocket(ssl, req_buf[0..total], config, upstream_port, &entry);
+            handleWebSocket(ssl, req_buf[0..total], config, .{
+                .is_external = route_result.hostname != null,
+                .host = route_result.hostname orelse config.target_host,
+                .port = upstream_port,
+            }, client_ctx, conn_id, &entry);
             return;
         }
 
@@ -1067,30 +1073,51 @@ fn sslSendError(ssl: *ssl_c.SSL, status: u16, message: []const u8) void {
     sslWriteAll(ssl, response);
 }
 
+const WsTarget = struct { is_external: bool, host: []const u8, port: u16 };
+
 fn handleWebSocket(
     ssl: *ssl_c.SSL,
     raw_request: []const u8,
     config: *const ProxyConfig,
-    upstream_port: u16,
+    target: WsTarget,
+    client_ctx: ?*ssl_c.SSL_CTX,
+    conn_id: u64,
     entry: *requests.Entry,
 ) void {
     log.info("component=proxy op=websocket_upgrade uri={s}", .{entry.getPath()});
 
-    // Connect to upstream (use resolved route port, not default)
-    const upstream_addr = std.Io.net.IpAddress.parse(config.target_host, upstream_port) catch |e| {
-        log.err("component=proxy op=websocket_connect error={any}", .{e});
+    // Same connect path as plain requests: external routes get TLS + verification.
+    const upstream = connectUpstream(target.is_external, target.host, target.port, config, client_ctx, conn_id) catch |e| {
+        sslSendError(ssl, 502, if (e == error.UpstreamCertUntrusted)
+            "Upstream certificate not trusted (use --insecure-upstream to skip verification)"
+        else
+            "Bad Gateway");
         return;
     };
-    const upstream_sock = compat.tcpConnect(upstream_addr) catch |e| {
-        log.err("component=proxy op=websocket_connect error={any}", .{e});
-        sslSendError(ssl, 502, "Bad Gateway");
-        return;
-    };
-    const upstream = compat.SocketStream{ .handle = upstream_sock };
     defer upstream.close();
 
-    // Forward the original request as-is to upstream
-    upstream.writeAll(raw_request) catch return;
+    // Forward the upgrade request. Local: as-is. External: Host becomes the upstream
+    // (original kept as X-Forwarded-Host), like forwardRequest; Origin is untouched.
+    if (target.is_external) {
+        const first_end = std.mem.indexOf(u8, raw_request, "\r\n") orelse return;
+        const hdr_end = std.mem.indexOf(u8, raw_request, "\r\n\r\n") orelse return;
+        const headers = if (first_end + 2 <= hdr_end) raw_request[first_end + 2 .. hdr_end] else raw_request[0..0];
+        const sink = UpstreamSink{ .upstream = upstream };
+        sink.write(raw_request[0 .. first_end + 2]);
+        http_wire.forwardHeaders(headers, sink, .{ .skip = &.{"host:"} }, config.domain);
+        sink.write("Host: ");
+        sink.write(target.host);
+        sink.write("\r\n");
+        if (http_wire.getHeaderValue(headers, "host:")) |client_host| {
+            sink.write("X-Forwarded-Host: ");
+            sink.write(client_host);
+            sink.write("\r\n");
+        }
+        sink.write("\r\n");
+        sink.write(raw_request[hdr_end + 4 ..]);
+    } else {
+        upstream.writeAll(raw_request) catch return;
+    }
 
     // Read upstream response (expect 101 Switching Protocols)
     var resp_buf: [4096]u8 = undefined;
@@ -1131,7 +1158,7 @@ fn handleWebSocket(
 
 /// Bidirectional pipe between the TLS client and the upstream socket until
 /// either side closes, 30s pass with no traffic, or shutdown starts.
-fn relayWebSocket(ssl: *ssl_c.SSL, upstream: compat.SocketStream) void {
+fn relayWebSocket(ssl: *ssl_c.SSL, upstream: UpstreamConn) void {
     const raw_fd = ssl_c.SSL_get_fd(ssl);
     if (raw_fd < 0) return;
     const client_fd = compat.fdToSocket(raw_fd);
@@ -1140,7 +1167,7 @@ fn relayWebSocket(ssl: *ssl_c.SSL, upstream: compat.SocketStream) void {
     while (true) {
         var fds = [2]compat.pollfd{
             .{ .fd = client_fd, .events = compat.POLL.IN, .revents = 0 },
-            .{ .fd = upstream.handle, .events = compat.POLL.IN, .revents = 0 },
+            .{ .fd = upstream.sock.handle, .events = compat.POLL.IN, .revents = 0 },
         };
         // No idle timeout: HMR sockets sit quiet for minutes, and dropping one makes
         // clients like Vite reload the page. The pipe ends when either side closes;
@@ -1163,9 +1190,15 @@ fn relayWebSocket(ssl: *ssl_c.SSL, upstream: compat.SocketStream) void {
 
         // Upstream -> client
         if (fds[1].revents & compat.POLL.IN != 0) {
-            const n = upstream.read(&pipe_buf) catch break;
-            if (n == 0) break;
-            sslWriteAll(ssl, pipe_buf[0..n]);
+            // Same drain for a TLS upstream (external route).
+            const ok = while (true) {
+                const n = upstream.read(&pipe_buf) catch break false;
+                if (n == 0) break false;
+                sslWriteAll(ssl, pipe_buf[0..n]);
+                const pending = if (upstream.ssl_conn) |us| ssl_c.SSL_pending(us) else 0;
+                if (pending == 0) break true;
+            };
+            if (!ok) break;
         }
         if (fds[1].revents & (compat.POLL.HUP | compat.POLL.ERR) != 0) break;
     }
@@ -1664,7 +1697,7 @@ test "relayWebSocket forwards a client write larger than its read buffer at once
     var up = try TcpPair.init(18093);
     defer up.deinit();
 
-    const relay = try std.Thread.spawn(.{}, relayWebSocket, .{ tls.server, compat.SocketStream{ .handle = up.b } });
+    const relay = try std.Thread.spawn(.{}, relayWebSocket, .{ tls.server, UpstreamConn{ .sock = .{ .handle = up.b } } });
     defer relay.join();
     // close_notify makes the relay's SSL_read return 0, so the deferred join returns.
     defer _ = ssl_c.SSL_shutdown(tls.client);
@@ -1760,6 +1793,10 @@ const ProxyHarness = struct {
     thread: std.Thread,
 
     fn start(self: *ProxyHarness, port: u16, upstream_port: u16) !void {
+        return self.startWith(port, upstream_port, &.{}, null);
+    }
+
+    fn startWith(self: *ProxyHarness, port: u16, upstream_port: u16, routes: []const Route, client_ctx: ?*ssl_c.SSL_CTX) !void {
         self.tcp = try TcpPair.init(port);
         self.server_ctx = try testServerCtx();
         self.client_ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_client_method()) orelse return error.SslCtx;
@@ -1775,11 +1812,12 @@ const ProxyHarness = struct {
             .key_path = "",
             .ca_path = "",
             .server_ident = "test",
+            .routes = routes,
         };
         _ = proxy_workers.fetchAdd(1, .acq_rel);
         const client_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
         // handleConnection owns the server SSL and the server-side socket from here.
-        self.thread = try std.Thread.spawn(.{}, handleConnection, .{ server, self.tcp.b, client_addr, &self.config, @as(u64, 1), @as(?*ssl_c.SSL_CTX, null) });
+        self.thread = try std.Thread.spawn(.{}, handleConnection, .{ server, self.tcp.b, client_addr, &self.config, @as(u64, 1), client_ctx });
         if (ssl_c.SSL_connect(self.client) != 1) return error.Handshake;
         setSocketTimeout(self.tcp.a, .recv, 3);
     }
@@ -1906,4 +1944,114 @@ test "loadSystemRoots finds the OS trust store" {
     const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_client_method()) orelse return error.SslCtx;
     defer ssl_c.SSL_CTX_free(ctx);
     try testing.expect(loadSystemRoots(ctx));
+}
+
+test "relayWebSocket forwards an upstream TLS write larger than its read buffer at once" {
+    var tls = try TlsPair.init(18102);
+    defer tls.deinit();
+    // zlodev is the TLS client of an external upstream: up.client is its side.
+    var up = try TlsPair.init(18103);
+    defer up.deinit();
+
+    const relay = try std.Thread.spawn(.{}, relayWebSocket, .{ tls.server, UpstreamConn{ .sock = .{ .handle = up.tcp.a }, .ssl_conn = up.client } });
+    defer relay.join();
+    defer _ = ssl_c.SSL_shutdown(tls.client);
+
+    // One record bigger than the relay's 8 KB read: the rest sits inside BoringSSL.
+    var payload: [12_000]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 7);
+    try testing.expectEqual(@as(c_int, payload.len), ssl_c.SSL_write(up.server, &payload, payload.len));
+
+    setSocketTimeout(tls.tcp.a, .recv, 2);
+    var got: [12_000]u8 = undefined;
+    var total: usize = 0;
+    while (total < got.len) {
+        const n = ssl_c.SSL_read(tls.client, got[total..].ptr, @intCast(got.len - total));
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    try testing.expectEqual(payload.len, total);
+    try testing.expectEqualSlices(u8, &payload, &got);
+}
+
+/// TLS WebSocket server for external-route tests: records the upgrade request head,
+/// answers 101, then echoes one read back.
+const FakeWsUpstream = struct {
+    listener: compat.socket_t = undefined,
+    srv: TestServer = undefined,
+    thread: std.Thread = undefined,
+    head: [2048]u8 = undefined,
+    head_len: usize = 0,
+
+    fn start(self: *FakeWsUpstream, port: u16) !void {
+        self.srv = try testServer("localhost");
+        self.listener = try compat.tcpListen(try std.Io.net.IpAddress.parseIp4("127.0.0.1", port));
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn serve(self: *FakeWsUpstream) void {
+        var fds = [1]compat.pollfd{.{ .fd = self.listener, .events = compat.POLL.IN, .revents = 0 }};
+        // Generous: on Windows "localhost" tries ::1 first, and a refused loopback
+        // connect there takes ~2s before the proxy falls back to 127.0.0.1.
+        if (compat.pollWhileRunning(&fds, 15_000, shutdown.isRunning) != .ready) return;
+        const conn = compat.accept(self.listener) catch return;
+        defer compat.closeSocket(conn.sock);
+        setSocketTimeout(conn.sock, .recv, 3);
+        const ssl = ssl_c.SSL_new(self.srv.ctx) orelse return;
+        defer ssl_c.SSL_free(ssl);
+        _ = ssl_c.SSL_set_fd(ssl, compat.socketToFd(conn.sock));
+        if (ssl_c.SSL_accept(ssl) != 1) return;
+        while (std.mem.indexOf(u8, self.head[0..self.head_len], "\r\n\r\n") == null and self.head_len < self.head.len) {
+            const n = ssl_c.SSL_read(ssl, self.head[self.head_len..].ptr, @intCast(self.head.len - self.head_len));
+            if (n <= 0) return;
+            self.head_len += @intCast(n);
+        }
+        const resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        _ = ssl_c.SSL_write(ssl, resp, resp.len);
+        var buf: [256]u8 = undefined;
+        const n = ssl_c.SSL_read(ssl, &buf, buf.len);
+        if (n > 0) _ = ssl_c.SSL_write(ssl, &buf, n);
+        _ = ssl_c.SSL_read(ssl, &buf, buf.len); // wait for the relay to close
+    }
+
+    fn stop(self: *FakeWsUpstream) void {
+        self.thread.join();
+        compat.closeSocket(self.listener);
+        ssl_c.SSL_CTX_free(self.srv.ctx);
+        ssl_c.X509_free(self.srv.cert);
+    }
+};
+
+test "WebSocket upgrade on an external route reaches the upstream over TLS" {
+    var up = FakeWsUpstream{};
+    try up.start(18105);
+    defer up.stop();
+    const cctx = createClientSslCtx(false) orelse return error.SslCtx;
+    defer ssl_c.SSL_CTX_free(cctx);
+    try testing.expectEqual(@as(c_int, 1), ssl_c.X509_STORE_add_cert(ssl_c.SSL_CTX_get_cert_store(cctx), up.srv.cert));
+
+    const routes = [_]Route{.{ .kind = .path, .pattern = "/ws", .port = 18105, .hostname = "localhost" }};
+    var px: ProxyHarness = undefined;
+    try px.startWith(18104, 1, &routes, cctx);
+    defer px.stop();
+
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /ws HTTP/1.1\r\nHost: dev.lo\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: https://dev.lo\r\n\r\n", "\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 101"));
+
+    const frame = "frame-bytes";
+    try testing.expect(ssl_c.SSL_write(px.client, frame, frame.len) == frame.len);
+    var total: usize = 0;
+    while (total < frame.len) {
+        const n = ssl_c.SSL_read(px.client, buf[total..].ptr, @intCast(buf.len - total));
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    try testing.expectEqualStrings(frame, buf[0..total]);
+
+    const head = up.head[0..up.head_len];
+    try testing.expect(std.mem.indexOf(u8, head, "\r\nHost: localhost\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, head, "\r\nX-Forwarded-Host: dev.lo\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, head, "\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, head, "\r\nOrigin: https://dev.lo\r\n") != null);
 }

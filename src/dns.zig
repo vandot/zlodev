@@ -334,6 +334,16 @@ pub fn systemProbe() struct { ip: []const u8, port: u16 } {
     }
 }
 
+/// Load zlodev0 .netdev/.network changes. `networkctl reload` leaves other
+/// interfaces alone; a restart reconfigures every link networkd manages, which
+/// can drop the machine's real connection. Restart only where reload is missing
+/// (systemd < 244).
+fn reloadNetworkd(allocator: std.mem.Allocator) !void {
+    sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "reload" }) catch {
+        try sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" });
+    };
+}
+
 pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []const u8) !void {
     switch (builtin.os.tag) {
         .macos => {
@@ -361,12 +371,15 @@ pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []c
             const tmp_netdev = try sys.writeTmpFile(allocator, "dns_netdev", netdev_text);
             defer allocator.free(tmp_netdev);
             try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_netdev, "/etc/systemd/network/zlodev0.netdev" });
+            const link_existed = if (std.Io.Dir.accessAbsolute(rt.io(), "/sys/class/net/zlodev0", .{})) |_| true else |_| false;
             // networkd creates the zlodev0 dummy interface; without it .lo never resolves.
-            sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" }) catch |e| {
-                std.debug.print("could not restart systemd-networkd (needed for the zlodev0 interface); is it installed and not masked?\n", .{});
+            reloadNetworkd(allocator) catch |e| {
+                std.debug.print("could not reload systemd-networkd (needed for the zlodev0 interface); is it installed and not masked?\n", .{});
                 return e;
             };
-            sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
+            // Reinstall: reload alone leaves an existing link on the old .network (systemd < 249).
+            if (link_existed) sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "reconfigure", "zlodev0" }) catch {};
+            sys.sudoCmd(allocator, &.{ "sudo", "resolvectl", "flush-caches" }) catch {};
         },
         .windows => {
             const ps_cmd = try std.fmt.allocPrint(allocator, "Add-DnsClientNrptRule -Namespace '.{s}' -NameServers '{s}'", .{ tld, ip });
@@ -391,8 +404,8 @@ pub fn uninstall(allocator: std.mem.Allocator, tld: []const u8) !void {
             if (std.Io.Dir.accessAbsolute(rt.io(), "/sys/class/net/zlodev0", .{})) |_| {
                 sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
             } else |_| {}
-            sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-networkd.service" }) catch {};
-            sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
+            reloadNetworkd(allocator) catch {};
+            sys.sudoCmd(allocator, &.{ "sudo", "resolvectl", "flush-caches" }) catch {};
         },
         .windows => {
             const ps_cmd = try std.fmt.allocPrint(allocator, "Get-DnsClientNrptRule | Where {{ $_.Namespace -eq '.{s}' }} | Remove-DnsClientNrptRule -Force", .{tld});

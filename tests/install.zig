@@ -162,11 +162,12 @@ test "uninstall and verify" {
 
 test "install --local and verify" {
     // On Linux, systemd-resolved may have died during the previous uninstall test.
-    // Reset failed state, restart networkd first (resolved depends on it), then resolved.
+    // Reset failed state, reload networkd first (resolved depends on it), then restart resolved.
+    // Reload, not restart: restarting networkd reconfigures the runner's real interface.
     if (builtin.os.tag == .linux) {
         _ = runCmd(&.{ "sudo", "systemctl", "reset-failed", "systemd-resolved.service" }) catch {};
         _ = runCmd(&.{ "sudo", "systemctl", "reset-failed", "systemd-networkd.service" }) catch {};
-        _ = runCmd(&.{ "sudo", "systemctl", "restart", "systemd-networkd.service" }) catch {};
+        _ = runCmd(&.{ "sudo", "networkctl", "reload" }) catch {};
         _ = runCmd(&.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
         testing.io.sleep(.fromSeconds(2), .awake) catch {};
     }
