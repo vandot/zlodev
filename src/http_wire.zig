@@ -96,6 +96,7 @@ pub fn reasonPhrase(status: u16) []const u8 {
         413 => "Content Too Large",
         422 => "Unprocessable Entity",
         429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -201,6 +202,37 @@ pub fn chunkedStep(
     }
 }
 
+/// Resumable chunked decoder: the `chunkedStep` state plus capture bookkeeping, so a
+/// caller can decode part of a body (e.g. while deciding whether to hold it), then
+/// hand the same decoder to `pumpChunkedResume` to finish. Decoded bytes land in the
+/// `capture` slice passed to `feed`; pass the same slice on every call.
+pub const ChunkedDecoder = struct {
+    state: ChunkState = .size,
+    chunk_remaining: usize = 0,
+    size_val: usize = 0,
+    captured: usize = 0,
+    truncated: bool = false,
+    /// Decoded payload bytes seen, including those that didn't fit the capture.
+    decoded_total: u64 = 0,
+
+    pub fn finished(self: *const ChunkedDecoder) bool {
+        return self.state == .done or self.state == .parse_error;
+    }
+
+    /// Decode `bytes`; returns how many were consumed. Stops right after the byte
+    /// that ends the message (`.done`) or breaks the framing (`.parse_error`), so
+    /// bytes after the message (a pipelined request) are left to the caller.
+    pub fn feed(self: *ChunkedDecoder, bytes: []const u8, capture: []u8) usize {
+        if (self.finished()) return 0;
+        for (bytes, 0..) |b, i| {
+            if (self.state == .data) self.decoded_total += 1;
+            chunkedStep(b, &self.state, &self.chunk_remaining, &self.size_val, capture, &self.captured, &self.truncated);
+            if (self.finished()) return i + 1;
+        }
+        return bytes.len;
+    }
+};
+
 pub const PumpResult = struct {
     /// Decoded payload bytes landed in `body`.
     captured: usize,
@@ -209,7 +241,15 @@ pub const PumpResult = struct {
     state: ChunkState,
     /// At least one decoded byte was dropped because `body` was full.
     truncated: bool,
+    /// Bytes read past the end of the message (slice of `initial` or `read_buf`).
+    leftover: []const u8 = "",
+    /// Decoded size passed `limit`; the read that crossed it was not relayed.
+    over_limit: bool = false,
 };
+
+fn pumpResult(dec: *const ChunkedDecoder, leftover: []const u8, over_limit: bool) PumpResult {
+    return .{ .captured = dec.captured, .state = dec.state, .truncated = dec.truncated, .leftover = leftover, .over_limit = over_limit };
+}
 
 /// A sink that discards forwarded bytes — used by the capture-only path where the
 /// chunked body is decoded into an Entry but not relayed to a client.
@@ -217,42 +257,39 @@ pub const NullSink = struct {
     pub fn write(_: NullSink, _: []const u8) void {}
 };
 
-/// Decode a chunked transfer-encoded body in full: `initial` is the slice already
-/// read past the response headers, `src` supplies the rest (`read([]u8) !usize`),
-/// and `sink` receives the *raw* chunked bytes verbatim (`write([]const u8) void`)
-/// so a forwarding caller relays valid framing while `body` receives only the
-/// decoded payload. Pass `NullSink{}` to decode without forwarding. Stops at the
-/// terminal trailer (`.done`) or on invalid framing (`.parse_error`); a short read
-/// returns the mid-stream state. Owns its own read buffer.
+/// Decode a chunked body in full from a fresh decoder. See `pumpChunkedResume`;
+/// this wrapper owns its read buffer, so it never reports `leftover`.
 pub fn pumpChunked(initial: []const u8, src: anytype, sink: anytype, body: []u8) PumpResult {
-    var state: ChunkState = .size;
-    var chunk_remaining: usize = 0;
-    var size_val: usize = 0;
-    var captured: usize = 0;
-    var truncated = false;
-
-    if (initial.len > 0) {
-        sink.write(initial);
-        for (initial) |byte| {
-            chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured, &truncated);
-            if (state == .done or state == .parse_error)
-                return .{ .captured = captured, .state = state, .truncated = truncated };
-        }
-    }
-
+    var dec = ChunkedDecoder{};
     var read_buf: [16384]u8 = undefined;
-    while (state != .done and state != .parse_error) {
-        const n = src.read(&read_buf) catch break;
-        if (n == 0) break;
-        sink.write(read_buf[0..n]);
-        for (read_buf[0..n]) |byte| {
-            chunkedStep(byte, &state, &chunk_remaining, &size_val, body, &captured, &truncated);
-            if (state == .done or state == .parse_error)
-                return .{ .captured = captured, .state = state, .truncated = truncated };
-        }
-    }
+    var r = pumpChunkedResume(&dec, initial, src, sink, body, &read_buf, std.math.maxInt(u64));
+    r.leftover = "";
+    return r;
+}
 
-    return .{ .captured = captured, .state = state, .truncated = truncated };
+/// Continue decoding a chunked body with `dec`: `initial` holds bytes already read,
+/// `src` supplies the rest (`read([]u8) !usize`) into `read_buf`, and `sink`
+/// receives the *raw* chunked bytes of this message verbatim (`write([]const u8)
+/// void`) while `body` receives the decoded payload. Stops at the end of the
+/// message (`leftover` = bytes past it), on invalid framing, when `src` ends, or
+/// when the decoded size passes `limit` (`over_limit`; that read is not relayed).
+pub fn pumpChunkedResume(dec: *ChunkedDecoder, initial: []const u8, src: anytype, sink: anytype, body: []u8, read_buf: []u8, limit: u64) PumpResult {
+    if (dec.finished()) return pumpResult(dec, initial, false);
+    if (initial.len > 0) {
+        const used = dec.feed(initial, body);
+        if (dec.decoded_total > limit) return pumpResult(dec, "", true);
+        sink.write(initial[0..used]);
+        if (dec.finished()) return pumpResult(dec, initial[used..], false);
+    }
+    while (!dec.finished()) {
+        const n = src.read(read_buf) catch break;
+        if (n == 0) break;
+        const used = dec.feed(read_buf[0..n], body);
+        if (dec.decoded_total > limit) return pumpResult(dec, "", true);
+        sink.write(read_buf[0..used]);
+        if (dec.finished()) return pumpResult(dec, read_buf[used..n], false);
+    }
+    return pumpResult(dec, "", false);
 }
 
 /// The parsed head of an HTTP response. All slices point into the caller's read
@@ -327,6 +364,10 @@ pub const BodyResult = struct {
     captured: usize,
     /// At least one byte was dropped because `body` filled.
     truncated: bool,
+    /// Body bytes relayed in total.
+    total: u64 = 0,
+    /// `initial` bytes past `content_length` (a pipelined request), not relayed.
+    leftover: []const u8 = "",
 };
 
 /// Copy `chunk` into `body` starting at `captured`, advancing it, and set
@@ -341,35 +382,39 @@ fn captureInto(chunk: []const u8, body: []u8, captured: *usize, truncated: *bool
     if (chunk.len > space) truncated.* = true;
 }
 
-/// Relay a non-chunked response body from `src` (`read([]u8) !usize`) to `sink`
+/// Relay a non-chunked body from `src` (`read([]u8) !usize`) to `sink`
 /// (`write([]const u8) void`) while capturing up to `body.len` bytes. `initial` is
-/// the slice already read past the headers. `content_length` bounds the read; null
-/// means read until `src` closes (0-length read). Sets `truncated` if a captured
-/// byte was dropped because `body` filled. Like the chunked forward path, each read
-/// is relayed to `sink` verbatim — pass `NullSink{}` to capture without forwarding.
+/// the slice already read past the headers. With a `content_length` the relay
+/// stops exactly there: reads never ask for more, and surplus `initial` bytes come
+/// back as `leftover`. Null means read until `src` closes. Pass `NullSink{}` to
+/// capture without forwarding.
 pub fn streamBody(initial: []const u8, src: anytype, sink: anytype, content_length: ?usize, body: []u8) BodyResult {
     var captured: usize = 0;
     var truncated = false;
 
-    if (initial.len > 0) {
-        sink.write(initial);
-        captureInto(initial, body, &captured, &truncated);
+    const first_len = if (content_length) |cl| @min(initial.len, cl) else initial.len;
+    const first = initial[0..first_len];
+    if (first.len > 0) {
+        sink.write(first);
+        captureInto(first, body, &captured, &truncated);
     }
 
-    var read_total: usize = initial.len;
+    var read_total: usize = first.len;
     var read_buf: [16384]u8 = undefined;
     while (true) {
+        var want: usize = read_buf.len;
         if (content_length) |cl| {
             if (read_total >= cl) break;
+            want = @min(want, cl - read_total);
         }
-        const n = src.read(&read_buf) catch break;
+        const n = src.read(read_buf[0..want]) catch break;
         if (n == 0) break;
         sink.write(read_buf[0..n]);
         captureInto(read_buf[0..n], body, &captured, &truncated);
         read_total += n;
     }
 
-    return .{ .captured = captured, .truncated = truncated };
+    return .{ .captured = captured, .truncated = truncated, .total = read_total, .leftover = initial[first_len..] };
 }
 
 /// A header-forwarding policy: which header lines to drop, and whether to rewrite
@@ -668,6 +713,104 @@ test "pumpChunked with NullSink decodes without forwarding" {
 
     try testing.expectEqual(ChunkState.done, r.state);
     try testing.expectEqualStrings("abc", body[0..r.captured]);
+}
+
+test "ChunkedDecoder gives the same result for every split point" {
+    const whole = "4\r\nWiki\r\n5;x=y\r\npedia\r\n0\r\nTrailer: v\r\n\r\n";
+    for (0..whole.len + 1) |split| {
+        var dec = ChunkedDecoder{};
+        var body: [64]u8 = undefined;
+        const a = dec.feed(whole[0..split], &body);
+        try testing.expectEqual(split, a);
+        const b = dec.feed(whole[split..], &body);
+        try testing.expectEqual(whole.len - split, b);
+        try testing.expectEqual(ChunkState.done, dec.state);
+        try testing.expectEqualStrings("Wikipedia", body[0..dec.captured]);
+        try testing.expectEqual(@as(u64, 9), dec.decoded_total);
+    }
+}
+
+test "ChunkedDecoder stops at the end of the message" {
+    var dec = ChunkedDecoder{};
+    var body: [64]u8 = undefined;
+    const input = "3\r\nabc\r\n0\r\n\r\nGET /next HTTP/1.1\r\n";
+    const used = dec.feed(input, &body);
+    try testing.expectEqual(@as(usize, 13), used);
+    try testing.expectEqualStrings("GET /next HTTP/1.1\r\n", input[used..]);
+    // A finished decoder consumes nothing more.
+    try testing.expectEqual(@as(usize, 0), dec.feed("more", &body));
+}
+
+test "ChunkedDecoder reports parse_error and stops consuming" {
+    var dec = ChunkedDecoder{};
+    var body: [64]u8 = undefined;
+    const used = dec.feed("zz\r\nrest", &body);
+    try testing.expectEqual(@as(usize, 1), used);
+    try testing.expectEqual(ChunkState.parse_error, dec.state);
+    try testing.expect(dec.finished());
+}
+
+test "ChunkedDecoder counts decoded bytes past the capture" {
+    var dec = ChunkedDecoder{};
+    var body: [2]u8 = undefined;
+    _ = dec.feed("5\r\nhello\r\n0\r\n\r\n", &body);
+    try testing.expect(dec.truncated);
+    try testing.expectEqual(@as(usize, 2), dec.captured);
+    try testing.expectEqual(@as(u64, 5), dec.decoded_total);
+}
+
+test "pumpChunkedResume continues a decoder and returns bytes past the end" {
+    const whole = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    var dec = ChunkedDecoder{};
+    var body: [64]u8 = undefined;
+    _ = dec.feed(whole[0..7], &body); // as if a probe already decoded "4\r\nWiki"
+    var reader = SliceReader{ .data = whole[7..] ++ "NEXT" };
+    var fwd: [64]u8 = undefined;
+    var fwd_len: usize = 0;
+    var read_buf: [64]u8 = undefined;
+    const r = pumpChunkedResume(&dec, "", &reader, CaptureSink{ .buf = &fwd, .len = &fwd_len }, &body, &read_buf, std.math.maxInt(u64));
+    try testing.expectEqual(ChunkState.done, r.state);
+    try testing.expectEqualStrings("Wikipedia", body[0..r.captured]);
+    try testing.expectEqualStrings(whole[7..], fwd[0..fwd_len]);
+    try testing.expectEqualStrings("NEXT", r.leftover);
+}
+
+test "pumpChunkedResume stops with over_limit once decoded bytes pass the limit" {
+    var dec = ChunkedDecoder{};
+    var body: [64]u8 = undefined;
+    var reader = SliceReader{ .data = "a\r\n0123456789\r\n0\r\n\r\n" };
+    var fwd: [64]u8 = undefined;
+    var fwd_len: usize = 0;
+    var read_buf: [64]u8 = undefined;
+    const r = pumpChunkedResume(&dec, "", &reader, CaptureSink{ .buf = &fwd, .len = &fwd_len }, &body, &read_buf, 5);
+    try testing.expect(r.over_limit);
+    try testing.expectEqual(@as(usize, 0), fwd_len); // nothing past the limit was relayed
+}
+
+test "streamBody with content-length leaves surplus initial bytes as leftover" {
+    var reader = SliceReader{ .data = "" };
+    var fwd: [32]u8 = undefined;
+    var fwd_len: usize = 0;
+    var body: [32]u8 = undefined;
+    const r = streamBody("abcGET /", &reader, CaptureSink{ .buf = &fwd, .len = &fwd_len }, 3, &body);
+    try testing.expectEqualStrings("abc", fwd[0..fwd_len]);
+    try testing.expectEqualStrings("GET /", r.leftover);
+    try testing.expectEqual(@as(u64, 3), r.total);
+}
+
+test "streamBody never reads past content-length" {
+    var reader = SliceReader{ .data = "helloEXTRA" };
+    var fwd: [32]u8 = undefined;
+    var fwd_len: usize = 0;
+    var body: [32]u8 = undefined;
+    const r = streamBody("", &reader, CaptureSink{ .buf = &fwd, .len = &fwd_len }, 5, &body);
+    try testing.expectEqualStrings("hello", fwd[0..fwd_len]);
+    try testing.expectEqual(@as(usize, 5), reader.pos); // EXTRA still unread
+    try testing.expectEqual(@as(u64, 5), r.total);
+}
+
+test "reasonPhrase names 431" {
+    try testing.expectEqualStrings("Request Header Fields Too Large", reasonPhrase(431));
 }
 
 test "streamBody captures and forwards a content-length body" {
