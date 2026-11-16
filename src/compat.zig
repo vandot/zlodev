@@ -678,7 +678,8 @@ test "tcpConnectTimeout connects to a listener" {
 }
 
 test "tcpConnectTimeout reports ConnectionRefused when nothing listens" {
-    try std.testing.expectError(error.ConnectionRefused, tcpConnectTimeout(try Ip.parseIp4("127.0.0.1", 18361), 1000));
+    // Windows retries a refused connect for ~2s before reporting it; leave room.
+    try std.testing.expectError(error.ConnectionRefused, tcpConnectTimeout(try Ip.parseIp4("127.0.0.1", 18361), 5000));
 }
 
 test "tcpConnectTimeout gives up on an address that never answers" {
