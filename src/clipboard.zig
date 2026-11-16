@@ -2,12 +2,16 @@ const std = @import("std");
 const rt = @import("rt.zig");
 const requests = @import("requests.zig");
 
-/// Copy a request as a curl command to the clipboard.
-pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) void {
+pub const CopyResult = enum { copied, truncated, missing };
+
+/// Copy a request as a curl command to the clipboard. Refuses (`.truncated`) when
+/// the capture is cut, since the command would send something else.
+pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) CopyResult {
     _ = alloc; // std.process.spawn no longer takes an allocator
     var entry_copy: requests.Entry = undefined;
-    if (!requests.copyEntry(logical, &entry_copy)) return;
+    if (!requests.copyEntry(logical, &entry_copy)) return .missing;
     const entry = &entry_copy;
+    if (entry.requestTruncated()) return .truncated;
 
     var buf: [65536]u8 = undefined;
     var pos: usize = 0;
@@ -81,22 +85,23 @@ pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) 
     appendByte(&buf, &pos, '\'', &truncated);
 
     // If truncated, don't copy a broken curl command to clipboard
-    if (truncated) return;
+    if (truncated) return .truncated;
 
     // Pipe to clipboard (platform-specific)
     const clip_cmd: []const []const u8 = switch (@import("builtin").os.tag) {
         .macos => &.{"pbcopy"},
         .linux => &.{ "xclip", "-selection", "clipboard" },
         .windows => &.{"clip.exe"},
-        else => return,
+        else => return .missing,
     };
-    var child = std.process.spawn(rt.io(), .{ .argv = clip_cmd, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore }) catch return;
+    var child = std.process.spawn(rt.io(), .{ .argv = clip_cmd, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore }) catch return .missing;
     if (child.stdin) |stdin| {
         stdin.writeStreamingAll(rt.io(), buf[0..pos]) catch {};
         stdin.close(rt.io());
         child.stdin = null;
     }
     _ = child.wait(rt.io()) catch {};
+    return .copied;
 }
 
 pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -143,4 +148,13 @@ test "containsIgnoreCase both empty" {
 test "containsIgnoreCase single char" {
     try testing.expect(containsIgnoreCase("abc", "B"));
     try testing.expect(!containsIgnoreCase("abc", "D"));
+}
+
+test "copyAsCurl refuses a truncated capture" {
+    var e = requests.Entry{ .req_body_truncated = true, .timestamp = 1 };
+    const m = "POST";
+    @memcpy(e.method[0..m.len], m);
+    e.method_len = m.len;
+    requests.push(e);
+    try testing.expectEqual(CopyResult.truncated, copyAsCurl(testing.allocator, requests.getCount() - 1, "dev.lo"));
 }

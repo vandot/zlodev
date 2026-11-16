@@ -30,7 +30,7 @@ pub const Phase = enum {
 };
 
 pub const Entry = struct {
-    method: [7]u8 = @splat(0),
+    method: [16]u8 = @splat(0),
     method_len: u8 = 0,
     path: [512]u8 = @splat(0),
     path_len: u16 = 0,
@@ -47,6 +47,14 @@ pub const Entry = struct {
     resp_body_len: u32 = 0,
     req_body_truncated: bool = false,
     resp_body_truncated: bool = false,
+    path_truncated: bool = false,
+    req_headers_truncated: bool = false,
+    resp_headers_truncated: bool = false,
+    /// Intercept matched but the message didn't fit the capture, so it was relayed unheld.
+    too_large_to_intercept: bool = false,
+    /// Full decoded body sizes as relayed (the capture holds at most max_body_len).
+    req_body_total: u64 = 0,
+    resp_body_total: u64 = 0,
     state: EntryState = .normal,
     pinned: bool = false,
     starred: bool = false,
@@ -75,6 +83,12 @@ pub const Entry = struct {
 
     pub fn getRespBody(self: *const Entry) []const u8 {
         return self.resp_body[0..self.resp_body_len];
+    }
+
+    /// The captured request differs from what was sent, so replaying or copying it
+    /// would send something else.
+    pub fn requestTruncated(self: *const Entry) bool {
+        return self.path_truncated or self.req_headers_truncated or self.req_body_truncated;
     }
 };
 
@@ -1010,4 +1024,26 @@ test "EditableHold commits are gated by request vs response phase" {
     const rs_hold = EditableHold{ .idx = rs_idx, .phase = .response_held };
     try testing.expect(rs_hold.commitResponse(404, "X: y\r\n", "nope"));
     try testing.expect(!rs_hold.commitRequest("GET", "/", "", "")); // wrong phase, rejected
+}
+
+test "requestTruncated covers path, headers and body, not the response" {
+    var e = Entry{};
+    try testing.expect(!e.requestTruncated());
+    e.resp_body_truncated = true;
+    e.resp_headers_truncated = true;
+    try testing.expect(!e.requestTruncated());
+    e.path_truncated = true;
+    try testing.expect(e.requestTruncated());
+    e = Entry{ .req_headers_truncated = true };
+    try testing.expect(e.requestTruncated());
+    e = Entry{ .req_body_truncated = true };
+    try testing.expect(e.requestTruncated());
+}
+
+test "method field holds long WebDAV and CalDAV methods" {
+    var e = Entry{};
+    const m = "MKCALENDAR";
+    @memcpy(e.method[0..m.len], m);
+    e.method_len = m.len;
+    try testing.expectEqualStrings("MKCALENDAR", e.getMethod());
 }

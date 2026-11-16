@@ -67,8 +67,8 @@ pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: [
         writeJsonEscapedFile(file, domain) catch return null;
         writeJsonEscapedFile(file, entry.getPath()) catch return null;
         wr.writeAll(file, "\",\"httpVersion\":\"HTTP/1.1\",\"cookies\":[],\"queryString\":[],\"headersSize\":-1,\"bodySize\":") catch return null;
-        var bs_buf: [12]u8 = undefined;
-        wr.writeAll(file, std.fmt.bufPrint(&bs_buf, "{d}", .{entry.req_body_len}) catch "0") catch return null;
+        var bs_buf: [20]u8 = undefined;
+        wr.writeAll(file, std.fmt.bufPrint(&bs_buf, "{d}", .{@max(entry.req_body_total, entry.req_body_len)}) catch "0") catch return null;
 
         // Request headers
         wr.writeAll(file, ",\"headers\":[") catch return null;
@@ -89,8 +89,8 @@ pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: [
         var st_buf: [6]u8 = undefined;
         wr.writeAll(file, std.fmt.bufPrint(&st_buf, "{d}", .{entry.status}) catch "0") catch return null;
         wr.writeAll(file, ",\"statusText\":\"\",\"httpVersion\":\"HTTP/1.1\",\"cookies\":[],\"redirectURL\":\"\",\"headersSize\":-1,\"bodySize\":") catch return null;
-        var rbs_buf: [12]u8 = undefined;
-        wr.writeAll(file, std.fmt.bufPrint(&rbs_buf, "{d}", .{entry.resp_body_len}) catch "0") catch return null;
+        var rbs_buf: [20]u8 = undefined;
+        wr.writeAll(file, std.fmt.bufPrint(&rbs_buf, "{d}", .{@max(entry.resp_body_total, entry.resp_body_len)}) catch "0") catch return null;
 
         // Response headers
         wr.writeAll(file, ",\"headers\":[") catch return null;
@@ -103,6 +103,9 @@ pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: [
         wr.writeAll(file, ",\"mimeType\":\"\",\"text\":\"") catch return null;
         writeJsonEscapedFile(file, entry.getRespBody()) catch return null;
         wr.writeAll(file, "\"}}") catch return null;
+
+        if (entry.requestTruncated() or entry.resp_body_truncated or entry.resp_headers_truncated)
+            wr.writeAll(file, ",\"comment\":\"zlodev: captured copy truncated\"") catch return null;
 
         // Timings + cache
         wr.writeAll(file, ",\"cache\":{},\"timings\":{\"send\":-1,\"wait\":-1,\"receive\":-1}}") catch return null;
@@ -326,4 +329,20 @@ test "exportHar filename format" {
     try testing.expect(std.mem.startsWith(u8, fname, "zlodev_"));
     try testing.expect(std.mem.endsWith(u8, fname, ".har"));
     try testing.expectEqual(@as(usize, 26), fname.len);
+}
+
+test "exportHar reports full body sizes and notes truncated captures" {
+    var e1 = requests.Entry{ .req_body_truncated = true, .req_body_total = 100000, .resp_body_total = 7, .timestamp = 1700000000000 };
+    const m = "POST";
+    @memcpy(e1.method[0..m.len], m);
+    e1.method_len = m.len;
+    var entry_ptrs: [1]*const requests.Entry = .{&e1};
+    var fname_buf: [64]u8 = undefined;
+    const fname_len = exportHar(&entry_ptrs, 1, "dev.lo", &fname_buf) orelse return error.TestUnexpectedResult;
+    const fname = fname_buf[0..fname_len];
+    defer std.Io.Dir.cwd().deleteFile(rt.io(), fname) catch {};
+    const content = std.Io.Dir.cwd().readFileAlloc(rt.io(), fname, testing.allocator, .limited(1024 * 1024)) catch return error.TestUnexpectedResult;
+    defer testing.allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "\"bodySize\":100000") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"comment\":\"zlodev: captured copy truncated\"") != null);
 }
