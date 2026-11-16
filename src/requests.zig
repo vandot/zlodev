@@ -55,6 +55,9 @@ pub const Entry = struct {
     /// Full decoded body sizes as relayed (the capture holds at most max_body_len).
     req_body_total: u64 = 0,
     resp_body_total: u64 = 0,
+    /// Set only when zlodev itself wrote the response (502/504/413/431/400).
+    error_msg: [160]u8 = @splat(0),
+    error_len: u8 = 0,
     state: EntryState = .normal,
     pinned: bool = false,
     starred: bool = false,
@@ -89,6 +92,16 @@ pub const Entry = struct {
     /// would send something else.
     pub fn requestTruncated(self: *const Entry) bool {
         return self.path_truncated or self.req_headers_truncated or self.req_body_truncated;
+    }
+
+    pub fn getError(self: *const Entry) []const u8 {
+        return self.error_msg[0..self.error_len];
+    }
+
+    pub fn setError(self: *Entry, msg: []const u8) void {
+        const n = @min(msg.len, self.error_msg.len);
+        @memcpy(self.error_msg[0..n], msg[0..n]);
+        self.error_len = @intCast(n);
     }
 };
 
@@ -270,6 +283,20 @@ pub fn finishIfDangling(idx: usize, status: u16, duration_ms: u64) void {
         e.resp_body_len = 0;
         e.pinned = false;
     }
+}
+
+/// Finish a held entry whose request failed before a response: status, reason, no
+/// response data, unpinned (unless starred).
+pub fn finishFailed(idx: usize, status: u16, duration_ms: u64, reason: []const u8) void {
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
+    const e = &entries_backing[idx];
+    e.status = status;
+    e.duration_ms = duration_ms;
+    e.resp_headers_len = 0;
+    e.resp_body_len = 0;
+    e.setError(reason);
+    if (!e.starred) e.pinned = false;
 }
 
 /// A handle to a ring entry opened for editing by the TUI. Bundles the backing
@@ -1046,4 +1073,24 @@ test "method field holds long WebDAV and CalDAV methods" {
     @memcpy(e.method[0..m.len], m);
     e.method_len = m.len;
     try testing.expectEqualStrings("MKCALENDAR", e.getMethod());
+}
+
+test "setError keeps the reason and truncates past error_msg" {
+    var e = Entry{};
+    e.setError("connection refused 127.0.0.1:3000");
+    try testing.expectEqualStrings("connection refused 127.0.0.1:3000", e.getError());
+    const big: [300]u8 = @splat('a');
+    e.setError(&big);
+    try testing.expectEqual(e.error_msg.len, e.getError().len);
+}
+
+test "finishFailed records status and reason and unpins a held entry" {
+    clearAll();
+    const idx = pushAndPin(Entry{ .timestamp = 1 }).?;
+    finishFailed(idx, 504, 1000, "no response within 1s");
+    const out = getByBackingIndex(idx);
+    try testing.expectEqual(@as(u16, 504), out.status);
+    try testing.expectEqual(@as(u64, 1000), out.duration_ms);
+    try testing.expectEqualStrings("no response within 1s", out.getError());
+    try testing.expect(!out.pinned);
 }
