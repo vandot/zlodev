@@ -139,6 +139,7 @@ zlodev start --dns          start DNS server only (log mode)
 --command=CMD              dev server command to launch and monitor
 -c=PATH, --config=PATH     config file path [default .zlodev]
 --max-body=SIZE            max request body size [default 10M]
+--timeout=SECONDS          upstream connect/response timeout [default 30, 0 = none]
 --no-tui                   disable TUI, log to stderr
 --insecure-upstream        don't verify external route certificates
 -l, --local                use .local domain (mDNS)
@@ -152,6 +153,8 @@ zlodev start --dns          start DNS server only (log mode)
 `SIZE` accepts suffixes: `K` (KB), `M` (MB), `G` (GB). Example: `--max-body=50M`
 
 Request bodies up to `--max-body` are forwarded in full (larger ones get `413`); the TUI keeps the first 32 KB of each body for display.
+
+`--timeout` limits how long zlodev waits to connect to the dev server and for its response to start; past that the browser gets `504`. Once a response has started there is no timeout, so server-sent events, long polls and slow downloads run until either side closes.
 
 By default zlodev listens on `0.0.0.0` (on macOS that is what lets it use ports 80 and 443 without sudo) but only answers connections from your own machine. Other devices on your network are refused. To let them in, use `-l` (see [Local network](#local-network-mdns)) or set the address explicitly, for example `-b=0.0.0.0`.
 
@@ -170,7 +173,7 @@ no-tui
 
 zlodev reads `.zlodev` from the current directory on `start`. Use `-c=PATH` to specify a different location. CLI arguments override config file values.
 
-Supported options: `port`, `p`, `bind`, `b`, `route`, `max-body`, `command`, `intercept`, `no-tui`, `local`, `l`, `dns`.
+Supported options: `port`, `p`, `bind`, `b`, `route`, `max-body`, `timeout`, `command`, `intercept`, `no-tui`, `local`, `l`, `dns`.
 
 ### Routing
 
@@ -289,6 +292,8 @@ When a response is intercepted, the TUI shows two entries: the original request 
 Response entries cannot be replayed (`r`/`R`) — replay the original request above it instead, which will naturally produce a new response.
 
 Requests and responses too large to edit (URL over 512 bytes, headers over 2 KB, or body over 32 KB) pass through without being held and show `BIG` in the status column. They still reach the server and browser in full: the TUI shows the first 32 KB, marked `... truncated in view`. Replay and copy-as-curl are refused for requests whose captured copy is truncated.
+
+Requests zlodev answers itself (dev server down, timeout, body over `--max-body`, head too large, bad chunked encoding) also appear in the list, with a `!` after the status (`502!`, `504!`). The detail view starts with the reason, for example `zlodev: connection refused 127.0.0.1:3000`; the browser gets the same text as the response body.
 
 Pattern matching is case-insensitive. Press `i` again to disable intercept and release all held requests.
 
