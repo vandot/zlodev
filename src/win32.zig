@@ -41,6 +41,7 @@ pub const POLL = struct {
     pub const IN: i16 = 0x0300; // POLLRDNORM | POLLRDBAND
     pub const ERR: i16 = 0x0001;
     pub const HUP: i16 = 0x0002;
+    pub const OUT: i16 = 0x0010; // POLLWRNORM
 };
 pub extern "ws2_32" fn WSAPoll(fds: [*]WSAPOLLFD, nfds: u32, timeout: i32) callconv(.winapi) c_int;
 pub const INVALID_SOCKET: usize = std.math.maxInt(usize);
@@ -66,6 +67,9 @@ pub extern "ws2_32" fn recvfrom(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int,
 pub extern "ws2_32" fn sendto(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int, to: *const anyopaque, tolen: c_int) callconv(.winapi) c_int;
 pub extern "ws2_32" fn getaddrinfo(node: [*:0]const u8, service: ?[*:0]const u8, hints: ?*const ADDRINFOA, res: *?*ADDRINFOA) callconv(.winapi) c_int;
 pub extern "ws2_32" fn freeaddrinfo(res: *ADDRINFOA) callconv(.winapi) void;
+pub const FIONBIO: i32 = @bitCast(@as(u32, 0x8004667E));
+pub extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: i32, argp: *u32) callconv(.winapi) c_int;
+pub extern "ws2_32" fn getsockopt(s: SOCKET, level: c_int, optname: c_int, optval: [*]u8, optlen: *c_int) callconv(.winapi) c_int;
 pub extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
 
 // Job objects: `--command` puts cmd.exe in a kill-on-close job so stop/restart

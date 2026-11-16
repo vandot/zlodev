@@ -369,9 +369,76 @@ pub fn tcpConnect(ip: Ip) SocketError!socket_t {
     return sock;
 }
 
+/// Open a TCP connection, giving up after `timeout_ms` with `error.TimedOut`
+/// (0 = block like tcpConnect). The returned socket is blocking.
+pub fn tcpConnectTimeout(ip: Ip, timeout_ms: u32) SocketError!socket_t {
+    if (timeout_ms == 0) return tcpConnect(ip);
+    const sock = try openSocket(family(ip), posix.SOCK.STREAM);
+    errdefer closeSocket(sock);
+    try setBlocking(sock, false);
+    const sa: SockAddr = .from(ip);
+    if (builtin.os.tag == .windows) {
+        if (win32.connect(sock, &sa.storage, @intCast(sa.len)) != 0) {
+            if (win32.WSAGetLastError() != 10035) return lastError(); // WSAEWOULDBLOCK
+            try awaitConnect(sock, timeout_ms);
+        }
+    } else connect: while (true) {
+        switch (posix.errno(posix.system.connect(sock, @ptrCast(&sa.storage), sa.len))) {
+            .SUCCESS => break :connect,
+            .INTR => continue,
+            .INPROGRESS => {
+                try awaitConnect(sock, timeout_ms);
+                break :connect;
+            },
+            else => |e| return posixError(e),
+        }
+    }
+    try setBlocking(sock, true);
+    return sock;
+}
+
+/// Wait for a non-blocking connect to finish and report its result.
+fn awaitConnect(sock: socket_t, timeout_ms: u32) SocketError!void {
+    var fds = [1]pollfd{.{ .fd = sock, .events = POLL.OUT, .revents = 0 }};
+    const n = poll(&fds, @intCast(timeout_ms)) catch return error.Unexpected;
+    if (n == 0) return error.TimedOut;
+    var err: c_int = 0;
+    if (builtin.os.tag == .windows) {
+        var len: c_int = @sizeOf(c_int);
+        if (win32.getsockopt(sock, 0xffff, 0x1007, @ptrCast(&err), &len) != 0) return lastError(); // SOL_SOCKET, SO_ERROR
+        return switch (err) {
+            0 => {},
+            10061 => error.ConnectionRefused, // WSAECONNREFUSED
+            10060 => error.TimedOut, // WSAETIMEDOUT
+            10051, 10065 => error.NetworkUnreachable, // WSAENETUNREACH, WSAEHOSTUNREACH
+            else => error.Unexpected,
+        };
+    }
+    var len: posix.socklen_t = @sizeOf(c_int);
+    switch (posix.errno(posix.system.getsockopt(sock, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err), &len))) {
+        .SUCCESS => {},
+        else => |e| return posixError(e),
+    }
+    if (err != 0) return posixError(@enumFromInt(err));
+}
+
+fn setBlocking(sock: socket_t, blocking: bool) SocketError!void {
+    if (builtin.os.tag == .windows) {
+        var mode: u32 = if (blocking) 0 else 1;
+        if (win32.ioctlsocket(sock, win32.FIONBIO, &mode) != 0) return lastError();
+        return;
+    }
+    const nonblock: usize = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+    const rc = posix.system.fcntl(sock, posix.F.GETFL, @as(usize, 0));
+    if (posix.errno(rc) != .SUCCESS) return error.Unexpected;
+    const flags: usize = @intCast(rc);
+    const new = if (blocking) flags & ~nonblock else flags | nonblock;
+    if (posix.errno(posix.system.fcntl(sock, posix.F.SETFL, new)) != .SUCCESS) return error.Unexpected;
+}
+
 /// Resolve `host` and connect to the first address that accepts (blocking).
 /// Needs libc on POSIX (getaddrinfo); only the proxy, which links libc, uses it.
-pub fn tcpConnectHost(host: []const u8, port: u16) SocketError!socket_t {
+pub fn tcpConnectHost(host: []const u8, port: u16, timeout_ms: u32) SocketError!socket_t {
     var host_buf: [256]u8 = undefined;
     if (host.len >= host_buf.len) return error.UnknownHostName;
     @memcpy(host_buf[0..host.len], host);
@@ -400,7 +467,7 @@ pub fn tcpConnectHost(host: []const u8, port: u16) SocketError!socket_t {
             .ip4 => |*a| a.port = port,
             .ip6 => |*a| a.port = port,
         }
-        return tcpConnect(ip) catch |e| {
+        return tcpConnectTimeout(ip, timeout_ms) catch |e| {
             last_err = e;
             continue;
         };
@@ -601,4 +668,28 @@ test "isLoopback accepts 127/8, ::1 and IPv4-mapped loopback only" {
     try std.testing.expect(!isLoopback(try Ip.parse("10.0.0.1", 0)));
     try std.testing.expect(!isLoopback(try Ip.parse("::ffff:192.168.1.20", 0)));
     try std.testing.expect(!isLoopback(try Ip.parse("fe80::1", 0)));
+}
+
+test "tcpConnectTimeout connects to a listener" {
+    const l = try tcpListen(try Ip.parseIp4("127.0.0.1", 18360));
+    defer closeSocket(l);
+    const s = try tcpConnectTimeout(try Ip.parseIp4("127.0.0.1", 18360), 1000);
+    closeSocket(s);
+}
+
+test "tcpConnectTimeout reports ConnectionRefused when nothing listens" {
+    try std.testing.expectError(error.ConnectionRefused, tcpConnectTimeout(try Ip.parseIp4("127.0.0.1", 18361), 1000));
+}
+
+test "tcpConnectTimeout gives up on an address that never answers" {
+    // 10.255.255.1 is non-routable: either the SYN is dropped (TimedOut) or the
+    // runner has no route (NetworkUnreachable). Either way it must not block.
+    const rt = @import("rt.zig");
+    const t0 = rt.milliTimestamp();
+    const r = tcpConnectTimeout(try Ip.parseIp4("10.255.255.1", 9), 300);
+    if (r) |s| {
+        closeSocket(s);
+        return error.TestUnexpectedResult;
+    } else |e| try std.testing.expect(e == error.TimedOut or e == error.NetworkUnreachable or e == error.Unexpected);
+    try std.testing.expect(rt.milliTimestamp() - t0 < 1500);
 }

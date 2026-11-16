@@ -416,7 +416,7 @@ fn connectUpstream(
     // Resolve + connect — DNS for external, IP parse for local
     const upstream_sock: compat.socket_t = blk: {
         if (is_external) {
-            break :blk compat.tcpConnectHost(upstream_host, upstream_port) catch |e| {
+            break :blk compat.tcpConnectHost(upstream_host, upstream_port, 0) catch |e| {
                 switch (e) {
                     error.UnknownHostName => log.err(
                         "component=proxy conn={d} op=dns_resolve host={s} error={any}",
