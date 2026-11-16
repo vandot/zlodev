@@ -422,7 +422,7 @@ fn awaitConnect(sock: socket_t, timeout_ms: u32) SocketError!void {
     if (err != 0) return posixError(@enumFromInt(err));
 }
 
-fn setBlocking(sock: socket_t, blocking: bool) SocketError!void {
+pub fn setBlocking(sock: socket_t, blocking: bool) SocketError!void {
     if (builtin.os.tag == .windows) {
         var mode: u32 = if (blocking) 0 else 1;
         if (win32.ioctlsocket(sock, win32.FIONBIO, &mode) != 0) return lastError();
