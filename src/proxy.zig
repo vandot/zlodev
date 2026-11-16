@@ -410,10 +410,20 @@ fn rejectConnectionAndRelease(ssl: *ssl_c.SSL, client_sock: compat.socket_t, con
     rejectConnection(ssl, client_sock, conn_id);
 }
 
-/// Resolve, connect, and (for external routes) TLS-handshake an upstream connection.
-/// On any failure the specific cause is logged and `error.UpstreamUnavailable` is
-/// returned; the caller maps that to a single 502. Sets send/recv timeouts on the
-/// socket before returning.
+const UpstreamError = error{ DnsFailed, ConnectRefused, ConnectFailed, ConnectTimeout, TlsFailed, UpstreamCertUntrusted };
+
+fn connectError(e: compat.SocketError) UpstreamError {
+    return switch (e) {
+        error.UnknownHostName => error.DnsFailed,
+        error.ConnectionRefused => error.ConnectRefused,
+        error.TimedOut => error.ConnectTimeout,
+        else => error.ConnectFailed,
+    };
+}
+
+/// Resolve, connect (within `--timeout`), and for external routes TLS-handshake an
+/// upstream connection. Each failure is logged and returned as its own error so the
+/// caller can tell the client why. Sets send/recv timeouts on the socket.
 fn connectUpstream(
     is_external: bool,
     upstream_host: []const u8,
@@ -421,11 +431,12 @@ fn connectUpstream(
     config: *const ProxyConfig,
     client_ctx: ?*ssl_c.SSL_CTX,
     conn_id: u64,
-) !UpstreamConn {
+) UpstreamError!UpstreamConn {
+    const timeout_ms = config.upstream_timeout_s * 1000;
     // Resolve + connect — DNS for external, IP parse for local
     const upstream_sock: compat.socket_t = blk: {
         if (is_external) {
-            break :blk compat.tcpConnectHost(upstream_host, upstream_port, 0) catch |e| {
+            break :blk compat.tcpConnectHost(upstream_host, upstream_port, timeout_ms) catch |e| {
                 switch (e) {
                     error.UnknownHostName => log.err(
                         "component=proxy conn={d} op=dns_resolve host={s} error={any}",
@@ -436,15 +447,15 @@ fn connectUpstream(
                         .{ conn_id, upstream_host, e },
                     ),
                 }
-                return error.UpstreamUnavailable;
+                return connectError(e);
             };
         } else {
             const addr = std.Io.net.IpAddress.parse(config.target_host, upstream_port) catch {
-                return error.UpstreamUnavailable;
+                return error.ConnectFailed;
             };
-            break :blk compat.tcpConnect(addr) catch |e| {
+            break :blk compat.tcpConnectTimeout(addr, timeout_ms) catch |e| {
                 log.err("component=proxy conn={d} op=upstream_connect host={s} error={any}", .{ conn_id, upstream_host, e });
-                return error.UpstreamUnavailable;
+                return connectError(e);
             };
         }
     };
@@ -461,11 +472,11 @@ fn connectUpstream(
             // client_ctx is null — SSL_CTX allocation failed at startup
             log.err("component=proxy conn={d} op=external_tls error=no_client_ctx", .{conn_id});
             compat.closeSocket(upstream_sock);
-            return error.UpstreamUnavailable;
+            return error.TlsFailed;
         };
         const us = upstreamHandshake(cctx, upstream_sock, upstream_host, conn_id) catch |e| {
             compat.closeSocket(upstream_sock);
-            return e;
+            return if (e == error.UpstreamCertUntrusted) error.UpstreamCertUntrusted else error.TlsFailed;
         };
         upstream_ssl_obj = us;
     }
@@ -524,7 +535,9 @@ fn handleConnection(
 
         if (headers_end == null) {
             if (total == req_buf.len) {
-                sslSendError(ssl, 431, "Request Header Fields Too Large");
+                var big = requests.Entry{ .timestamp = rt.milliTimestamp() };
+                fillRequestLine(&big, req_buf[0..total]);
+                failRequest(ssl, &big, null, 431, "request head over 16KB");
                 discardPendingInput(ssl, client_sock);
             }
             return; // client closed, or a head that doesn't fit
@@ -590,7 +603,9 @@ fn handleConnection(
         const content_length: usize = if (req_chunked) 0 else http_wire.getContentLength(req_hdr_section) orelse 0;
         if (content_length > config.max_request_body) {
             log.err("component=proxy conn={d} op=body_read bytes={d} max={d} error=body_too_large", .{ conn_id, content_length, config.max_request_body });
-            sslSendError(ssl, 413, "Request Entity Too Large");
+            entry.req_body_truncated = true;
+            var rb: [64]u8 = undefined;
+            failRequest(ssl, &entry, null, 413, std.fmt.bufPrint(&rb, "body over --max-body ({d} bytes)", .{content_length}) catch "body over --max-body");
             discardPendingInput(ssl, client_sock);
             return;
         }
@@ -619,7 +634,8 @@ fn handleConnection(
                 probe = p;
                 switch (p.outcome) {
                     .parse_error => {
-                        sslSendError(ssl, 400, "Bad Request");
+                        entry.req_body_truncated = true;
+                        failRequest(ssl, &entry, null, 400, "bad chunked encoding");
                         discardPendingInput(ssl, client_sock);
                         return;
                     },
@@ -665,6 +681,8 @@ fn handleConnection(
             }
         }
 
+        const held: ?usize = if (was_intercepted) intercept_backing_idx else null;
+
         // Ensure intercepted entries are unpinned on any early exit after this point.
         // Normal completion paths call finishEntry/finishResponseIntercept explicitly,
         // which set status/duration before unpinning — so this defer only fires for
@@ -679,14 +697,9 @@ fn handleConnection(
         const upstream_host = route_result.hostname orelse config.target_host;
 
         const upstream = connectUpstream(is_external, upstream_host, upstream_port, config, client_ctx, conn_id) catch |e| {
-            const dur = rt.milliTimestamp() - start_time;
-            if (was_intercepted) {
-                requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
-            }
-            sslSendError(ssl, 502, if (e == error.UpstreamCertUntrusted)
-                "Upstream certificate not trusted (use --insecure-upstream to skip verification)"
-            else
-                "Bad Gateway");
+            var rb: [192]u8 = undefined;
+            const r = connectReason(&rb, e, upstream_host, upstream_port, config.upstream_timeout_s);
+            failRequest(ssl, &entry, held, r.status, r.reason);
             return;
         };
         defer upstream.close();
@@ -698,8 +711,7 @@ fn handleConnection(
         defer if (fwd_snapshot) |s| std.heap.page_allocator.destroy(s);
         const fwd_entry: *const requests.Entry = if (was_intercepted) blk: {
             const s = std.heap.page_allocator.create(requests.Entry) catch {
-                requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                sslSendError(ssl, 502, "Bad Gateway");
+                failRequest(ssl, &entry, held, 502, "out of memory");
                 return;
             };
             fwd_snapshot = s;
@@ -737,13 +749,16 @@ fn handleConnection(
                 entry.req_body_truncated = pr.truncated;
                 if (pr.over_limit) {
                     log.err("component=proxy conn={d} op=body_read max={d} error=body_too_large", .{ conn_id, config.max_request_body });
-                    sslSendError(ssl, 413, "Request Entity Too Large");
+                    entry.req_body_truncated = true;
+                    var rb: [64]u8 = undefined;
+                    failRequest(ssl, &entry, null, 413, std.fmt.bufPrint(&rb, "body over --max-body ({d} bytes)", .{dec.decoded_total}) catch "body over --max-body");
                     discardPendingInput(ssl, client_sock);
                     return;
                 }
                 if (pr.state != .done and !upstream_failed) {
                     if (pr.state == .parse_error) {
-                        sslSendError(ssl, 400, "Bad Request");
+                        entry.req_body_truncated = true;
+                        failRequest(ssl, &entry, null, 400, "bad chunked encoding");
                         discardPendingInput(ssl, client_sock);
                     }
                     return; // bad framing, or client gone mid-body
@@ -762,7 +777,7 @@ fn handleConnection(
             // Upstream stopped taking the request (closed, or a 30s send timeout):
             // don't drain the rest of the upload into it.
             log.err("component=proxy conn={d} op=upstream_write error=write_failed", .{conn_id});
-            sslSendError(ssl, 502, "Bad Gateway");
+            failRequest(ssl, &entry, held, 502, "upstream stopped reading the request");
             discardPendingInput(ssl, client_sock);
             return;
         }
@@ -1303,6 +1318,68 @@ fn sslSendError(ssl: *ssl_c.SSL, status: u16, message: []const u8) void {
     sslWriteAll(ssl, response);
 }
 
+/// Error response whose status line uses the standard phrase and whose body is
+/// `reason`, so the browser shows what went wrong.
+fn sslSendReason(ssl: *ssl_c.SSL, status: u16, reason: []const u8) void {
+    var buf: [512]u8 = undefined;
+    const response = std.fmt.bufPrint(&buf, "HTTP/1.1 {d} {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+        status, http_wire.reasonPhrase(status), reason.len, reason,
+    }) catch return;
+    sslWriteAll(ssl, response);
+}
+
+/// zlodev answered this request itself: tell the client, then record the entry
+/// with `status` and `reason`, finishing the held ring entry if it was intercepted.
+fn failRequest(ssl: *ssl_c.SSL, entry: *requests.Entry, held: ?usize, status: u16, reason: []const u8) void {
+    sslSendReason(ssl, status, reason);
+    const elapsed = rt.milliTimestamp() - entry.timestamp;
+    const dur: u64 = if (elapsed > 0) @intCast(elapsed) else 0;
+    if (held) |idx| {
+        requests.finishFailed(idx, status, dur, reason);
+        return;
+    }
+    entry.status = status;
+    entry.duration_ms = dur;
+    entry.setError(reason);
+    requests.push(entry.*);
+}
+
+const FailReason = struct { status: u16, reason: []const u8 };
+
+fn connectReason(buf: []u8, e: UpstreamError, host: []const u8, port: u16, timeout_s: u32) FailReason {
+    return switch (e) {
+        error.ConnectRefused => .{ .status = 502, .reason = std.fmt.bufPrint(buf, "connection refused {s}:{d}", .{ host, port }) catch "connection refused" },
+        error.ConnectFailed => .{ .status = 502, .reason = std.fmt.bufPrint(buf, "connect failed {s}:{d}", .{ host, port }) catch "connect failed" },
+        error.DnsFailed => .{ .status = 502, .reason = std.fmt.bufPrint(buf, "DNS lookup failed {s}", .{host}) catch "DNS lookup failed" },
+        error.ConnectTimeout => .{ .status = 504, .reason = std.fmt.bufPrint(buf, "connect timed out after {d}s {s}:{d}", .{ timeout_s, host, port }) catch "connect timed out" },
+        error.TlsFailed => .{ .status = 502, .reason = std.fmt.bufPrint(buf, "TLS handshake failed {s}", .{host}) catch "TLS handshake failed" },
+        error.UpstreamCertUntrusted => .{ .status = 502, .reason = std.fmt.bufPrint(buf, "upstream certificate not trusted {s} (use --insecure-upstream to skip verification)", .{host}) catch "upstream certificate not trusted" },
+    };
+}
+
+/// Fill method, path and the headers that fit from a head too big to parse whole.
+/// No request line in the bytes: method and path are "?".
+fn fillRequestLine(entry: *requests.Entry, head: []const u8) void {
+    const line_end = std.mem.indexOf(u8, head, "\r\n");
+    var method: []const u8 = "?";
+    var path: []const u8 = "?";
+    if (line_end) |le| {
+        var parts = std.mem.splitScalar(u8, head[0..le], ' ');
+        method = parts.next() orelse "?";
+        path = parts.next() orelse "?";
+    }
+    entry.method_len = @intCast(@min(method.len, entry.method.len));
+    @memcpy(entry.method[0..entry.method_len], method[0..entry.method_len]);
+    entry.path_len = @intCast(@min(path.len, entry.path.len));
+    @memcpy(entry.path[0..entry.path_len], path[0..entry.path_len]);
+    entry.path_truncated = path.len > entry.path.len or line_end == null;
+    const rest = if (line_end) |le| head[le + 2 ..] else "";
+    const n = @min(rest.len, requests.max_header_len);
+    @memcpy(entry.req_headers[0..n], rest[0..n]);
+    entry.req_headers_len = @intCast(n);
+    entry.req_headers_truncated = true;
+}
+
 const WsTarget = struct { is_external: bool, host: []const u8, port: u16 };
 
 fn handleWebSocket(
@@ -1318,10 +1395,9 @@ fn handleWebSocket(
 
     // Same connect path as plain requests: external routes get TLS + verification.
     const upstream = connectUpstream(target.is_external, target.host, target.port, config, client_ctx, conn_id) catch |e| {
-        sslSendError(ssl, 502, if (e == error.UpstreamCertUntrusted)
-            "Upstream certificate not trusted (use --insecure-upstream to skip verification)"
-        else
-            "Bad Gateway");
+        var rb: [192]u8 = undefined;
+        const r = connectReason(&rb, e, target.host, target.port, config.upstream_timeout_s);
+        failRequest(ssl, entry, null, r.status, r.reason);
         return;
     };
     defer upstream.close();
@@ -1709,7 +1785,7 @@ test "replay sends a captured chunked request de-chunked" {
     );
 }
 
-test "connectUpstream returns UpstreamUnavailable for an unresolvable external host" {
+test "connectUpstream returns DnsFailed for an unresolvable external host" {
     const cfg = ProxyConfig{
         .target_host = "127.0.0.1",
         .target_port = 1,
@@ -1722,7 +1798,7 @@ test "connectUpstream returns UpstreamUnavailable for an unresolvable external h
         .routes = &.{},
         .domain = "dev.lo",
     };
-    try testing.expectError(error.UpstreamUnavailable, connectUpstream(true, "nonexistent.invalid", 443, &cfg, null, 1));
+    try testing.expectError(error.DnsFailed, connectUpstream(true, "nonexistent.invalid", 443, &cfg, null, 1));
 }
 
 const DrainTestWorker = struct {
@@ -2161,6 +2237,7 @@ const ProxyHarness = struct {
         routes: []const Route = &.{},
         client_ctx: ?*ssl_c.SSL_CTX = null,
         max_request_body: usize = default_max_request_body,
+        upstream_timeout_s: u32 = default_upstream_timeout_s,
     };
 
     fn startWith(self: *ProxyHarness, port: u16, upstream_port: u16, routes: []const Route, client_ctx: ?*ssl_c.SSL_CTX) !void {
@@ -2185,6 +2262,7 @@ const ProxyHarness = struct {
             .server_ident = "test",
             .routes = opts.routes,
             .max_request_body = opts.max_request_body,
+            .upstream_timeout_s = opts.upstream_timeout_s,
         };
         _ = proxy_workers.fetchAdd(1, .acq_rel);
         const client_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
@@ -2511,7 +2589,7 @@ test "Content-Length over --max-body gets 413" {
     try px.startOpts(18304, 18305, .{ .max_request_body = 1000 });
     defer px.stop();
     var buf: [4096]u8 = undefined;
-    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 2000\r\n\r\n" ++ rep("x", 2000), "Request Entity Too Large", &buf);
+    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 2000\r\n\r\n" ++ rep("x", 2000), "(2000 bytes)", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 413"));
 }
 
@@ -2523,7 +2601,7 @@ test "chunked body over --max-body gets 413" {
     try px.startOpts(18306, 18307, .{ .max_request_body = 1000 });
     defer px.stop();
     var buf: [4096]u8 = undefined;
-    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n7d0\r\n" ++ rep("y", 2000) ++ "\r\n0\r\n\r\n", "Request Entity Too Large", &buf);
+    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n7d0\r\n" ++ rep("y", 2000) ++ "\r\n0\r\n\r\n", "bytes)", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 413"));
 }
 
@@ -2535,7 +2613,7 @@ test "request head over 16 KB gets 431" {
     try px.start(18308, 18309);
     defer px.stop();
     var buf: [4096]u8 = undefined;
-    const resp = try px.roundTrip("GET / HTTP/1.1\r\nHost: dev.lo\r\nX-Big: " ++ rep("b", 17000) ++ "\r\n\r\n", "Request Header Fields Too Large", &buf);
+    const resp = try px.roundTrip("GET / HTTP/1.1\r\nHost: dev.lo\r\nX-Big: " ++ rep("b", 17000) ++ "\r\n\r\n", "request head over 16KB", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 431"));
 }
 
@@ -2547,7 +2625,7 @@ test "malformed chunked request body gets 400" {
     try px.start(18310, 18311);
     defer px.stop();
     var buf: [4096]u8 = undefined;
-    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", "Bad Request", &buf);
+    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", "bad chunked encoding", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400"));
 }
 
@@ -2799,7 +2877,7 @@ test "upstream that hangs up mid-upload gets the client a 502 at once" {
     const req = try std.mem.concat(testing.allocator, u8, &.{ "POST /up HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 1048576\r\n\r\n", body });
     defer testing.allocator.free(req);
     var buf: [4096]u8 = undefined;
-    const resp = try px.roundTrip(req, "Bad Gateway", &buf);
+    const resp = try px.roundTrip(req, "upstream stopped reading the request", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 502"));
 }
 
@@ -2811,4 +2889,107 @@ test "parseTimeoutSeconds accepts whole seconds up to a day" {
     try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds("30s"));
     try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds(""));
     try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds("-1"));
+}
+
+test "connect refused answers 502 and records the reason" {
+    const before = freshRing();
+    var px: ProxyHarness = undefined;
+    try px.start(18340, 18341); // nothing listens on 18341
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /x HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "127.0.0.1:18341", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 502 Bad Gateway"));
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 502), e.status);
+    try testing.expectEqualStrings("connection refused 127.0.0.1:18341", e.getError());
+    try testing.expectEqualStrings("/x", e.getPath());
+}
+
+test "413 over --max-body is recorded" {
+    const before = freshRing();
+    var up = RecordingUpstream{};
+    try up.start(18343);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18342, 18343, .{ .max_request_body = 10 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip("POST /up HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 20\r\n\r\n01234567890123456789", "(20 bytes)", &buf);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 413), e.status);
+    try testing.expectEqualStrings("body over --max-body (20 bytes)", e.getError());
+    try testing.expect(e.requestTruncated());
+}
+
+test "chunked body over --max-body is recorded" {
+    const before = freshRing();
+    var up = RecordingUpstream{};
+    try up.start(18345);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18344, 18345, .{ .max_request_body = 10 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip("POST /c HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n14\r\n01234567890123456789\r\n0\r\n\r\n", "bytes)", &buf);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 413), e.status);
+    try testing.expect(std.mem.startsWith(u8, e.getError(), "body over --max-body"));
+}
+
+test "bad chunked framing is recorded as 400" {
+    const before = freshRing();
+    var up = RecordingUpstream{};
+    try up.start(18347);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18346, 18347);
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip("POST /c HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", "bad chunked encoding", &buf);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 400), e.status);
+    try testing.expectEqualStrings("bad chunked encoding", e.getError());
+    try testing.expect(e.requestTruncated());
+}
+
+test "431 head over 16KB is recorded with its request line" {
+    const before = freshRing();
+    var px: ProxyHarness = undefined;
+    try px.start(18348, 18349);
+    defer px.stop();
+    const req = "GET /big HTTP/1.1\r\nX: " ++ rep("a", 17000) ++ "\r\n\r\n";
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip(req, "request head over 16KB", &buf);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 431), e.status);
+    try testing.expectEqualStrings("GET", e.getMethod());
+    try testing.expectEqualStrings("/big", e.getPath());
+    try testing.expect(e.req_headers_truncated);
+}
+
+test "held request whose upstream is down finishes with the reason" {
+    const before = freshRing();
+    intercept.enableWithPattern("req:/held");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18350, 18351); // nothing on 18351
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip("GET /held HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "127.0.0.1:18351", &buf);
+    // The connection closes after the error response.
+    var one: [1]u8 = undefined;
+    try testing.expect(ssl_c.SSL_read(px.client, &one, 1) <= 0);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 502), e.status);
+    try testing.expect(!e.pinned);
+    try testing.expectEqualStrings("connection refused 127.0.0.1:18351", e.getError());
 }
