@@ -104,8 +104,14 @@ pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: [
         writeJsonEscapedFile(file, entry.getRespBody()) catch return null;
         wr.writeAll(file, "\"}}") catch return null;
 
-        if (entry.requestTruncated() or entry.resp_body_truncated or entry.resp_headers_truncated)
-            wr.writeAll(file, ",\"comment\":\"zlodev: captured copy truncated\"") catch return null;
+        const cut = entry.requestTruncated() or entry.resp_body_truncated or entry.resp_headers_truncated;
+        if (entry.error_len > 0 or cut) {
+            wr.writeAll(file, ",\"comment\":\"zlodev: ") catch return null;
+            if (entry.error_len > 0) writeJsonEscapedFile(file, entry.getError()) catch return null;
+            if (entry.error_len > 0 and cut) wr.writeAll(file, "; ") catch return null;
+            if (cut) wr.writeAll(file, "captured copy truncated") catch return null;
+            wr.writeByte(file, '"') catch return null;
+        }
 
         // Timings + cache
         wr.writeAll(file, ",\"cache\":{},\"timings\":{\"send\":-1,\"wait\":-1,\"receive\":-1}}") catch return null;
@@ -345,4 +351,20 @@ test "exportHar reports full body sizes and notes truncated captures" {
     defer testing.allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "\"bodySize\":100000") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"comment\":\"zlodev: captured copy truncated\"") != null);
+}
+
+test "exportHar notes why zlodev answered a failed request" {
+    var e1 = requests.Entry{ .status = 502, .timestamp = 1700000000000 };
+    const m = "GET";
+    @memcpy(e1.method[0..m.len], m);
+    e1.method_len = m.len;
+    e1.setError("connection refused 127.0.0.1:3000");
+    var entry_ptrs: [1]*const requests.Entry = .{&e1};
+    var fname_buf: [64]u8 = undefined;
+    const fname_len = exportHar(&entry_ptrs, 1, "dev.lo", &fname_buf) orelse return error.TestUnexpectedResult;
+    const fname = fname_buf[0..fname_len];
+    defer std.Io.Dir.cwd().deleteFile(rt.io(), fname) catch {};
+    const content = std.Io.Dir.cwd().readFileAlloc(rt.io(), fname, testing.allocator, .limited(1024 * 1024)) catch return error.TestUnexpectedResult;
+    defer testing.allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "\"comment\":\"zlodev: connection refused 127.0.0.1:3000\"") != null);
 }
