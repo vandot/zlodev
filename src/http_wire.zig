@@ -331,19 +331,38 @@ fn parseStatus(status_line: []const u8) u16 {
 /// skipped; 101 is final (protocol switch). Returns null if the connection yielded
 /// nothing or no complete head fit in `buf`. The returned slices point into `buf`.
 pub fn readResponseHead(src: anytype, buf: []u8) ?ResponseHead {
+    return switch (readResponseHeadResult(src, buf)) {
+        .head => |h| h,
+        else => null,
+    };
+}
+
+pub const HeadResult = union(enum) { head: ResponseHead, closed, timeout };
+
+/// True for the deadline error a polling reader returns (`error.Timeout`).
+pub fn isTimeout(e: anyerror) bool {
+    return e == error.Timeout;
+}
+
+/// Same as readResponseHead, but tells why no head came: `.timeout` when the
+/// source's deadline passed (`error.Timeout`), `.closed` for EOF or any other error.
+pub fn readResponseHeadResult(src: anytype, buf: []u8) HeadResult {
     var total: usize = 0;
     while (true) {
         var headers_end: ?usize = std.mem.indexOf(u8, buf[0..total], "\r\n\r\n");
         while (headers_end == null and total < buf.len) {
-            const n = src.read(buf[total..]) catch break;
+            const n = src.read(buf[total..]) catch |e| {
+                if (isTimeout(e)) return .timeout;
+                break;
+            };
             if (n == 0) break;
             total += n;
             headers_end = std.mem.indexOf(u8, buf[0..total], "\r\n\r\n");
         }
-        if (total == 0) return null;
-        const hdr_end = headers_end orelse return null;
+        if (total == 0) return .closed;
+        const hdr_end = headers_end orelse return .closed;
 
-        const first_line_end = std.mem.indexOf(u8, buf[0..total], "\r\n") orelse return null;
+        const first_line_end = std.mem.indexOf(u8, buf[0..total], "\r\n") orelse return .closed;
         const status = parseStatus(buf[0..first_line_end]);
         const body_start = hdr_end + 4;
 
@@ -354,14 +373,14 @@ pub fn readResponseHead(src: anytype, buf: []u8) ?ResponseHead {
             continue;
         }
 
-        return .{
+        return .{ .head = .{
             .status = status,
             .status_line = buf[0 .. first_line_end + 2],
             // A headerless response (status line immediately followed by CRLFCRLF) has
             // first_line_end == hdr_end — yield an empty header block, not a bad slice.
             .headers = if (first_line_end + 2 <= hdr_end) buf[first_line_end + 2 .. hdr_end] else buf[0..0],
             .initial_body = if (body_start < total) buf[body_start..total] else buf[0..0],
-        };
+        } };
     }
 }
 
@@ -1110,4 +1129,43 @@ test "readResponseHead returns 101 Switching Protocols as final" {
     var buf: [256]u8 = undefined;
     const head = readResponseHead(&reader, &buf).?;
     try testing.expectEqual(@as(u16, 101), head.status);
+}
+
+const TimeoutReader = struct {
+    data: []const u8 = "",
+    pos: usize = 0,
+    fn read(self: *TimeoutReader, buf: []u8) !usize {
+        if (self.pos == self.data.len) return error.Timeout;
+        const n = @min(buf.len, self.data.len - self.pos);
+        @memcpy(buf[0..n], self.data[self.pos..][0..n]);
+        self.pos += n;
+        return n;
+    }
+};
+
+test "readResponseHeadResult reports a timeout before any byte" {
+    var reader = TimeoutReader{};
+    var buf: [256]u8 = undefined;
+    try testing.expect(readResponseHeadResult(&reader, &buf) == .timeout);
+}
+
+test "readResponseHeadResult reports a timeout mid-head" {
+    var reader = TimeoutReader{ .data = "HTTP/1.1 200 OK\r\nX: y" };
+    var buf: [256]u8 = undefined;
+    try testing.expect(readResponseHeadResult(&reader, &buf) == .timeout);
+}
+
+test "readResponseHeadResult reports a close as closed" {
+    var reader = SliceReader{ .data = "" };
+    var buf: [256]u8 = undefined;
+    try testing.expect(readResponseHeadResult(&reader, &buf) == .closed);
+}
+
+test "readResponseHeadResult returns the head" {
+    var reader = SliceReader{ .data = "HTTP/1.1 201 Created\r\n\r\n" };
+    var buf: [256]u8 = undefined;
+    switch (readResponseHeadResult(&reader, &buf)) {
+        .head => |h| try testing.expectEqual(@as(u16, 201), h.status),
+        else => return error.TestUnexpectedResult,
+    }
 }
