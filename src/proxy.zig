@@ -150,6 +150,36 @@ const UpstreamConn = struct {
     }
 };
 
+/// Reads the upstream through poll, so a deadline can end the wait (`error.Timeout`)
+/// and shutdown is noticed within a second. `deadline_ms` 0 = wait until data,
+/// close or shutdown. TLS bytes BoringSSL already decrypted are read without polling.
+const UpstreamReader = struct {
+    conn: UpstreamConn,
+    deadline_ms: i64 = 0,
+
+    pub fn read(self: UpstreamReader, buf: []u8) !usize {
+        const pending = if (self.conn.ssl_conn) |s| ssl_c.SSL_pending(s) > 0 else false;
+        if (!pending) {
+            var fds = [1]compat.pollfd{.{ .fd = self.conn.sock.handle, .events = compat.POLL.IN, .revents = 0 }};
+            const wait_ms: u32 = if (self.deadline_ms == 0) std.math.maxInt(u32) else blk: {
+                const left = self.deadline_ms - rt.milliTimestamp();
+                break :blk if (left > 0) @intCast(left) else 0;
+            };
+            switch (compat.pollWhileRunning(&fds, wait_ms, shutdown.isRunning)) {
+                .ready => {},
+                .timeout => return error.Timeout,
+                .stopped, .failed => return error.Closed,
+            }
+        }
+        return self.conn.read(buf);
+    }
+};
+
+/// Absolute deadline `timeout_s` from now; 0 = none.
+fn deadlineAfter(timeout_s: u32) i64 {
+    return if (timeout_s == 0) 0 else rt.milliTimestamp() + @as(i64, timeout_s) * 1000;
+}
+
 /// Root bundles tried after BoringSSL's defaults (`/etc/ssl/cert.pem`, `/etc/ssl/certs`,
 /// `SSL_CERT_FILE`/`SSL_CERT_DIR`). The first that loads wins.
 const root_bundles = [_][:0]const u8{
@@ -639,7 +669,7 @@ fn handleConnection(
                         discardPendingInput(ssl, client_sock);
                         return;
                     },
-                    .ended => return, // client gone mid-body
+                    .ended, .timed_out => return, // client gone mid-body
                     .too_large => fits = false,
                     .complete => {
                         entry.req_body_len = @intCast(dec.captured);
@@ -786,7 +816,19 @@ fn handleConnection(
 
         // Read and parse the upstream response head
         var resp_buf: [16384]u8 = undefined;
-        const head = http_wire.readResponseHead(upstream, &resp_buf) orelse return;
+        const head_src = UpstreamReader{ .conn = upstream, .deadline_ms = deadlineAfter(config.upstream_timeout_s) };
+        const head = switch (http_wire.readResponseHeadResult(head_src, &resp_buf)) {
+            .head => |h| h,
+            .closed => {
+                failRequest(ssl, &entry, held, 502, "upstream closed before responding");
+                return;
+            },
+            .timeout => {
+                var rb: [48]u8 = undefined;
+                failRequest(ssl, &entry, held, 504, std.fmt.bufPrint(&rb, "no response within {d}s", .{config.upstream_timeout_s}) catch "no response in time");
+                return;
+            },
+        };
         entry.status = head.status;
 
         // Capture response headers
@@ -823,21 +865,23 @@ fn handleConnection(
         if (intercept.shouldInterceptResponse(method, uri)) resp_hold: {
             // Hold only a response whose capture is complete; else relay it unheld.
             var fits = !entry.resp_headers_truncated;
+            // The probe gives up at --timeout; what it read so far is relayed unheld.
+            const probe_src = UpstreamReader{ .conn = upstream, .deadline_ms = deadlineAfter(config.upstream_timeout_s) };
             if (fits and has_body) {
                 if (is_chunked or resp_content_length == null) {
                     const raw = std.heap.page_allocator.alloc(u8, probe_cap) catch break :resp_hold;
                     resp_probe_buf = raw;
                     if (is_chunked) {
-                        const p = probeChunked(&resp_dec, head.initial_body, upstream, &entry.resp_body, raw);
+                        const p = probeChunked(&resp_dec, head.initial_body, probe_src, &entry.resp_body, raw);
                         if (p.outcome == .complete) {
                             entry.resp_body_len = @intCast(resp_dec.captured);
                             entry.resp_body_total = resp_dec.decoded_total;
-                        } else if (p.outcome == .too_large) {
+                        } else if (p.outcome == .too_large or p.outcome == .timed_out) {
                             fits = false;
                             prefetched = p.raw;
                         } else return; // bad framing or upstream gone before the end
                     } else {
-                        const p = probeUntilClose(head.initial_body, upstream, raw[0 .. requests.max_body_len + 1]);
+                        const p = probeUntilClose(head.initial_body, probe_src, raw[0 .. requests.max_body_len + 1]);
                         if (p.complete) {
                             @memcpy(entry.resp_body[0..p.raw.len], p.raw);
                             entry.resp_body_len = @intCast(p.raw.len);
@@ -848,9 +892,14 @@ fn handleConnection(
                         }
                     }
                 } else if (resp_content_length.? <= requests.max_body_len) {
-                    const br = http_wire.streamBody(head.initial_body, upstream, http_wire.NullSink{}, resp_content_length, &entry.resp_body);
+                    const br = http_wire.streamBody(head.initial_body, probe_src, http_wire.NullSink{}, resp_content_length, &entry.resp_body);
                     entry.resp_body_len = @intCast(br.captured);
                     entry.resp_body_total = br.total;
+                    if (br.total < resp_content_length.?) {
+                        // Timed out (or closed) short: the bytes read sit in the capture.
+                        fits = false;
+                        prefetched = entry.resp_body[0..br.captured];
+                    }
                 } else {
                     fits = false;
                 }
@@ -921,7 +970,7 @@ fn handleConnection(
             continue;
         }
 
-        relayResponse(ssl, head, upstream, &entry, relay_ctx, &resp_dec, prefetched);
+        relayResponse(ssl, head, UpstreamReader{ .conn = upstream }, &entry, relay_ctx, &resp_dec, prefetched);
 
         const elapsed = rt.milliTimestamp() - start_time;
         entry.duration_ms = if (elapsed > 0) @intCast(elapsed) else 0;
@@ -1080,7 +1129,7 @@ const RelayCtx = struct {
 /// body, capturing up to max_body_len into `entry`. `prefetched` holds body bytes an
 /// intercept probe already read (relayed first); for chunked bodies `dec` carries
 /// the probe's decoder state, else it is fresh.
-fn relayResponse(ssl: *ssl_c.SSL, head: http_wire.ResponseHead, upstream: UpstreamConn, entry: *requests.Entry, ctx: RelayCtx, dec: *http_wire.ChunkedDecoder, prefetched: []const u8) void {
+fn relayResponse(ssl: *ssl_c.SSL, head: http_wire.ResponseHead, upstream: UpstreamReader, entry: *requests.Entry, ctx: RelayCtx, dec: *http_wire.ChunkedDecoder, prefetched: []const u8) void {
     const sink = SslSink{ .ssl = ssl };
     sslWriteAll(ssl, head.status_line);
     http_wire.forwardHeaders(head.headers, sink, .{
@@ -1102,6 +1151,14 @@ fn relayResponse(ssl: *ssl_c.SSL, head: http_wire.ResponseHead, upstream: Upstre
         entry.resp_body_len = @intCast(pr.captured);
         entry.resp_body_truncated = pr.truncated;
         entry.resp_body_total = dec.decoded_total;
+    } else if (prefetched.len > 0 and ctx.content_length != null) {
+        // Content-Length body whose intercept fit read timed out: its first bytes
+        // are already in the capture; relay them, then stream the rest.
+        sink.write(prefetched);
+        const br = http_wire.streamBody("", upstream, sink, ctx.content_length.? - prefetched.len, entry.resp_body[prefetched.len..]);
+        entry.resp_body_len = @intCast(prefetched.len + br.captured);
+        entry.resp_body_truncated = br.truncated;
+        entry.resp_body_total = prefetched.len + br.total;
     } else if (prefetched.len > 0) {
         // Read-to-close body the probe outgrew: relay it, capture its head, stream the rest.
         sink.write(prefetched);
@@ -1125,7 +1182,11 @@ fn probeUntilClose(initial: []const u8, src: anytype, raw: []u8) struct { comple
     @memcpy(raw[0..initial.len], initial);
     var len: usize = initial.len;
     while (len < raw.len) {
-        const n = src.read(raw[len..]) catch 0;
+        // A timeout is not the end of the body: report it as not complete.
+        const n = src.read(raw[len..]) catch |e| {
+            if (http_wire.isTimeout(e)) return .{ .complete = false, .raw = raw[0..len] };
+            return .{ .complete = true, .raw = raw[0..len] };
+        };
         if (n == 0) return .{ .complete = true, .raw = raw[0..len] };
         len += n;
     }
@@ -1192,7 +1253,7 @@ fn discardPendingInput(ssl: *ssl_c.SSL, sock: compat.socket_t) void {
 const probe_cap = 4 * requests.max_body_len;
 
 const Probe = struct {
-    outcome: enum { complete, too_large, parse_error, ended },
+    outcome: enum { complete, too_large, parse_error, ended, timed_out },
     /// The message bytes read so far, framing included — relayed first if not held.
     raw: []const u8,
     /// Bytes read past the end of the message (a pipelined request).
@@ -1211,7 +1272,10 @@ fn probeChunked(dec: *http_wire.ChunkedDecoder, initial: []const u8, src: anytyp
         if (dec.state == .parse_error) return .{ .outcome = .parse_error, .raw = raw[0..scan], .leftover = "" };
         if (dec.state == .done) return .{ .outcome = if (dec.truncated) .too_large else .complete, .raw = raw[0..scan], .leftover = raw[scan..len] };
         if (dec.truncated or len == raw.len) return .{ .outcome = .too_large, .raw = raw[0..scan], .leftover = "" };
-        const n = src.read(raw[len..]) catch 0;
+        const n = src.read(raw[len..]) catch |e| {
+            if (http_wire.isTimeout(e)) return .{ .outcome = .timed_out, .raw = raw[0..scan], .leftover = "" };
+            return .{ .outcome = .ended, .raw = raw[0..scan], .leftover = "" };
+        };
         if (n == 0) return .{ .outcome = .ended, .raw = raw[0..scan], .leftover = "" };
         len += n;
     }
@@ -2106,6 +2170,11 @@ const RecordingUpstream = struct {
     response: []const u8 = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
     /// False: hang up right after the request head, without reading the body or answering.
     read_body: bool = true,
+    /// Wait this long after reading the request before answering (sliced, ends on stop).
+    delay_ms: u32 = 0,
+    /// Written `gap_ms` after `response`: a stream that goes quiet, then continues.
+    response2: []const u8 = "",
+    gap_ms: u32 = 0,
     buf: []u8 = &.{},
     len: std.atomic.Value(usize) = .init(0),
     thread: std.Thread = undefined,
@@ -2139,8 +2208,22 @@ const RecordingUpstream = struct {
                 continue;
             }
             self.len.store(readRequest(s, self.buf), .release);
+            sleepWhileRunning(self.delay_ms);
             s.writeAll(self.response) catch {};
+            if (self.response2.len > 0) {
+                sleepWhileRunning(self.gap_ms);
+                s.writeAll(self.response2) catch {};
+            }
             compat.closeSocket(conn.sock);
+        }
+    }
+
+    fn sleepWhileRunning(ms: u32) void {
+        var left = ms;
+        while (left > 0 and isRunning()) {
+            const step = @min(left, 50);
+            rt.sleepMs(step);
+            left -= step;
         }
     }
 
@@ -2992,4 +3075,79 @@ test "held request whose upstream is down finishes with the reason" {
     try testing.expectEqual(@as(u16, 502), e.status);
     try testing.expect(!e.pinned);
     try testing.expectEqualStrings("connection refused 127.0.0.1:18351", e.getError());
+}
+
+test "no response head within --timeout answers 504" {
+    const before = freshRing();
+    var up = RecordingUpstream{ .delay_ms = 3000 };
+    try up.start(18353);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18352, 18353, .{ .upstream_timeout_s = 1 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const t0 = rt.milliTimestamp();
+    const resp = try px.roundTrip("GET /slow HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "no response within 1s", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 504 Gateway Timeout"));
+    try testing.expect(rt.milliTimestamp() - t0 < 2500);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 504), e.status);
+    try testing.expectEqualStrings("no response within 1s", e.getError());
+}
+
+test "upstream that closes without a head answers 502" {
+    const before = freshRing();
+    var up = RecordingUpstream{ .response = "" };
+    try up.start(18355);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18354, 18355);
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip("GET / HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "upstream closed before responding", &buf);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 502), e.status);
+}
+
+test "a stream quiet for longer than --timeout after its head is relayed whole" {
+    var up = RecordingUpstream{
+        .response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: a\n\n",
+        .response2 = "data: b\n\n",
+        .gap_ms = 2000,
+    };
+    try up.start(18357);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18356, 18357, .{ .upstream_timeout_s = 1 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /events HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "data: b\n\n", &buf);
+    try testing.expect(std.mem.indexOf(u8, resp, "data: a\n\ndata: b\n\n") != null);
+}
+
+test "response intercept probe that hits --timeout relays unheld" {
+    const before = freshRing();
+    intercept.enableWithPattern("resp:/probe");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+    var up = RecordingUpstream{
+        .response = "HTTP/1.1 200 OK\r\n\r\nfirst-",
+        .response2 = "second",
+        .gap_ms = 2000,
+    };
+    try up.start(18359);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18358, 18359, .{ .upstream_timeout_s = 1 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /probe HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "first-second", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expect(e.too_large_to_intercept);
 }
