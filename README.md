@@ -151,6 +151,8 @@ zlodev start --dns          start DNS server only (log mode)
 
 `SIZE` accepts suffixes: `K` (KB), `M` (MB), `G` (GB). Example: `--max-body=50M`
 
+Request bodies up to `--max-body` are forwarded in full (larger ones get `413`); the TUI keeps the first 32 KB of each body for display.
+
 By default zlodev listens on `0.0.0.0` (on macOS that is what lets it use ports 80 and 443 without sudo) but only answers connections from your own machine. Other devices on your network are refused. To let them in, use `-l` (see [Local network](#local-network-mdns)) or set the address explicitly, for example `-b=0.0.0.0`.
 
 ### Config file
@@ -285,6 +287,8 @@ Without a `req:` or `resp:` prefix, both requests and responses are intercepted.
 When a response is intercepted, the TUI shows two entries: the original request with its upstream round-trip time, and a `↳` response entry showing `RESP` in the status column with a live hold timer. Press `e` on the response entry to edit status code, headers, and body before it reaches the browser. Press `a` to accept or `d` to drop.
 
 Response entries cannot be replayed (`r`/`R`) — replay the original request above it instead, which will naturally produce a new response.
+
+Requests and responses too large to edit (URL over 512 bytes, headers over 2 KB, or body over 32 KB) pass through without being held and show `BIG` in the status column. They still reach the server and browser in full: the TUI shows the first 32 KB, marked `... truncated in view`. Replay and copy-as-curl are refused for requests whose captured copy is truncated.
 
 Pattern matching is case-insensitive. Press `i` again to disable intercept and release all held requests.
 
