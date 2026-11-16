@@ -14,6 +14,13 @@ const win32 = @import("win32.zig");
 const ssl_c = @import("ssl_c");
 
 pub const default_max_request_body: usize = 10 * 1024 * 1024; // 10MB
+pub const default_upstream_timeout_s: u32 = 30;
+
+/// `--timeout` / `timeout=` value: whole seconds, 0 (no limit) to one day.
+pub fn parseTimeoutSeconds(val: []const u8) ?u32 {
+    const n = std.fmt.parseInt(u32, val, 10) catch return null;
+    return if (n <= 86400) n else null;
+}
 
 pub const Route = struct {
     kind: enum { subdomain, path },
@@ -39,6 +46,8 @@ pub const ProxyConfig = struct {
     domain: []const u8 = "dev.lo",
     /// Skip certificate verification for external routes (`--insecure-upstream`).
     insecure_upstream: bool = false,
+    /// Upstream connect + response-head deadline in seconds (`--timeout`); 0 = none.
+    upstream_timeout_s: u32 = default_upstream_timeout_s,
 };
 
 var conn_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
@@ -442,8 +451,8 @@ fn connectUpstream(
 
     // Before the TLS handshake: an upstream that accepts TCP but never answers
     // the handshake must not pin this worker forever.
-    setSocketTimeout(upstream_sock, .recv, 30);
-    setSocketTimeout(upstream_sock, .send, 30);
+    setSocketTimeout(upstream_sock, .recv, config.upstream_timeout_s);
+    setSocketTimeout(upstream_sock, .send, config.upstream_timeout_s);
 
     // Wrap in TLS for external upstreams; plain socket for local
     var upstream_ssl_obj: ?*ssl_c.SSL = null;
@@ -2792,4 +2801,14 @@ test "upstream that hangs up mid-upload gets the client a 502 at once" {
     var buf: [4096]u8 = undefined;
     const resp = try px.roundTrip(req, "Bad Gateway", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 502"));
+}
+
+test "parseTimeoutSeconds accepts whole seconds up to a day" {
+    try testing.expectEqual(@as(?u32, 30), parseTimeoutSeconds("30"));
+    try testing.expectEqual(@as(?u32, 0), parseTimeoutSeconds("0"));
+    try testing.expectEqual(@as(?u32, 86400), parseTimeoutSeconds("86400"));
+    try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds("86401"));
+    try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds("30s"));
+    try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds(""));
+    try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds("-1"));
 }
