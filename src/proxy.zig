@@ -664,6 +664,7 @@ fn handleConnection(
                 .upstream_host = ws_target.host,
                 .client_host = host,
                 .client_ip = formatAddress(client_addr, &ws_ip_buf),
+                .client_xff = http_wire.getHeaderValue(req_hdr_section, "x-forwarded-for:") orelse "",
                 .domain = config.domain,
             }, client_ctx, conn_id, &entry);
             return;
@@ -796,6 +797,7 @@ fn handleConnection(
             .upstream_host = upstream_host,
             .client_host = host,
             .client_ip = formatAddress(client_addr, &ip_buf),
+            .client_xff = http_wire.getHeaderValue(req_hdr_section, "x-forwarded-for:") orelse "",
             .domain = config.domain,
         };
         var upstream_failed = false;
@@ -862,6 +864,10 @@ fn handleConnection(
             .head => |h| h,
             .closed => {
                 failRequest(ssl, &entry, held, 502, "upstream closed before responding");
+                return;
+            },
+            .too_large => {
+                failRequest(ssl, &entry, held, 502, "response head over 16KB");
                 return;
             },
             .timeout => {
@@ -1042,26 +1048,42 @@ const RequestForward = struct {
     upstream_host: []const u8,
     client_host: []const u8, // original Host header, preserved as X-Forwarded-Host
     client_ip: []const u8,
+    client_xff: []const u8 = "", // client's own X-Forwarded-For, extended with client_ip
     domain: []const u8,
 };
 
-/// The proxy's own headers after the forwarded block: the external Host rewrite
-/// (original Host kept as X-Forwarded-Host), X-Real-IP, X-Forwarded-Proto, no-cache.
+/// Headers zlodev writes itself (client copies dropped so they aren't doubled or
+/// spoofed), plus Accept-Encoding so upstreams answer uncompressed and the TUI
+/// shows readable bodies.
+const proxy_owned_headers = [_][]const u8{ "cache-control:", "accept-encoding:", "x-forwarded-host:", "x-forwarded-for:", "x-forwarded-proto:", "x-real-ip:" };
+
+/// The proxy's own headers after the forwarded block: the external Host rewrite,
+/// X-Forwarded-Host (original Host), X-Forwarded-For, X-Real-IP, X-Forwarded-Proto,
+/// Accept-Encoding: identity, no-cache.
 fn writeProxyHeaders(sink: anytype, ctx: RequestForward) void {
     if (ctx.is_external) {
         sink.write("Host: ");
         sink.write(ctx.upstream_host);
         sink.write("\r\n");
-        if (ctx.client_host.len > 0) {
-            sink.write("X-Forwarded-Host: ");
-            sink.write(ctx.client_host);
-            sink.write("\r\n");
-        }
     }
+    if (ctx.client_host.len > 0) {
+        sink.write("X-Forwarded-Host: ");
+        sink.write(ctx.client_host);
+        sink.write("\r\n");
+    }
+    sink.write("X-Forwarded-For: ");
+    if (ctx.client_xff.len > 0) {
+        sink.write(ctx.client_xff);
+        sink.write(", ");
+    }
+    sink.write(ctx.client_ip);
+    sink.write("\r\n");
     sink.write("X-Real-IP: ");
     sink.write(ctx.client_ip);
     sink.write("\r\n");
     sink.write("X-Forwarded-Proto: https\r\n");
+    // Explicit: a request without Accept-Encoding accepts any coding (RFC 9110 12.5.3).
+    sink.write("Accept-Encoding: identity\r\n");
     sink.write("Cache-Control: no-cache\r\n");
     sink.write("Pragma: no-cache\r\n");
 }
@@ -1075,10 +1097,9 @@ fn forwardRequestHead(sink: anytype, method: []const u8, uri: []const u8, header
     sink.write(" ");
     sink.write(uri);
     sink.write(" HTTP/1.1\r\n");
-    var skip_buf: [3][]const u8 = undefined;
-    var n: usize = 0;
-    skip_buf[n] = "cache-control:";
-    n += 1;
+    var skip_buf: [proxy_owned_headers.len + 2][]const u8 = undefined;
+    @memcpy(skip_buf[0..proxy_owned_headers.len], &proxy_owned_headers);
+    var n: usize = proxy_owned_headers.len;
     if (chunked) {
         skip_buf[n] = "content-length:";
         n += 1;
@@ -1103,11 +1124,16 @@ fn forwardRequest(sink: anytype, e: *const requests.Entry, ctx: RequestForward) 
     sink.write(" HTTP/1.1\r\n");
     const headers = e.getReqHeaders();
     if (headers.len > 0) {
-        const skip: []const []const u8 = if (ctx.is_external)
-            &.{ "cache-control:", "content-length:", "transfer-encoding:", "host:" }
-        else
-            &.{ "cache-control:", "content-length:", "transfer-encoding:" };
-        http_wire.forwardHeaders(headers, sink, .{ .skip = skip }, ctx.domain);
+        const framing = [_][]const u8{ "content-length:", "transfer-encoding:" };
+        var skip_buf: [proxy_owned_headers.len + framing.len + 1][]const u8 = undefined;
+        @memcpy(skip_buf[0..proxy_owned_headers.len], &proxy_owned_headers);
+        @memcpy(skip_buf[proxy_owned_headers.len..][0..framing.len], &framing);
+        var n: usize = proxy_owned_headers.len + framing.len;
+        if (ctx.is_external) {
+            skip_buf[n] = "host:";
+            n += 1;
+        }
+        http_wire.forwardHeaders(headers, sink, .{ .skip = skip_buf[0..n] }, ctx.domain);
     }
     writeProxyHeaders(sink, ctx);
     const body = e.getReqBody();
@@ -1844,7 +1870,8 @@ test "forwardRequest emits a local request, dropping cache-control and content-l
     try testing.expectEqualStrings(
         "GET /api/x HTTP/1.1\r\n" ++
             "Host: dev.lo\r\nAccept: */*\r\n" ++
-            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
+            "X-Forwarded-Host: dev.lo\r\nX-Forwarded-For: 10.0.0.1\r\n" ++
+            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nAccept-Encoding: identity\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
             "Content-Length: 0\r\n\r\n",
         out[0..len],
     );
@@ -1863,11 +1890,35 @@ test "forwardRequest rewrites Host and adds X-Forwarded-Host for external routes
     });
     try testing.expectEqualStrings(
         "POST /login HTTP/1.1\r\n" ++
-            "Host: staging.example.com\r\nX-Forwarded-Host: dev.lo\r\n" ++
-            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
+            "Host: staging.example.com\r\nX-Forwarded-Host: dev.lo\r\nX-Forwarded-For: 10.0.0.1\r\n" ++
+            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nAccept-Encoding: identity\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
             "Content-Length: 2\r\n\r\nhi",
         out[0..len],
     );
+}
+
+test "forwardRequest appends to the client's X-Forwarded-For and drops client proxy headers" {
+    const e = buildEntry("GET", "/x", "Host: dev.lo\r\nX-Forwarded-For: 1.2.3.4\r\nX-Real-IP: 6.6.6.6\r\nX-Forwarded-Proto: http\r\nX-Forwarded-Host: evil\r\nAccept-Encoding: gzip, br\r\n", "");
+    var out: [512]u8 = undefined;
+    var len: usize = 0;
+    forwardRequest(TestSink{ .buf = &out, .len = &len }, &e, .{
+        .is_external = false,
+        .upstream_host = "127.0.0.1",
+        .client_host = "dev.lo",
+        .client_ip = "10.0.0.1",
+        .client_xff = "1.2.3.4",
+        .domain = "dev.lo",
+    });
+    const got = out[0..len];
+    try testing.expect(std.mem.indexOf(u8, got, "X-Forwarded-For: 1.2.3.4, 10.0.0.1\r\n") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "X-Forwarded-For:"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "X-Real-IP:"));
+    try testing.expect(std.mem.indexOf(u8, got, "X-Real-IP: 10.0.0.1\r\n") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "X-Forwarded-Proto:"));
+    try testing.expect(std.mem.indexOf(u8, got, "X-Forwarded-Host: dev.lo\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "evil") == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Accept-Encoding"));
+    try testing.expect(std.mem.indexOf(u8, got, "Accept-Encoding: identity\r\n") != null);
 }
 
 test "forwardRequest recomputes Content-Length from the body, ignoring the original" {
@@ -2673,7 +2724,42 @@ test "WebSocket upgrade on a local route gets X-Real-IP and X-Forwarded-Proto" {
     try testing.expect(std.mem.indexOf(u8, got, "\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Real-IP: 127.0.0.1\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-Proto: https\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-Host: dev.lo\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\n"));
+}
+
+test "upstream gets no Accept-Encoding and the forwarding headers on a local route" {
+    var up = RecordingUpstream{};
+    try up.start(18373);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18372, 18373);
+    defer px.stop();
+    var buf: [4096]u8 = undefined;
+    _ = try px.roundTrip("GET /a HTTP/1.1\r\nHost: dev.lo\r\nAccept-Encoding: gzip, deflate, br\r\nX-Forwarded-For: 9.9.9.9\r\n\r\n", "ok", &buf);
+    const got = up.received();
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nAccept-Encoding: identity\r\n") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Accept-Encoding"));
+    try testing.expect(std.mem.indexOf(u8, got, "gzip") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-Host: dev.lo\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-For: 9.9.9.9, 127.0.0.1\r\n") != null);
+}
+
+test "response head over 16KB answers 502 with the reason" {
+    var up = RecordingUpstream{ .response = "HTTP/1.1 200 OK\r\nX-Big: " ++ rep("a", 17000) ++ "\r\n\r\nok" };
+    try up.start(18371);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18370, 18371);
+    defer px.stop();
+    const before = freshRing();
+    var buf: [4096]u8 = undefined;
+    const resp = try px.roundTrip("GET /big HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "response head over 16KB", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 502"));
+    const e = try testing.allocator.create(requests.Entry);
+    defer testing.allocator.destroy(e);
+    try waitNewestEntry(before, e);
+    try testing.expectEqualStrings("response head over 16KB", e.getError());
 }
 
 test "chunked upload arriving in two writes is relayed whole and the next request still answers" {

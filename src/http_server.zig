@@ -140,6 +140,8 @@ fn handleRequest(stream: compat.SocketStream, domain: []const u8, ca_pem_path: [
     var parts = std.mem.splitScalar(u8, request_line, ' ');
     const method = parts.next() orelse return;
     const path = parts.next() orelse return;
+    const head_end = std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") orelse total;
+    const req_headers = if (first_line_end + 2 <= head_end) buf[first_line_end + 2 .. head_end] else buf[0..0];
 
     log.info("component=http method={s} uri={s}", .{ method, path });
 
@@ -175,7 +177,7 @@ fn handleRequest(stream: compat.SocketStream, domain: []const u8, ca_pem_path: [
                 "Content-Type: text/plain; charset=utf-8\r\n" ++
                 "Location: https://{s}{s}\r\n" ++
                 "Content-Length: 0\r\n" ++
-                "\r\n", .{ domain, path }) catch return;
+                "\r\n", .{ redirectHost(http_wire.getHeaderValue(req_headers, "host:"), domain), path }) catch return;
         stream.writeAll(response) catch return;
     }
 }
@@ -311,6 +313,27 @@ fn sendError(stream: compat.SocketStream, status: []const u8) void {
     stream.writeAll(response) catch {};
 }
 
+/// Host for the HTTPS redirect: the request's Host (without port) when it is the
+/// zlodev domain or a subdomain of it, else the domain. Never an outside site.
+fn redirectHost(host_header: ?[]const u8, domain: []const u8) []const u8 {
+    const raw = host_header orelse return domain;
+    const host = if (std.mem.indexOfScalar(u8, raw, ':')) |c| raw[0..c] else raw;
+    return if (http_wire.sameSiteHost(host, domain)) host else domain;
+}
+
 test "http_server compiles on every target" {
     std.testing.refAllDecls(@This());
+}
+
+test "redirectHost keeps a subdomain and strips the port" {
+    try std.testing.expectEqualStrings("api.dev.lo", redirectHost("api.dev.lo", "dev.lo"));
+    try std.testing.expectEqualStrings("API.DEV.LO", redirectHost("API.DEV.LO:80", "dev.lo"));
+    try std.testing.expectEqualStrings("dev.lo", redirectHost("dev.lo:80", "dev.lo"));
+}
+
+test "redirectHost falls back to the domain for other or missing hosts" {
+    try std.testing.expectEqualStrings("dev.lo", redirectHost("evil.com", "dev.lo"));
+    try std.testing.expectEqualStrings("dev.lo", redirectHost("dev.lo.evil.com", "dev.lo"));
+    try std.testing.expectEqualStrings("dev.lo", redirectHost(null, "dev.lo"));
+    try std.testing.expectEqualStrings("dev.lo", redirectHost("", "dev.lo"));
 }
