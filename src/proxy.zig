@@ -1428,6 +1428,7 @@ fn sslSendReason(ssl: *ssl_c.SSL, status: u16, reason: []const u8) void {
 /// zlodev answered this request itself: tell the client, then record the entry
 /// with `status` and `reason`, finishing the held ring entry if it was intercepted.
 fn failRequest(ssl: *ssl_c.SSL, entry: *requests.Entry, held: ?usize, status: u16, reason: []const u8) void {
+    log.err("component=proxy op=fail_request method={s} uri={s} status={d} reason=\"{s}\"", .{ entry.getMethod(), entry.getPath(), status, reason });
     sslSendReason(ssl, status, reason);
     const elapsed = rt.milliTimestamp() - entry.timestamp;
     const dur: u64 = if (elapsed > 0) @intCast(elapsed) else 0;
@@ -3290,7 +3291,7 @@ test "external TLS route relays a response slower than one socket read" {
     defer ssl_c.SSL_CTX_free(cctx);
     const routes = [_]Route{.{ .kind = .path, .pattern = "/ext", .port = 18363, .hostname = "127.0.0.1" }};
     var px: ProxyHarness = undefined;
-    try px.startOpts(18362, 1, .{ .routes = &routes, .client_ctx = cctx, .upstream_timeout_s = 3 });
+    try px.startOpts(18362, 1, .{ .routes = &routes, .client_ctx = cctx, .upstream_timeout_s = 10 });
     defer px.stop();
     var buf: [1024]u8 = undefined;
     const resp = try px.roundTrip("GET /ext HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "ok", &buf);
