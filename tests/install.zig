@@ -94,6 +94,23 @@ fn verifyCertDirRemoved(domain: []const u8) !void {
     try testing.expect(!fileExists(cert_dir));
 }
 
+const linux_anchor_dirs = [_]struct { dir: []const u8, ext: []const u8 }{
+    .{ .dir = "/etc/pki/ca-trust/source/anchors", .ext = "pem" },
+    .{ .dir = "/usr/local/share/ca-certificates", .ext = "crt" },
+    .{ .dir = "/etc/ca-certificates/trust-source/anchors", .ext = "crt" },
+    .{ .dir = "/usr/share/pki/trust/anchors", .ext = "pem" },
+};
+
+/// True when the per-domain system trust anchor exists in any distro's anchor dir.
+fn anchorExists(domain: []const u8) bool {
+    for (linux_anchor_dirs) |a| {
+        var buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/zlodevCA-{s}.{s}", .{ a.dir, domain, a.ext }) catch continue;
+        if (fileExists(path)) return true;
+    }
+    return false;
+}
+
 // --- Default mode (dev.lo) ---
 
 test "install and verify" {
@@ -110,11 +127,7 @@ test "install and verify" {
         .linux => {
             try testing.expect(fileExists("/etc/systemd/network/zlodev0.network"));
             try testing.expect(fileExists("/etc/systemd/network/zlodev0.netdev"));
-            const found = fileExists("/usr/local/share/ca-certificates/zlodevCA.crt") or
-                fileExists("/etc/pki/ca-trust/source/anchors/zlodevCA.pem") or
-                fileExists("/etc/ca-certificates/trust-source/anchors/zlodevCA.crt") or
-                fileExists("/usr/share/pki/trust/anchors/zlodevCA.pem");
-            try testing.expect(found);
+            try testing.expect(anchorExists("dev.lo"));
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (!(Get-DnsClientNrptRule | Where { $_.Namespace -eq '.lo' })) { exit 1 }" });
@@ -142,11 +155,7 @@ test "uninstall and verify" {
         .linux => {
             try testing.expect(!fileExists("/etc/systemd/network/zlodev0.network"));
             try testing.expect(!fileExists("/etc/systemd/network/zlodev0.netdev"));
-            const found = fileExists("/usr/local/share/ca-certificates/zlodevCA.crt") or
-                fileExists("/etc/pki/ca-trust/source/anchors/zlodevCA.pem") or
-                fileExists("/etc/ca-certificates/trust-source/anchors/zlodevCA.crt") or
-                fileExists("/usr/share/pki/trust/anchors/zlodevCA.pem");
-            try testing.expect(!found);
+            try testing.expect(!anchorExists("dev.lo"));
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (Get-DnsClientNrptRule | Where { $_.Namespace -eq '.lo' }) { exit 1 }" });
@@ -187,11 +196,7 @@ test "install --local and verify" {
             try runCmdExpectSuccess(&.{ "security", "find-certificate", "-c", cn, "/Library/Keychains/System.keychain" });
         },
         .linux => {
-            const found = fileExists("/usr/local/share/ca-certificates/zlodevCA.crt") or
-                fileExists("/etc/pki/ca-trust/source/anchors/zlodevCA.pem") or
-                fileExists("/etc/ca-certificates/trust-source/anchors/zlodevCA.crt") or
-                fileExists("/usr/share/pki/trust/anchors/zlodevCA.pem");
-            try testing.expect(found);
+            try testing.expect(anchorExists(domain));
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", cn });
@@ -228,11 +233,7 @@ test "uninstall --local and verify" {
             try testing.expect(!std.meta.eql(term, std.process.Child.Term{ .exited = 0 }));
         },
         .linux => {
-            const found = fileExists("/usr/local/share/ca-certificates/zlodevCA.crt") or
-                fileExists("/etc/pki/ca-trust/source/anchors/zlodevCA.pem") or
-                fileExists("/etc/ca-certificates/trust-source/anchors/zlodevCA.crt") or
-                fileExists("/usr/share/pki/trust/anchors/zlodevCA.pem");
-            try testing.expect(!found);
+            try testing.expect(!anchorExists(domain));
         },
         .windows => {
             const term_wl = try runCmd(&.{ "certutil", "-verifystore", "Root", cn });

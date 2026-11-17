@@ -438,6 +438,28 @@ fn makePrivateDir(path: []const u8) !void {
     if (builtin.os.tag != .windows) try cwd.setFilePermissions(rt.io(), path, .fromMode(0o700), .{});
 }
 
+const AnchorStore = struct { dir: []const u8, ext: []const u8, refresh: []const []const u8 };
+
+/// System trust-anchor dirs, first existing one wins: Fedora/RHEL, Debian/Ubuntu, Arch, openSUSE.
+const linux_anchor_stores = [_]AnchorStore{
+    .{ .dir = "/etc/pki/ca-trust/source/anchors", .ext = "pem", .refresh = &.{ "sudo", "update-ca-trust", "extract" } },
+    .{ .dir = "/usr/local/share/ca-certificates", .ext = "crt", .refresh = &.{ "sudo", "update-ca-certificates" } },
+    .{ .dir = "/etc/ca-certificates/trust-source/anchors", .ext = "crt", .refresh = &.{ "sudo", "trust", "extract-compat" } },
+    .{ .dir = "/usr/share/pki/trust/anchors", .ext = "pem", .refresh = &.{ "sudo", "update-ca-certificates" } },
+};
+
+fn linuxAnchorStore() ?AnchorStore {
+    for (linux_anchor_stores) |store| {
+        if (sys.dirExists(store.dir)) return store;
+    }
+    return null;
+}
+
+fn anchorPath(buf: []u8, store: AnchorStore, domain: []const u8) ![]const u8 {
+    var name_buf: [256]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ store.dir, try anchorFileName(&name_buf, domain, store.ext) });
+}
+
 pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cert_dir = try getCertPath(&path_buf, domain);
@@ -464,18 +486,10 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         },
         .linux => {
             std.debug.print("installing CA and generating certificate, please provide sudo password when asked\n", .{});
-            if (sys.dirExists("/etc/pki/ca-trust/source/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, "/etc/pki/ca-trust/source/anchors/zlodevCA.pem" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-trust", "extract" });
-            } else if (sys.dirExists("/usr/local/share/ca-certificates")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, "/usr/local/share/ca-certificates/zlodevCA.crt" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-certificates" });
-            } else if (sys.dirExists("/etc/ca-certificates/trust-source/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, "/etc/ca-certificates/trust-source/anchors/zlodevCA.crt" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "trust", "extract-compat" });
-            } else if (sys.dirExists("/usr/share/pki/trust/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, "/usr/share/pki/trust/anchors/zlodevCA.pem" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-certificates" });
+            if (linuxAnchorStore()) |store| {
+                var anchor_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, try anchorPath(&anchor_buf, store, domain) });
+                try sys.sudoCmd(allocator, store.refresh);
             }
         },
         .windows => {
@@ -500,6 +514,8 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         std.debug.print("no certificates found for {s}\n", .{domain});
         return;
     }
+    var ca_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const ca_path = try std.fmt.bufPrint(&ca_path_buf, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
 
     switch (builtin.os.tag) {
         .macos => {
@@ -508,18 +524,14 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         },
         .linux => {
             std.debug.print("uninstalling and removing CA, please provide sudo password when asked\n", .{});
-            if (sys.dirExists("/etc/pki/ca-trust/source/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/pki/ca-trust/source/anchors/zlodevCA.pem" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-trust", "extract" });
-            } else if (sys.dirExists("/usr/local/share/ca-certificates")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/usr/local/share/ca-certificates/zlodevCA.crt" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-certificates" });
-            } else if (sys.dirExists("/etc/ca-certificates/trust-source/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/ca-certificates/trust-source/anchors/zlodevCA.crt" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "trust", "extract-compat" });
-            } else if (sys.dirExists("/usr/share/pki/trust/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/usr/share/pki/trust/anchors/zlodevCA.pem" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-certificates" });
+            if (linuxAnchorStore()) |store| {
+                var anchor_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", try anchorPath(&anchor_buf, store, domain) });
+                // Older versions used one file for every domain: remove it only if it holds this CA.
+                var legacy_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const legacy = try std.fmt.bufPrint(&legacy_buf, "{s}/zlodevCA.{s}", .{ store.dir, store.ext });
+                if (sameFileContents(allocator, legacy, ca_path)) try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", legacy });
+                try sys.sudoCmd(allocator, store.refresh);
             }
         },
         .windows => {
