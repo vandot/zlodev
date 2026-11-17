@@ -373,7 +373,7 @@ const EditState = struct {
     }
 };
 
-pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, routes: []const proxy.Route, has_command: bool, cert_warning: ?[]const u8) !void {
+pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, routes: []const proxy.Route, has_command: bool, cert_warning: ?[]const u8, version: []const u8) !void {
     const proxy_text = try std.fmt.allocPrint(alloc, "https -> 127.0.0.1:{d}", .{target_port});
     defer alloc.free(proxy_text);
     const ca_text = try std.fmt.allocPrint(alloc, "http://{s}/ca", .{domain});
@@ -437,14 +437,19 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     var intercept_buf: [intercept.max_pattern_len]u8 = @splat(0);
     var intercept_len: usize = 0;
     var filtered_count: usize = 0;
-    // Maps filtered index -> original index in ptr_buf
+    // Maps filtered index -> index in summaries (= logical index)
     var filter_map: [requests.max_entries]usize = undefined;
     var flash_time: i64 = 0; // timestamp when flash message was set
-    var flash_buf: [64]u8 = undefined;
+    var flash_buf: [128]u8 = undefined;
     var flash_len: usize = 0;
     var har_fname_buf: [64]u8 = undefined;
 
-    var ptr_buf: [requests.max_entries]*const requests.Entry = undefined;
+    // Heap: [max_entries]Summary is ~300 KB, too big for a 1 MB main-thread stack.
+    const summaries = try std.heap.page_allocator.alloc(requests.Summary, requests.max_entries);
+    defer std.heap.page_allocator.free(summaries);
+    var summary_count: usize = 0;
+    const detail_entry = try std.heap.page_allocator.create(requests.Entry);
+    defer std.heap.page_allocator.destroy(detail_entry);
 
     while (true) {
         while (try loop.tryEvent()) |event| {
@@ -606,16 +611,12 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 flash_len = msg.len;
                                 flash_time = rt.milliTimestamp();
                             }
-                            if (key.matches('E', .{})) {
-                                var export_buf: [requests.max_entries]*const requests.Entry = undefined;
-                                const export_slice: []*const requests.Entry = &export_buf;
-                                const export_count = requests.getRange(export_slice, 0, requests.max_entries);
-                                if (har.exportHar(export_slice, export_count, domain, &har_fname_buf)) |fname_len| {
-                                    const prefix = "Exported ";
-                                    @memcpy(flash_buf[0..prefix.len], prefix);
-                                    const nlen = @min(fname_len, flash_buf.len - prefix.len);
-                                    @memcpy(flash_buf[prefix.len..][0..nlen], har_fname_buf[0..nlen]);
-                                    flash_len = prefix.len + nlen;
+                            if (key.matches('E', .{}) or key.matches('e', .{ .ctrl = true })) {
+                                const redact = key.matches('E', .{});
+                                if (har.exportHar(version, domain, redact, &har_fname_buf)) |fname_len| {
+                                    const note = if (redact) " (cookies and auth redacted; Ctrl+E for full)" else " (full, includes cookies and auth)";
+                                    const flash = std.fmt.bufPrint(&flash_buf, "Exported {s}{s}", .{ har_fname_buf[0..fname_len], note }) catch flash_buf[0..0];
+                                    flash_len = flash.len;
                                 } else {
                                     const msg = "Export failed";
                                     @memcpy(flash_buf[0..msg.len], msg);
@@ -626,12 +627,12 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             if (key.matches('r', .{}) and filtered_count > 0) {
                                 if (edit_state.openForReplay(alloc, filter_map[cursor])) {
                                     view = .edit;
-                                } else if (requests.getOne(filter_map[cursor])) |re| if (re.requestTruncated()) {
+                                } else if (filter_map[cursor] < summary_count and summaries[filter_map[cursor]].request_truncated) {
                                     const msg = "Request too large to replay: captured copy is truncated";
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
                                     flash_time = rt.milliTimestamp();
-                                };
+                                }
                             }
                             if (key.matches('R', .{})) {
                                 if (focus == .logs and logs_visible and has_command) {
@@ -696,12 +697,12 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             } else if (key.matches('r', .{})) {
                                 if (edit_state.openForReplay(alloc, detail_index)) {
                                     view = .edit;
-                                } else if (requests.getOne(detail_index)) |re| if (re.requestTruncated()) {
+                                } else if (detail_index < summary_count and summaries[detail_index].request_truncated) {
                                     const msg = "Request too large to replay: captured copy is truncated";
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
                                     flash_time = rt.milliTimestamp();
-                                };
+                                }
                             } else if (key.matches('R', .{})) {
                                 const msg: []const u8 = if (replayEntry(detail_index)) "Replayed!" else "Request too large to replay: captured copy is truncated";
                                 @memcpy(flash_buf[0..msg.len], msg);
@@ -779,13 +780,13 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
         win.clear();
 
         // Build filter map (used by both views)
-        const buf_slice: []*const requests.Entry = &ptr_buf;
-        const raw_count = requests.getRange(buf_slice, 0, current_count);
+        summary_count = requests.getSummaries(summaries);
+        const raw_count = summary_count;
         const search_term = search_buf[0..search_len];
         filtered_count = 0;
         if (search_len > 0) {
             for (0..raw_count) |i| {
-                if (search.entryMatchesSearch(buf_slice[i], search_term)) {
+                if (search.entryMatchesSearch(&summaries[i], search_term)) {
                     filter_map[filtered_count] = i;
                     filtered_count += 1;
                 }
@@ -840,7 +841,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                         scroll_offset = cursor - req_h + 1;
                     }
                     // Pass req_win with start_row=0 (drawing relative to the child window), draw_footer=false
-                    drawRequests(req_win, buf_slice, &filter_map, filtered_count, 0, scroll_offset, cursor, req_autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len], false, has_command);
+                    drawRequests(req_win, summaries[0..summary_count], &filter_map, filtered_count, 0, scroll_offset, cursor, req_autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len], false, has_command);
 
                     // Logs border + pane
                     const logs_border_y = req_start + req_h;
@@ -867,7 +868,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                     } else if (cursor >= scroll_offset + available_rows) {
                         scroll_offset = cursor - available_rows + 1;
                     }
-                    drawRequests(win, buf_slice, &filter_map, filtered_count, header_rows, scroll_offset, cursor, req_autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len], true, has_command);
+                    drawRequests(win, summaries[0..summary_count], &filter_map, filtered_count, header_rows, scroll_offset, cursor, req_autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len], true, has_command);
                 }
             },
             .detail => {
@@ -875,7 +876,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                 if (filtered_count > 0) {
                     detail_index = filter_map[cursor];
                 }
-                const entry = if (filtered_count > 0) requests.getOne(detail_index) else null;
+                const entry: ?*const requests.Entry = if (filtered_count > 0 and requests.copyEntry(detail_index, detail_entry)) detail_entry else null;
                 drawDetail(alloc, win, entry, detail_index, raw_count, req_autoscroll, &detail_scroll, show_help, show_body);
             },
             .edit => {
@@ -1016,7 +1017,7 @@ fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_
 
 fn drawRequests(
     win: vaxis.Window,
-    ptr_buf: []*const requests.Entry,
+    rows: []const requests.Summary,
     filter_map: []const usize,
     filtered_count: usize,
     start_row: u16,
@@ -1051,7 +1052,7 @@ fn drawRequests(
     for (0..visible) |i| {
         const idx = scroll_offset + i;
         if (idx >= filtered_count) break;
-        const entry = ptr_buf[filter_map[idx]];
+        const entry = &rows[filter_map[idx]];
         const row = start_row + @as(u16, @intCast(i));
         if (row >= win.height -| 1) break;
 
@@ -1082,7 +1083,7 @@ fn drawRequests(
     }
 }
 
-fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Entry, selected: bool) void {
+fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Summary, selected: bool) void {
     const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
     const bg: vaxis.Color = if (selected) .{ .rgb = .{ 0x1c, 0x2b, 0x3a } } else .default;
 
@@ -1607,7 +1608,8 @@ fn drawHelpOverlay(win: vaxis.Window, ctx: HelpContext) void {
         .{ .key = "e", .desc = "edit request / response" },
         .{ .key = "r", .desc = "edit & replay" },
         .{ .key = "R", .desc = "replay / restart (focus)" },
-        .{ .key = "E", .desc = "export HAR" },
+        .{ .key = "E", .desc = "export HAR (secrets redacted)" },
+        .{ .key = "Ctrl+E", .desc = "export HAR (full)" },
         .{ .key = "?", .desc = "close help" },
     };
 

@@ -577,7 +577,7 @@ fn doStart(
         }
     } else {
         // Run TUI on main thread (blocks until user quits)
-        tui.run(allocator, full_domain, target_port, routes, command != null, cert_warning) catch |e| {
+        tui.run(allocator, full_domain, target_port, routes, command != null, cert_warning, version) catch |e| {
             log.unmute();
             log.err("component=tui op=start error={any}", .{e});
         };

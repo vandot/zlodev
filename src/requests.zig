@@ -105,6 +105,56 @@ pub const Entry = struct {
     }
 };
 
+/// The fields the request list and search read, copied out under the lock so the
+/// TUI never reads a ring slot a worker is overwriting (~600 bytes vs ~69 KB).
+pub const Summary = struct {
+    method: [16]u8 = @splat(0),
+    method_len: u8 = 0,
+    path: [512]u8 = @splat(0),
+    path_len: u16 = 0,
+    status: u16 = 0,
+    duration_ms: u64 = 0,
+    timestamp: i64 = 0,
+    state: EntryState = .normal,
+    starred: bool = false,
+    resp_intercepted: bool = false,
+    too_large_to_intercept: bool = false,
+    error_len: u8 = 0,
+    route_index: u8 = 0xff,
+    resp_body_total: u64 = 0,
+    resp_body_len: u32 = 0,
+    request_truncated: bool = false,
+
+    pub fn getMethod(self: *const Summary) []const u8 {
+        return self.method[0..self.method_len];
+    }
+
+    pub fn getPath(self: *const Summary) []const u8 {
+        return self.path[0..self.path_len];
+    }
+
+    pub fn of(e: *const Entry) Summary {
+        return .{
+            .method = e.method,
+            .method_len = e.method_len,
+            .path = e.path,
+            .path_len = e.path_len,
+            .status = e.status,
+            .duration_ms = e.duration_ms,
+            .timestamp = e.timestamp,
+            .state = e.state,
+            .starred = e.starred,
+            .resp_intercepted = e.resp_intercepted,
+            .too_large_to_intercept = e.too_large_to_intercept,
+            .error_len = e.error_len,
+            .route_index = e.route_index,
+            .resp_body_total = e.resp_body_total,
+            .resp_body_len = e.resp_body_len,
+            .request_truncated = e.requestTruncated(),
+        };
+    }
+};
+
 var mutex: std.Io.Mutex = .init;
 var entries: [max_entries]*Entry = undefined;
 var entries_backing: [max_entries]Entry = @splat(Entry{});
@@ -441,44 +491,23 @@ pub fn logicalToBackingIndex(logical: usize) ?usize {
     return null;
 }
 
-/// Get a range of non-deleted entries for display. Returns count written.
-pub fn getRange(buf: []*const Entry, offset: usize, limit: usize) usize {
+/// Copy summaries of the non-deleted entries, oldest first, under the mutex.
+/// Returns how many were written (at most `buf.len`).
+pub fn getSummaries(buf: []Summary) usize {
     mutex.lockUncancelable(rt.io());
     defer mutex.unlock(rt.io());
     ensureInit();
     if (count == 0) return 0;
     const ring_start = if (count >= max_entries) write_pos else 0;
     var written: usize = 0;
-    var skipped: usize = 0;
     for (0..count) |i| {
+        if (written >= buf.len) break;
         const idx = (ring_start + i) % max_entries;
         if (entries_backing[idx].state == .deleted) continue;
-        if (skipped < offset) {
-            skipped += 1;
-            continue;
-        }
-        if (written >= limit) break;
-        buf[written] = &entries_backing[idx];
+        buf[written] = Summary.of(&entries_backing[idx]);
         written += 1;
     }
     return written;
-}
-
-/// Get a single entry by logical index (0 = oldest, skipping deleted).
-pub fn getOne(index: usize) ?*const Entry {
-    mutex.lockUncancelable(rt.io());
-    defer mutex.unlock(rt.io());
-    ensureInit();
-    if (count == 0) return null;
-    const ring_start = if (count >= max_entries) write_pos else 0;
-    var seen: usize = 0;
-    for (0..count) |i| {
-        const idx = (ring_start + i) % max_entries;
-        if (entries_backing[idx].state == .deleted) continue;
-        if (seen == index) return &entries_backing[idx];
-        seen += 1;
-    }
-    return null;
 }
 
 /// Copy an entry by logical index into caller-provided storage, under the mutex.
@@ -509,6 +538,36 @@ pub fn getCount() usize {
 }
 
 // --- Unit Tests ---
+
+/// Test helper: a copy of the entry at `logical`, or null.
+fn testEntry(logical: usize) ?Entry {
+    var e: Entry = undefined;
+    return if (copyEntry(logical, &e)) e else null;
+}
+
+test "getSummaries stops at the buffer size" {
+    clearAll();
+    push(makeEntry("GET", "/a", 200));
+    push(makeEntry("GET", "/b", 200));
+    var buf: [1]Summary = undefined;
+    try testing.expectEqual(@as(usize, 1), getSummaries(&buf));
+    try testing.expectEqualStrings("/a", buf[0].getPath());
+}
+
+test "Summary.of flags truncated requests and copies list fields" {
+    var e = makeEntry("POST", "/up", 413);
+    e.req_body_truncated = true;
+    e.starred = true;
+    e.resp_body_total = 99;
+    e.setError("body over --max-body");
+    const s = Summary.of(&e);
+    try testing.expect(s.request_truncated);
+    try testing.expect(s.starred);
+    try testing.expectEqual(@as(u64, 99), s.resp_body_total);
+    try testing.expect(s.error_len > 0);
+    try testing.expectEqualStrings("POST", s.getMethod());
+    try testing.expectEqual(@as(u16, 413), s.status);
+}
 
 const testing = std.testing;
 
@@ -564,49 +623,35 @@ test "push and getCount" {
     try testing.expectEqual(@as(usize, 2), getCount());
 }
 
-test "getOne returns entries in order" {
+test "copyEntry returns entries in order" {
     clearAll();
     push(makeEntry("GET", "/first", 200));
     push(makeEntry("POST", "/second", 201));
 
-    const first = getOne(0) orelse return error.TestUnexpectedResult;
+    const first = testEntry(0) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("GET", first.getMethod());
     try testing.expectEqualStrings("/first", first.getPath());
 
-    const second = getOne(1) orelse return error.TestUnexpectedResult;
+    const second = testEntry(1) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("POST", second.getMethod());
     try testing.expectEqualStrings("/second", second.getPath());
 
     // Out of bounds
-    try testing.expect(getOne(2) == null);
+    try testing.expect(testEntry(2) == null);
 }
 
-test "getRange basic" {
+test "getSummaries basic" {
     clearAll();
     push(makeEntry("GET", "/a", 200));
     push(makeEntry("POST", "/b", 201));
     push(makeEntry("PUT", "/c", 204));
 
-    var buf: [10]*const Entry = undefined;
-    const n = getRange(&buf, 0, 10);
+    var buf: [10]Summary = undefined;
+    const n = getSummaries(&buf);
     try testing.expectEqual(@as(usize, 3), n);
     try testing.expectEqualStrings("/a", buf[0].getPath());
     try testing.expectEqualStrings("/b", buf[1].getPath());
     try testing.expectEqualStrings("/c", buf[2].getPath());
-}
-
-test "getRange with offset and limit" {
-    clearAll();
-    push(makeEntry("GET", "/a", 200));
-    push(makeEntry("POST", "/b", 201));
-    push(makeEntry("PUT", "/c", 204));
-
-    var buf: [10]*const Entry = undefined;
-
-    // offset=1, limit=1 → only /b
-    const n = getRange(&buf, 1, 1);
-    try testing.expectEqual(@as(usize, 1), n);
-    try testing.expectEqualStrings("/b", buf[0].getPath());
 }
 
 test "remove marks entry as deleted" {
@@ -620,8 +665,8 @@ test "remove marks entry as deleted" {
     remove(idx);
 
     try testing.expectEqual(@as(usize, 1), getCount());
-    // getOne(0) should now be /b (skips deleted)
-    const first = getOne(0) orelse return error.TestUnexpectedResult;
+    // testEntry(0) should now be /b (skips deleted)
+    const first = testEntry(0) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("/b", first.getPath());
 }
 
@@ -633,7 +678,7 @@ test "clearAll resets everything" {
 
     clearAll();
     try testing.expectEqual(@as(usize, 0), getCount());
-    try testing.expect(getOne(0) == null);
+    try testing.expect(testEntry(0) == null);
 }
 
 test "pushAndPin and unpin" {
@@ -678,7 +723,7 @@ test "ring buffer wraps and overwrites oldest" {
     try testing.expectEqual(@as(usize, max_entries), getCount());
 
     // Oldest should be /0
-    const oldest = getOne(0) orelse return error.TestUnexpectedResult;
+    const oldest = testEntry(0) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i64, 0), oldest.timestamp);
 
     // Push one more — should overwrite /0
@@ -689,10 +734,10 @@ test "ring buffer wraps and overwrites oldest" {
     // Count stays at max_entries
     try testing.expectEqual(@as(usize, max_entries), getCount());
     // Oldest is now /1
-    const new_oldest = getOne(0) orelse return error.TestUnexpectedResult;
+    const new_oldest = testEntry(0) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i64, 1), new_oldest.timestamp);
     // Newest is /new
-    const newest = getOne(max_entries - 1) orelse return error.TestUnexpectedResult;
+    const newest = testEntry(max_entries - 1) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i64, 9999), newest.timestamp);
 }
 
@@ -750,7 +795,7 @@ test "logicalToBackingIndex skips deleted" {
     try testing.expect(logicalToBackingIndex(2) == null);
 }
 
-test "getRange skips deleted entries" {
+test "getSummaries skips deleted entries" {
     clearAll();
     push(makeEntry("GET", "/a", 200));
     push(makeEntry("POST", "/b", 201));
@@ -760,8 +805,8 @@ test "getRange skips deleted entries" {
     const idx = logicalToBackingIndex(1) orelse return error.TestUnexpectedResult;
     remove(idx);
 
-    var buf: [10]*const Entry = undefined;
-    const n = getRange(&buf, 0, 10);
+    var buf: [10]Summary = undefined;
+    const n = getSummaries(&buf);
     try testing.expectEqual(@as(usize, 2), n);
     try testing.expectEqualStrings("/a", buf[0].getPath());
     try testing.expectEqualStrings("/c", buf[1].getPath());
@@ -784,7 +829,7 @@ test "truncation flags preserved through push" {
     e.req_body_truncated = true;
     push(e);
 
-    const stored = getOne(0) orelse return error.TestUnexpectedResult;
+    const stored = testEntry(0) orelse return error.TestUnexpectedResult;
     try testing.expect(stored.req_body_truncated);
     try testing.expect(!stored.resp_body_truncated);
 }
@@ -905,7 +950,7 @@ test "resp_intercepted flag" {
     e.resp_intercepted = true;
     push(e);
 
-    const stored = getOne(0) orelse return error.TestUnexpectedResult;
+    const stored = testEntry(0) orelse return error.TestUnexpectedResult;
     try testing.expect(stored.resp_intercepted);
 }
 
