@@ -20,7 +20,7 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 - **Request/response interception** — hold, inspect, edit, accept, or drop requests and responses with optional pattern matching
 - **Request replay** — re-send any completed request
 - **Copy as curl** — copy any request as a `curl` command
-- **HAR export** — export captured traffic as HTTP Archive files
+- **HAR export** — export captured traffic as HTTP Archive files, with cookies and auth headers redacted by default
 - **Request starring** — star important requests so they survive ring buffer overflow
 - **Search/filter** — filter requests by path, method, or status code
 - **WebSocket passthrough** — `wss://dev.lo` upgrades are proxied to your dev server, so HMR and live reload work over HTTPS (see [WebSockets](#websockets))
@@ -282,7 +282,7 @@ Press `i` in the TUI to enable intercept mode. You'll be prompted for a pattern 
 
 - **Empty pattern** — intercepts all requests and responses
 - **Path pattern** — `intercept=/api` matches any request with `/api` in the path
-- **Method pattern** — `intercept=POST` matches all POST requests
+- **Method pattern** — `intercept=POST` matches all POST requests (a method word matches only the method: `POST` doesn't hold `GET /posts`)
 - **Combined** — `intercept=POST /api` matches POST requests to `/api`
 - **Request only** — `intercept=req:/api` holds only requests (responses pass through)
 - **Response only** — `intercept=resp:/api` holds only responses (requests pass through)
@@ -329,7 +329,8 @@ intercept=resp:POST /api
 | `e` | Edit request / response |
 | `r` | Edit & replay request |
 | `R` | Quick replay (no edit) or restart dev server (when focused on logs) |
-| `E` | Export traffic as HAR file |
+| `E` | Export traffic as HAR file (cookie and auth values redacted) |
+| `Ctrl+E` | Export HAR with all headers |
 | `C` | Clear all requests |
 | `?` | Toggle help overlay (`Esc` also closes it) |
 | `q` | Quit |
