@@ -51,6 +51,7 @@ jobs:
           zig test src/compat.zig
           zig test src/sys.zig -lc
           zig test src/cli.zig
+          zig test src/log.zig -lc
 
       - name: Test intercept
         run: zig test src/intercept.zig
@@ -132,6 +133,7 @@ jobs:
           zig test src/compat.zig
           zig test src/sys.zig -lc
           zig test src/cli.zig
+          zig test src/log.zig -lc
 
       - name: Test intercept
         run: zig test src/intercept.zig
@@ -195,6 +197,7 @@ jobs:
           zig test src/compat.zig
           zig test src/sys.zig -lc
           zig test src/cli.zig
+          zig test src/log.zig -lc
 
       - name: Test intercept
         run: zig test src/intercept.zig
