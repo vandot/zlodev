@@ -497,7 +497,7 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
             std.debug.print("installing CA and generating certificate\n", .{});
             try sys.sudoCmd(allocator, &.{ "certutil", "-addstore", "Root", ca_path });
             // Also add CA to Git's OpenSSL CA bundle so tools like Git's curl can verify certs
-            appendToGitCaBundle(allocator, ca_path);
+            appendToGitCaBundle(allocator, domain, ca_path);
         },
         else => {},
     }
@@ -546,7 +546,7 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
             sys.sudoCmd(allocator, &.{ "certutil", "-delstore", "Root", cn }) catch {
                 std.debug.print("failed to remove certificate from store\n", .{});
             };
-            removeFromGitCaBundle(allocator);
+            removeFromGitCaBundle(allocator, domain, ca_path);
         },
         else => {},
     }
@@ -571,92 +571,103 @@ fn removeFromKeychain(allocator: std.mem.Allocator, cert_dir: []const u8) void {
     };
 }
 
-const ca_bundle_marker_begin = "\n# BEGIN zlodev CA\n";
-const ca_bundle_marker_end = "# END zlodev CA\n";
+// Markers written by versions before per-domain blocks; only read for cleanup.
+const legacy_bundle_begin = "\n# BEGIN zlodev CA\n";
+const legacy_bundle_end = "# END zlodev CA\n";
 
-/// Append the zlodev CA PEM to Git's OpenSSL CA bundle so tools using
-/// OpenSSL (e.g. Git's bundled curl) can verify zlodev certificates.
-fn appendToGitCaBundle(allocator: std.mem.Allocator, ca_pem_path: []const u8) void {
+const BundleBlock = struct { start: usize, stop: usize, body: []const u8 };
+
+fn findBlock(content: []const u8, begin: []const u8, end: []const u8) ?BundleBlock {
+    const start = std.mem.indexOf(u8, content, begin) orelse return null;
+    const body_start = start + begin.len;
+    const end_at = std.mem.indexOfPos(u8, content, body_start, end) orelse return null;
+    return .{ .start = start, .stop = end_at + end.len, .body = content[body_start..end_at] };
+}
+
+/// `content` with a block for `domain` appended; null when that domain already has one.
+pub fn bundleWithCa(allocator: std.mem.Allocator, content: []const u8, domain: []const u8, pem: []const u8) !?[]u8 {
+    var begin_buf: [320]u8 = undefined;
+    var end_buf: [320]u8 = undefined;
+    const begin = try std.fmt.bufPrint(&begin_buf, "\n# BEGIN zlodev CA {s}\n", .{domain});
+    const end = try std.fmt.bufPrint(&end_buf, "# END zlodev CA {s}\n", .{domain});
+    if (std.mem.indexOf(u8, content, begin) != null) return null;
+    return try std.mem.concat(allocator, u8, &.{ content, begin, pem, end });
+}
+
+/// `content` without `domain`'s block, and without an older unnamed block when it
+/// holds this CA's PEM (so the other domain's CA survives). Null when nothing changed.
+pub fn bundleWithoutCa(allocator: std.mem.Allocator, content: []const u8, domain: []const u8, pem: []const u8) !?[]u8 {
+    var begin_buf: [320]u8 = undefined;
+    var end_buf: [320]u8 = undefined;
+    const begin = try std.fmt.bufPrint(&begin_buf, "\n# BEGIN zlodev CA {s}\n", .{domain});
+    const end = try std.fmt.bufPrint(&end_buf, "# END zlodev CA {s}\n", .{domain});
+    var owned: ?[]u8 = null;
+    errdefer if (owned) |o| allocator.free(o);
+    var current = content;
+    if (findBlock(current, begin, end)) |b| {
+        owned = try std.mem.concat(allocator, u8, &.{ current[0..b.start], current[b.stop..] });
+        current = owned.?;
+    }
+    if (findBlock(current, legacy_bundle_begin, legacy_bundle_end)) |b| {
+        if (std.mem.eql(u8, b.body, pem)) {
+            const next = try std.mem.concat(allocator, u8, &.{ current[0..b.start], current[b.stop..] });
+            if (owned) |o| allocator.free(o);
+            owned = next;
+        }
+    }
+    return owned;
+}
+
+fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.zlodev_tmp", .{path});
+    defer allocator.free(tmp_path);
+    const tmp_file = try std.Io.Dir.createFileAbsolute(rt.io(), tmp_path, .{});
+    tmp_file.writeStreamingAll(rt.io(), bytes) catch |e| {
+        tmp_file.close(rt.io());
+        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
+        return e;
+    };
+    tmp_file.close(rt.io());
+    std.Io.Dir.renameAbsolute(tmp_path, path, rt.io()) catch |e| {
+        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
+        return e;
+    };
+}
+
+/// Append the domain's CA to Git's OpenSSL CA bundle so tools using OpenSSL
+/// (e.g. Git's bundled curl) can verify zlodev certificates.
+fn appendToGitCaBundle(allocator: std.mem.Allocator, domain: []const u8, ca_pem_path: []const u8) void {
     const bundle_path = getGitCaBundlePath(allocator) orelse return;
     defer allocator.free(bundle_path);
-
-    // Read CA PEM content
     const ca_content = std.Io.Dir.cwd().readFileAlloc(rt.io(), ca_pem_path, allocator, .limited(8192)) catch {
         std.debug.print("warning: could not read CA file for Git bundle\n", .{});
         return;
     };
     defer allocator.free(ca_content);
-
-    // Check if already present
     const bundle_content = std.Io.Dir.cwd().readFileAlloc(rt.io(), bundle_path, allocator, .limited(4 * 1024 * 1024)) catch {
         std.debug.print("warning: could not read Git CA bundle\n", .{});
         return;
     };
     defer allocator.free(bundle_content);
-    if (std.mem.indexOf(u8, bundle_content, "# BEGIN zlodev CA") != null) return;
-
-    // Build new content in memory
-    var new_content: std.ArrayListUnmanaged(u8) = .empty;
-    defer new_content.deinit(allocator);
-    new_content.appendSlice(allocator, bundle_content) catch return;
-    new_content.appendSlice(allocator, ca_bundle_marker_begin) catch return;
-    new_content.appendSlice(allocator, ca_content) catch return;
-    new_content.appendSlice(allocator, ca_bundle_marker_end) catch return;
-
-    // Write atomically via temp file + rename
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}.zlodev_tmp", .{bundle_path}) catch return;
-    defer allocator.free(tmp_path);
-
-    const tmp_file = std.Io.Dir.createFileAbsolute(rt.io(), tmp_path, .{}) catch return;
-    tmp_file.writeStreamingAll(rt.io(), new_content.items) catch {
-        tmp_file.close(rt.io());
-        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
-        return;
-    };
-    tmp_file.close(rt.io());
-
-    std.Io.Dir.renameAbsolute(tmp_path, bundle_path, rt.io()) catch {
-        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
-        return;
-    };
-
+    const new_content = (bundleWithCa(allocator, bundle_content, domain, ca_content) catch return) orelse return;
+    defer allocator.free(new_content);
+    writeFileAtomic(allocator, bundle_path, new_content) catch return;
     std.debug.print("CA also added to Git CA bundle at {s}\n", .{bundle_path});
 }
 
-/// Remove the zlodev CA from Git's OpenSSL CA bundle.
-fn removeFromGitCaBundle(allocator: std.mem.Allocator) void {
+/// Remove the domain's CA from Git's OpenSSL CA bundle.
+fn removeFromGitCaBundle(allocator: std.mem.Allocator, domain: []const u8, ca_pem_path: []const u8) void {
     const bundle_path = getGitCaBundlePath(allocator) orelse return;
     defer allocator.free(bundle_path);
-
+    // Without the PEM only the named block can go; a legacy block never matches "".
+    const pem = std.Io.Dir.cwd().readFileAlloc(rt.io(), ca_pem_path, allocator, .limited(8192)) catch
+        allocator.dupe(u8, "") catch return;
+    defer allocator.free(pem);
     const content = std.Io.Dir.cwd().readFileAlloc(rt.io(), bundle_path, allocator, .limited(4 * 1024 * 1024)) catch return;
     defer allocator.free(content);
-
-    const begin = std.mem.indexOf(u8, content, ca_bundle_marker_begin) orelse return;
-    const after_begin = begin + ca_bundle_marker_begin.len;
-    const end_marker = std.mem.indexOfPos(u8, content, after_begin, ca_bundle_marker_end) orelse return;
-    const end = end_marker + ca_bundle_marker_end.len;
-
-    // Write to a temporary file, then rename atomically
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}.zlodev_tmp", .{bundle_path}) catch return;
-    defer allocator.free(tmp_path);
-
-    const tmp_file = std.Io.Dir.createFileAbsolute(rt.io(), tmp_path, .{}) catch return;
-    tmp_file.writeStreamingAll(rt.io(), content[0..begin]) catch {
-        tmp_file.close(rt.io());
-        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
-        return;
-    };
-    tmp_file.writeStreamingAll(rt.io(), content[end..]) catch {
-        tmp_file.close(rt.io());
-        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
-        return;
-    };
-    tmp_file.close(rt.io());
-
-    std.Io.Dir.renameAbsolute(tmp_path, bundle_path, rt.io()) catch {
-        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
-        return;
-    };
+    const new_content = (bundleWithoutCa(allocator, content, domain, pem) catch return) orelse return;
+    defer allocator.free(new_content);
+    writeFileAtomic(allocator, bundle_path, new_content) catch return;
     std.debug.print("CA removed from Git CA bundle\n", .{});
 }
 
@@ -1315,4 +1326,47 @@ test "nssDatabases finds snap databases and Firefox profiles that exist" {
     try std.testing.expect(hasDb(dbs, "My Profile", .firefox));
     try std.testing.expect(hasDb(dbs, "xyz.default", .firefox));
     for (dbs) |db| try std.testing.expect(std.mem.indexOf(u8, db.path, ".var") == null);
+}
+
+const test_pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+const other_pem = "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
+
+const dev_block = "\n# BEGIN zlodev CA dev.lo\n" ++ test_pem ++ "# END zlodev CA dev.lo\n";
+const host_block = "\n# BEGIN zlodev CA host.local\n" ++ other_pem ++ "# END zlodev CA host.local\n";
+
+const legacy_test_bundle = "roots\n\n# BEGIN zlodev CA\n" ++ test_pem ++ "# END zlodev CA\n";
+
+test "bundleWithCa appends a block named for the domain" {
+    const out = (try bundleWithCa(std.testing.allocator, "roots\n", "dev.lo", test_pem)).?;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("roots\n" ++ dev_block, out);
+}
+
+test "bundleWithCa skips a domain already present and adds a second domain" {
+    const first = "roots\n" ++ dev_block;
+    try std.testing.expect((try bundleWithCa(std.testing.allocator, first, "dev.lo", test_pem)) == null);
+    const out = (try bundleWithCa(std.testing.allocator, first, "host.local", other_pem)).?;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(first ++ host_block, out);
+}
+
+test "bundleWithoutCa removes only the named domain" {
+    const both = "roots\n" ++ dev_block ++ host_block;
+    const out = (try bundleWithoutCa(std.testing.allocator, both, "host.local", other_pem)).?;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("roots\n" ++ dev_block, out);
+}
+
+test "bundleWithoutCa removes a legacy block holding this CA" {
+    const out = (try bundleWithoutCa(std.testing.allocator, legacy_test_bundle, "dev.lo", test_pem)).?;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("roots\n", out);
+}
+
+test "bundleWithoutCa keeps a legacy block holding another CA" {
+    try std.testing.expect((try bundleWithoutCa(std.testing.allocator, legacy_test_bundle, "host.local", other_pem)) == null);
+}
+
+test "bundleWithoutCa returns null when the domain has no block" {
+    try std.testing.expect((try bundleWithoutCa(std.testing.allocator, "roots\n", "dev.lo", test_pem)) == null);
 }

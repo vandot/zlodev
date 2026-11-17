@@ -284,3 +284,69 @@ test "uninstall --local and verify" {
         else => {},
     }
 }
+
+/// Git for Windows' CA bundle contents, or null when there is none.
+fn gitBundleContent() ?[]u8 {
+    const res = std.process.run(testing.allocator, testing.io, .{ .argv = &.{ "git", "config", "--system", "http.sslCAInfo" } }) catch return null;
+    defer testing.allocator.free(res.stdout);
+    defer testing.allocator.free(res.stderr);
+    const configured = std.mem.trim(u8, res.stdout, " \t\r\n");
+    const path = if (configured.len > 0) configured else "C:\\Program Files\\Git\\mingw64\\etc\\ssl\\certs\\ca-bundle.crt";
+    return std.Io.Dir.cwd().readFileAlloc(testing.io, path, testing.allocator, .limited(4 * 1024 * 1024)) catch null;
+}
+
+fn bundleHas(content: []const u8, domain: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const marker = std.fmt.bufPrint(&buf, "# BEGIN zlodev CA {s}\n", .{domain}) catch return false;
+    return std.mem.indexOf(u8, content, marker) != null;
+}
+
+// --- Both domains side by side ---
+
+test "install --cert and install -l --cert keep separate trust entries" {
+    var hostname_buf: [hostname_max]u8 = undefined;
+    const hostname = getHostname(&hostname_buf);
+    var domain_buf: [512]u8 = undefined;
+    const domain = try std.fmt.bufPrint(&domain_buf, "{s}.local", .{hostname});
+
+    try runCmdExpectSuccess(&.{ binary_path, "install", "--cert" });
+    try runCmdExpectSuccess(&.{ binary_path, "install", "-l", "--cert" });
+    switch (builtin.os.tag) {
+        .linux => {
+            try testing.expect(anchorExists("dev.lo"));
+            try testing.expect(anchorExists(domain));
+            try testing.expect(nssHas(".pki/nssdb", "dev.lo"));
+            try testing.expect(nssHas(".pki/nssdb", domain));
+        },
+        .windows => if (gitBundleContent()) |content| {
+            defer testing.allocator.free(content);
+            try testing.expect(bundleHas(content, "dev.lo"));
+            try testing.expect(bundleHas(content, domain));
+        },
+        else => {},
+    }
+
+    try runCmdExpectSuccess(&.{ binary_path, "uninstall", "-l", "--cert" });
+    try verifyCertFiles("dev.lo");
+    switch (builtin.os.tag) {
+        .macos => try runCmdExpectSuccess(&.{ "security", "find-certificate", "-c", "dev.lo CA", "/Library/Keychains/System.keychain" }),
+        .linux => {
+            try testing.expect(anchorExists("dev.lo"));
+            try testing.expect(!anchorExists(domain));
+            try testing.expect(nssHas(".pki/nssdb", "dev.lo"));
+            try testing.expect(!nssHas(".pki/nssdb", domain));
+        },
+        .windows => {
+            try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", "dev.lo CA" });
+            if (gitBundleContent()) |content| {
+                defer testing.allocator.free(content);
+                try testing.expect(bundleHas(content, "dev.lo"));
+                try testing.expect(!bundleHas(content, domain));
+            }
+        },
+        else => {},
+    }
+
+    try runCmdExpectSuccess(&.{ binary_path, "uninstall", "--cert" });
+    try verifyCertDirRemoved("dev.lo");
+}
