@@ -183,14 +183,16 @@ fn writeHeadersJsonFile(f: std.Io.File, raw_headers: []const u8, redact: bool) !
         if (header.len == 0) continue;
         if (!first) try f.writeStreamingAll(rt.io(), ",");
         first = false;
-        if (std.mem.indexOf(u8, header, ": ")) |sep| {
+        // The space after the colon is optional (RFC 9112 5.1), so split on ':' alone.
+        if (std.mem.indexOfScalar(u8, header, ':')) |sep| {
+            const name = header[0..sep];
             try f.writeStreamingAll(rt.io(), "{\"name\":\"");
-            try writeJsonEscapedFile(f, header[0..sep]);
+            try writeJsonEscapedFile(f, name);
             try f.writeStreamingAll(rt.io(), "\",\"value\":\"");
-            if (redact and isSecretHeader(header[0..sep])) {
+            if (redact and isSecretHeader(name)) {
                 try f.writeStreamingAll(rt.io(), "[redacted]");
             } else {
-                try writeJsonEscapedFile(f, header[sep + 2 ..]);
+                try writeJsonEscapedFile(f, std.mem.trim(u8, header[sep + 1 ..], " \t"));
             }
             try f.writeStreamingAll(rt.io(), "\"}");
         } else {
@@ -455,4 +457,18 @@ test "exportHarFrom stops when the source runs out" {
     const content = try std.Io.Dir.cwd().readFileAlloc(rt.io(), fname, testing.allocator, .limited(1024 * 1024));
     defer testing.allocator.free(content);
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, content, "\"startedDateTime\""));
+}
+
+test "writeHeadersJsonFile redacts secrets written without a space after the colon" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(rt.io(), "h.json", .{});
+    try writeHeadersJsonFile(f, "cookie:session=abc\r\nAuthorization:\tBearer x\r\nAccept:*/*", true);
+    f.close(rt.io());
+    const out = try tmp.dir.readFileAlloc(rt.io(), "h.json", testing.allocator, .unlimited);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "session") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Bearer") == null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "\"value\":\"[redacted]\""));
+    try testing.expect(std.mem.indexOf(u8, out, "{\"name\":\"Accept\",\"value\":\"*/*\"}") != null);
 }
