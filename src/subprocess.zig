@@ -649,6 +649,16 @@ test "stopChild kills group members that outlive the shell" {
     while (isRunning() and rt.milliTimestamp() < deadline) rt.sleepMs(20);
     try std.testing.expect(!isRunning());
     stopChild();
-    rt.sleepMs(100);
-    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(-pgid, @enumFromInt(0)));
+    // The orphan is reaped asynchronously (by init); poll instead of a fixed sleep.
+    const gone_by = rt.milliTimestamp() + 5000;
+    while (true) {
+        std.posix.kill(-pgid, @enumFromInt(0)) catch |e| switch (e) {
+            error.ProcessNotFound => break,
+            // macOS: killed members are zombies until launchd reaps them.
+            error.PermissionDenied => {},
+            else => return e,
+        };
+        if (rt.milliTimestamp() > gone_by) return error.GroupStillAlive;
+        rt.sleepMs(20);
+    }
 }
