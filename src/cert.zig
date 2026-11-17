@@ -679,6 +679,26 @@ fn getGitCaBundlePath(allocator: std.mem.Allocator) ?[]const u8 {
     return null;
 }
 
+/// Trust-anchor file name for `domain`, so `install` and `install -l` don't share one file.
+pub fn anchorFileName(buf: []u8, domain: []const u8, ext: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "zlodevCA-{s}.{s}", .{ domain, ext });
+}
+
+/// Nickname of the CA in browsers' NSS databases.
+pub fn nssNickname(buf: []u8, domain: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "zlodev {s} CA", .{domain});
+}
+
+/// True when both files exist and hold the same bytes.
+fn sameFileContents(allocator: std.mem.Allocator, a: []const u8, b: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    const x = cwd.readFileAlloc(rt.io(), a, allocator, .limited(64 * 1024)) catch return false;
+    defer allocator.free(x);
+    const y = cwd.readFileAlloc(rt.io(), b, allocator, .limited(64 * 1024)) catch return false;
+    defer allocator.free(y);
+    return std.mem.eql(u8, x, y);
+}
+
 fn getFingerprint(ca_path: []const u8) ![40]u8 {
     // Null-terminate the path for C API
     var path_z_buf: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
@@ -1058,4 +1078,44 @@ test "keptWarning names the error, expiry date and fix" {
         "renewal failed (CaKeyNotFound), expires 2026-11-14 - run zlodev install -f",
         keptWarning(&buf, error.CaKeyNotFound, 1794614400),
     );
+}
+
+test "anchorFileName and nssNickname carry the domain" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("zlodevCA-dev.lo.crt", try anchorFileName(&buf, "dev.lo", "crt"));
+    try std.testing.expectEqualStrings("zlodevCA-myhost.local.pem", try anchorFileName(&buf, "myhost.local", "pem"));
+    try std.testing.expectEqualStrings("zlodev dev.lo CA", try nssNickname(&buf, "dev.lo"));
+}
+
+test "anchorFileName and nssNickname fit a 63-character host" {
+    const domain = "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh" ++ ".local"; // 63 chars
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, "zlodevCA-".len + domain.len + ".crt".len), (try anchorFileName(&buf, domain, "crt")).len);
+    try std.testing.expectEqual(@as(usize, "zlodev ".len + domain.len + " CA".len), (try nssNickname(&buf, domain)).len);
+}
+
+test "sameFileContents compares bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(rt.io(), .{ .sub_path = "a.pem", .data = "PEM-A\n" });
+    try tmp.dir.writeFile(rt.io(), .{ .sub_path = "a2.pem", .data = "PEM-A\n" });
+    try tmp.dir.writeFile(rt.io(), .{ .sub_path = "b.pem", .data = "PEM-B\n" });
+    var a: [256]u8 = undefined;
+    var a2: [256]u8 = undefined;
+    var b: [256]u8 = undefined;
+    var missing: [256]u8 = undefined;
+    const pa = try tmpPathZ(&a, &tmp, "a.pem");
+    try std.testing.expect(sameFileContents(std.testing.allocator, pa, try tmpPathZ(&a2, &tmp, "a2.pem")));
+    try std.testing.expect(!sameFileContents(std.testing.allocator, pa, try tmpPathZ(&b, &tmp, "b.pem")));
+    try std.testing.expect(!sameFileContents(std.testing.allocator, pa, try tmpPathZ(&missing, &tmp, "none.pem")));
+}
+
+test "runUserCmd reports a missing binary" {
+    try std.testing.expectEqual(sys.RunResult.missing, sys.runUserCmd(&.{"zlodev-no-such-binary-7f3a"}));
+}
+
+test "runUserCmd reports success and failure" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectEqual(sys.RunResult.ok, sys.runUserCmd(&.{"true"}));
+    try std.testing.expectEqual(sys.RunResult.failed, sys.runUserCmd(&.{"false"}));
 }

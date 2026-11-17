@@ -15,6 +15,22 @@ pub fn sudoCmd(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     }
 }
 
+pub const RunResult = enum { ok, failed, missing };
+
+/// Run a command as the current user with all output discarded. `missing` means
+/// the binary isn't on PATH, so callers can tell "not installed" from "failed".
+pub fn runUserCmd(argv: []const []const u8) RunResult {
+    var child = std.process.spawn(rt.io(), .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch |e| return switch (e) {
+        error.FileNotFound => .missing,
+        else => .failed,
+    };
+    const term = child.wait(rt.io()) catch return .failed;
+    return switch (term) {
+        .exited => |code| if (code == 0) .ok else .failed,
+        else => .failed,
+    };
+}
+
 /// Run a command and capture its stdout output. Returns allocated slice (caller must free).
 /// Returns null if the command fails or produces no output.
 pub fn runCmdOutput(allocator: std.mem.Allocator, argv: []const []const u8) ?[]const u8 {
