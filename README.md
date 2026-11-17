@@ -215,7 +215,7 @@ The upstream's certificate is verified against your system's trusted roots and m
 
 ### WebSockets
 
-WebSocket connections work through zlodev without any setup. The page at `https://dev.lo` opens `wss://dev.lo/...`. zlodev terminates TLS and forwards the upgrade request unchanged to your dev server as plain `ws://`. After the `101 Switching Protocols` reply, it relays frames in both directions. This is what keeps HMR and live reload (Vite, webpack-dev-server, Next.js, etc.) working over HTTPS.
+WebSocket connections work through zlodev without any setup. The page at `https://dev.lo` opens `wss://dev.lo/...`. zlodev terminates TLS and forwards the upgrade request to your dev server as plain `ws://`, adding `X-Forwarded-Proto: https` and `X-Real-IP` like it does for normal requests. After the `101 Switching Protocols` reply, it relays frames in both directions. This is what keeps HMR and live reload (Vite, webpack-dev-server, Next.js, etc.) working over HTTPS.
 
 - Upgrades follow the same routing as other requests: the default port, subdomain routes (`wss://api.dev.lo`) and path routes (`wss://dev.lo/socket` with `--route=/socket=4000`).
 - External routes work too (`--route=ws=echo.websocket.org` → `wss://ws.dev.lo`). zlodev connects to the upstream over TLS, verifying its certificate like any external request. It rewrites `Host` to the upstream and keeps the original as `X-Forwarded-Host`. `Origin` is forwarded unchanged as `https://dev.lo`, so an upstream that checks `Origin` has to allow it.
