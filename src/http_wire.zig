@@ -337,7 +337,7 @@ pub fn readResponseHead(src: anytype, buf: []u8) ?ResponseHead {
     };
 }
 
-pub const HeadResult = union(enum) { head: ResponseHead, closed, timeout };
+pub const HeadResult = union(enum) { head: ResponseHead, closed, timeout, too_large };
 
 /// True for the deadline error a polling reader returns (`error.Timeout`).
 pub fn isTimeout(e: anyerror) bool {
@@ -345,7 +345,7 @@ pub fn isTimeout(e: anyerror) bool {
 }
 
 /// Same as readResponseHead, but tells why no head came: `.timeout` when the
-/// source's deadline passed (`error.Timeout`), `.closed` for EOF or any other error.
+/// source's deadline passed (`error.Timeout`), `.closed` for EOF or any other error, `.too_large` when the head doesn't fit in `buf`.
 pub fn readResponseHeadResult(src: anytype, buf: []u8) HeadResult {
     var total: usize = 0;
     while (true) {
@@ -360,7 +360,8 @@ pub fn readResponseHeadResult(src: anytype, buf: []u8) HeadResult {
             headers_end = std.mem.indexOf(u8, buf[0..total], "\r\n\r\n");
         }
         if (total == 0) return .closed;
-        const hdr_end = headers_end orelse return .closed;
+        // A full buffer with no blank line: the head is bigger than we can hold.
+        const hdr_end = headers_end orelse return if (total == buf.len) .too_large else .closed;
 
         const first_line_end = std.mem.indexOf(u8, buf[0..total], "\r\n") orelse return .closed;
         const status = parseStatus(buf[0..first_line_end]);
@@ -508,6 +509,18 @@ const testing = std.testing;
 /// Path zlodev answers itself on :443 and :80. Namespaced so an app's own
 /// `/health` route still reaches the dev server.
 pub const health_path = "/.zlodev/health";
+
+/// True when `host` is `domain` or a subdomain of it (case-insensitive) and holds
+/// only hostname characters, so it is safe to put in a redirect or curl URL.
+pub fn sameSiteHost(host: []const u8, domain: []const u8) bool {
+    if (host.len == 0 or domain.len == 0) return false;
+    for (host) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-')) return false;
+    }
+    if (std.ascii.eqlIgnoreCase(host, domain)) return true;
+    return host.len > domain.len + 1 and host[host.len - domain.len - 1] == '.' and
+        std.ascii.endsWithIgnoreCase(host, domain);
+}
 
 pub fn isHealthCheck(path: []const u8) bool {
     return std.mem.eql(u8, path, health_path);
@@ -1159,6 +1172,44 @@ test "readResponseHeadResult reports a close as closed" {
     var reader = SliceReader{ .data = "" };
     var buf: [256]u8 = undefined;
     try testing.expect(readResponseHeadResult(&reader, &buf) == .closed);
+}
+
+const big_header_value = blk: {
+    var a: [300]u8 = undefined;
+    @memset(&a, 'a');
+    break :blk a;
+};
+
+test "readResponseHeadResult reports a head that overflows the buffer as too_large" {
+    var reader = SliceReader{ .data = "HTTP/1.1 200 OK\r\nX-Big: " ++ big_header_value ++ "\r\n\r\n" };
+    var buf: [256]u8 = undefined;
+    try testing.expect(readResponseHeadResult(&reader, &buf) == .too_large);
+}
+
+test "readResponseHeadResult parses a head that exactly fills the buffer" {
+    const head = "HTTP/1.1 200 OK\r\nX: y\r\n\r\n";
+    var reader = SliceReader{ .data = head };
+    var buf: [head.len]u8 = undefined;
+    switch (readResponseHeadResult(&reader, &buf)) {
+        .head => |h| try testing.expectEqual(@as(u16, 200), h.status),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sameSiteHost accepts the domain and its subdomains" {
+    try testing.expect(sameSiteHost("dev.lo", "dev.lo"));
+    try testing.expect(sameSiteHost("api.dev.lo", "dev.lo"));
+    try testing.expect(sameSiteHost("API.Dev.LO", "dev.lo"));
+    try testing.expect(sameSiteHost("a-b.c.myhost.local", "myhost.local"));
+}
+
+test "sameSiteHost rejects other sites" {
+    try testing.expect(!sameSiteHost("evil.com", "dev.lo"));
+    try testing.expect(!sameSiteHost("dev.lo.evil.com", "dev.lo"));
+    try testing.expect(!sameSiteHost("xdev.lo", "dev.lo"));
+    try testing.expect(!sameSiteHost("", "dev.lo"));
+    try testing.expect(!sameSiteHost("a/b.dev.lo", "dev.lo"));
+    try testing.expect(!sameSiteHost("a\r\nb.dev.lo", "dev.lo"));
 }
 
 test "readResponseHeadResult returns the head" {

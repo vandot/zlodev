@@ -864,6 +864,10 @@ fn handleConnection(
                 failRequest(ssl, &entry, held, 502, "upstream closed before responding");
                 return;
             },
+            .too_large => {
+                failRequest(ssl, &entry, held, 502, "response head over 16KB");
+                return;
+            },
             .timeout => {
                 var rb: [48]u8 = undefined;
                 failRequest(ssl, &entry, held, 504, std.fmt.bufPrint(&rb, "no response within {d}s", .{config.upstream_timeout_s}) catch "no response in time");
@@ -2674,6 +2678,23 @@ test "WebSocket upgrade on a local route gets X-Real-IP and X-Forwarded-Proto" {
     try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Real-IP: 127.0.0.1\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-Proto: https\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\n"));
+}
+
+test "response head over 16KB answers 502 with the reason" {
+    var up = RecordingUpstream{ .response = "HTTP/1.1 200 OK\r\nX-Big: " ++ rep("a", 17000) ++ "\r\n\r\nok" };
+    try up.start(18371);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18370, 18371);
+    defer px.stop();
+    const before = freshRing();
+    var buf: [4096]u8 = undefined;
+    const resp = try px.roundTrip("GET /big HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "response head over 16KB", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 502"));
+    const e = try testing.allocator.create(requests.Entry);
+    defer testing.allocator.destroy(e);
+    try waitNewestEntry(before, e);
+    try testing.expectEqualStrings("response head over 16KB", e.getError());
 }
 
 test "chunked upload arriving in two writes is relayed whole and the next request still answers" {
