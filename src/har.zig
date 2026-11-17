@@ -2,8 +2,26 @@ const std = @import("std");
 const rt = @import("rt.zig");
 const requests = @import("requests.zig");
 
-/// Export visible requests as a HAR file. Writes filename to fname_out, returns length or null on failure.
-pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: []const u8, fname_out: *[64]u8) ?usize {
+/// Reads the ring one entry at a time under its lock (see requests.copyEntry).
+const RingSource = struct {
+    i: usize = 0,
+    fn next(self: *RingSource, dest: *requests.Entry) bool {
+        if (!requests.copyEntry(self.i, dest)) return false;
+        self.i += 1;
+        return true;
+    }
+};
+
+/// Export captured requests as a HAR file in the current dir. `redact` hides
+/// cookie and auth header values. Writes the filename to fname_out.
+pub fn exportHar(version: []const u8, domain: []const u8, redact: bool, fname_out: *[64]u8) ?usize {
+    var src = RingSource{};
+    return exportHarFrom(&src, version, domain, redact, fname_out);
+}
+
+/// Write the entries `src.next(*Entry) bool` yields as a HAR file. Returns the
+/// filename length in fname_out, or null on failure.
+pub fn exportHarFrom(src: anytype, version: []const u8, domain: []const u8, redact: bool, fname_out: *[64]u8) ?usize {
     // Generate filename with timestamp
     const now_ms = rt.milliTimestamp();
     const now_s: u64 = if (now_ms > 0) @intCast(@divTrunc(now_ms, 1000)) else 0;
@@ -33,10 +51,15 @@ pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: [
         }
     };
 
-    wr.writeAll(file, "{\"log\":{\"version\":\"1.2\",\"creator\":{\"name\":\"zlodev\",\"version\":\"1.0\"},\"entries\":[") catch return null;
+    wr.writeAll(file, "{\"log\":{\"version\":\"1.2\",\"creator\":{\"name\":\"zlodev\",\"version\":\"") catch return null;
+    writeJsonEscapedFile(file, version) catch return null;
+    wr.writeAll(file, "\"},\"entries\":[") catch return null;
 
-    for (0..entry_count) |fi| {
-        const entry = entries[fi];
+    const entry = std.heap.page_allocator.create(requests.Entry) catch return null;
+    defer std.heap.page_allocator.destroy(entry);
+
+    var fi: usize = 0;
+    while (src.next(entry)) : (fi += 1) {
         if (fi > 0) wr.writeByte(file, ',') catch return null;
 
         // startedDateTime
@@ -72,7 +95,7 @@ pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: [
 
         // Request headers
         wr.writeAll(file, ",\"headers\":[") catch return null;
-        writeHeadersJsonFile(file, entry.getReqHeaders()) catch return null;
+        writeHeadersJsonFile(file, entry.getReqHeaders(), redact) catch return null;
         wr.writeByte(file, ']') catch return null;
 
         // Request body (postData)
@@ -94,7 +117,7 @@ pub fn exportHar(entries: []*const requests.Entry, entry_count: usize, domain: [
 
         // Response headers
         wr.writeAll(file, ",\"headers\":[") catch return null;
-        writeHeadersJsonFile(file, entry.getRespHeaders()) catch return null;
+        writeHeadersJsonFile(file, entry.getRespHeaders(), redact) catch return null;
         wr.writeByte(file, ']') catch return null;
 
         // Response content
@@ -143,18 +166,34 @@ fn writeJsonEscapedFile(f: std.Io.File, data: []const u8) !void {
     }
 }
 
-fn writeHeadersJsonFile(f: std.Io.File, raw_headers: []const u8) !void {
+const redacted_headers = [_][]const u8{ "cookie", "set-cookie", "authorization", "proxy-authorization" };
+
+fn isSecretHeader(name: []const u8) bool {
+    for (redacted_headers) |h| {
+        if (std.ascii.eqlIgnoreCase(name, h)) return true;
+    }
+    return false;
+}
+
+/// `redact` writes `[redacted]` as the value of cookie and auth headers.
+fn writeHeadersJsonFile(f: std.Io.File, raw_headers: []const u8, redact: bool) !void {
     var iter = std.mem.splitSequence(u8, raw_headers, "\r\n");
     var first = true;
     while (iter.next()) |header| {
         if (header.len == 0) continue;
         if (!first) try f.writeStreamingAll(rt.io(), ",");
         first = false;
-        if (std.mem.indexOf(u8, header, ": ")) |sep| {
+        // The space after the colon is optional (RFC 9112 5.1), so split on ':' alone.
+        if (std.mem.indexOfScalar(u8, header, ':')) |sep| {
+            const name = header[0..sep];
             try f.writeStreamingAll(rt.io(), "{\"name\":\"");
-            try writeJsonEscapedFile(f, header[0..sep]);
+            try writeJsonEscapedFile(f, name);
             try f.writeStreamingAll(rt.io(), "\",\"value\":\"");
-            try writeJsonEscapedFile(f, header[sep + 2 ..]);
+            if (redact and isSecretHeader(name)) {
+                try f.writeStreamingAll(rt.io(), "[redacted]");
+            } else {
+                try writeJsonEscapedFile(f, std.mem.trim(u8, header[sep + 1 ..], " \t"));
+            }
             try f.writeStreamingAll(rt.io(), "\"}");
         } else {
             try f.writeStreamingAll(rt.io(), "{\"name\":\"");
@@ -187,10 +226,21 @@ fn headersToString(input: []const u8, buf: []u8) ![]const u8 {
     {
         const f = try tmp.dir.createFile(rt.io(), "hdr_test", .{});
         defer f.close(rt.io());
-        try writeHeadersJsonFile(f, input);
+        try writeHeadersJsonFile(f, input, false);
     }
     return tmp.dir.readFile(rt.io(), "hdr_test", buf);
 }
+
+const SliceSource = struct {
+    entries: []const requests.Entry,
+    i: usize = 0,
+    fn next(self: *SliceSource, dest: *requests.Entry) bool {
+        if (self.i >= self.entries.len) return false;
+        dest.* = self.entries[self.i];
+        self.i += 1;
+        return true;
+    }
+};
 
 test "writeJsonEscapedFile plain text" {
     var buf: [256]u8 = undefined;
@@ -278,10 +328,10 @@ test "exportHar produces valid JSON structure" {
     @memcpy(e1.resp_body[0..rb.len], rb);
     e1.resp_body_len = @intCast(rb.len);
 
-    var entry_ptrs: [1]*const requests.Entry = .{&e1};
+    var src = SliceSource{ .entries = &.{e1} };
 
     var fname_buf: [64]u8 = undefined;
-    const fname_len = exportHar(&entry_ptrs, 1, "dev.lo", &fname_buf) orelse {
+    const fname_len = exportHarFrom(&src, "9.9.9-test", "dev.lo", false, &fname_buf) orelse {
         return error.TestUnexpectedResult;
     };
     const fname = fname_buf[0..fname_len];
@@ -304,10 +354,10 @@ test "exportHar produces valid JSON structure" {
 }
 
 test "exportHar with empty entries" {
-    var entry_ptrs: [0]*const requests.Entry = .{};
+    var src = SliceSource{ .entries = &.{} };
 
     var fname_buf: [64]u8 = undefined;
-    const fname_len = exportHar(&entry_ptrs, 0, "dev.lo", &fname_buf) orelse {
+    const fname_len = exportHarFrom(&src, "9.9.9-test", "dev.lo", false, &fname_buf) orelse {
         return error.TestUnexpectedResult;
     };
     const fname = fname_buf[0..fname_len];
@@ -316,16 +366,16 @@ test "exportHar with empty entries" {
     const content = std.Io.Dir.cwd().readFileAlloc(rt.io(), fname, testing.allocator, .limited(1024 * 1024)) catch return error.TestUnexpectedResult;
     defer testing.allocator.free(content);
 
-    try testing.expectEqualStrings("{\"log\":{\"version\":\"1.2\",\"creator\":{\"name\":\"zlodev\",\"version\":\"1.0\"},\"entries\":[]}}", content);
+    try testing.expectEqualStrings("{\"log\":{\"version\":\"1.2\",\"creator\":{\"name\":\"zlodev\",\"version\":\"9.9.9-test\"},\"entries\":[]}}", content);
 }
 
 test "exportHar filename format" {
     var e = requests.Entry{};
     e.method_len = 0;
-    var entry_ptrs: [1]*const requests.Entry = .{&e};
+    var src = SliceSource{ .entries = &.{e} };
 
     var fname_buf: [64]u8 = undefined;
-    const fname_len = exportHar(&entry_ptrs, 1, "dev.lo", &fname_buf) orelse {
+    const fname_len = exportHarFrom(&src, "9.9.9-test", "dev.lo", false, &fname_buf) orelse {
         return error.TestUnexpectedResult;
     };
     const fname = fname_buf[0..fname_len];
@@ -342,9 +392,9 @@ test "exportHar reports full body sizes and notes truncated captures" {
     const m = "POST";
     @memcpy(e1.method[0..m.len], m);
     e1.method_len = m.len;
-    var entry_ptrs: [1]*const requests.Entry = .{&e1};
+    var src = SliceSource{ .entries = &.{e1} };
     var fname_buf: [64]u8 = undefined;
-    const fname_len = exportHar(&entry_ptrs, 1, "dev.lo", &fname_buf) orelse return error.TestUnexpectedResult;
+    const fname_len = exportHarFrom(&src, "9.9.9-test", "dev.lo", false, &fname_buf) orelse return error.TestUnexpectedResult;
     const fname = fname_buf[0..fname_len];
     defer std.Io.Dir.cwd().deleteFile(rt.io(), fname) catch {};
     const content = std.Io.Dir.cwd().readFileAlloc(rt.io(), fname, testing.allocator, .limited(1024 * 1024)) catch return error.TestUnexpectedResult;
@@ -359,12 +409,66 @@ test "exportHar notes why zlodev answered a failed request" {
     @memcpy(e1.method[0..m.len], m);
     e1.method_len = m.len;
     e1.setError("connection refused 127.0.0.1:3000");
-    var entry_ptrs: [1]*const requests.Entry = .{&e1};
+    var src = SliceSource{ .entries = &.{e1} };
     var fname_buf: [64]u8 = undefined;
-    const fname_len = exportHar(&entry_ptrs, 1, "dev.lo", &fname_buf) orelse return error.TestUnexpectedResult;
+    const fname_len = exportHarFrom(&src, "9.9.9-test", "dev.lo", false, &fname_buf) orelse return error.TestUnexpectedResult;
     const fname = fname_buf[0..fname_len];
     defer std.Io.Dir.cwd().deleteFile(rt.io(), fname) catch {};
     const content = std.Io.Dir.cwd().readFileAlloc(rt.io(), fname, testing.allocator, .limited(1024 * 1024)) catch return error.TestUnexpectedResult;
     defer testing.allocator.free(content);
     try testing.expect(std.mem.indexOf(u8, content, "\"comment\":\"zlodev: connection refused 127.0.0.1:3000\"") != null);
+}
+
+test "writeHeadersJsonFile redacts secrets case-insensitively" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(rt.io(), "h.json", .{});
+    try writeHeadersJsonFile(f, "cookie: a=1\r\nAUTHORIZATION: Bearer x\r\nSet-Cookie: s=2\r\nProxy-Authorization: Basic y\r\nAccept: */*", true);
+    f.close(rt.io());
+    const out = try tmp.dir.readFileAlloc(rt.io(), "h.json", testing.allocator, .unlimited);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, out, "\"value\":\"[redacted]\""));
+    try testing.expect(std.mem.indexOf(u8, out, "Bearer") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"cookie\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"value\":\"*/*\"") != null);
+}
+
+test "exportHarFrom keeps secrets when not redacting" {
+    var e1 = requests.Entry{ .timestamp = 1700000000000 };
+    const rh = "Cookie: session=abc";
+    @memcpy(e1.req_headers[0..rh.len], rh);
+    e1.req_headers_len = rh.len;
+    var src = SliceSource{ .entries = &.{e1} };
+    var fname_buf: [64]u8 = undefined;
+    const fname_len = exportHarFrom(&src, "9.9.9-test", "dev.lo", false, &fname_buf) orelse return error.TestUnexpectedResult;
+    const fname = fname_buf[0..fname_len];
+    defer std.Io.Dir.cwd().deleteFile(rt.io(), fname) catch {};
+    const content = try std.Io.Dir.cwd().readFileAlloc(rt.io(), fname, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "session=abc") != null);
+}
+
+test "exportHarFrom stops when the source runs out" {
+    var src = SliceSource{ .entries = &.{ requests.Entry{ .timestamp = 1 }, requests.Entry{ .timestamp = 2 } } };
+    var fname_buf: [64]u8 = undefined;
+    const fname_len = exportHarFrom(&src, "9.9.9-test", "dev.lo", true, &fname_buf) orelse return error.TestUnexpectedResult;
+    const fname = fname_buf[0..fname_len];
+    defer std.Io.Dir.cwd().deleteFile(rt.io(), fname) catch {};
+    const content = try std.Io.Dir.cwd().readFileAlloc(rt.io(), fname, testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(content);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, content, "\"startedDateTime\""));
+}
+
+test "writeHeadersJsonFile redacts secrets written without a space after the colon" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(rt.io(), "h.json", .{});
+    try writeHeadersJsonFile(f, "cookie:session=abc\r\nAuthorization:\tBearer x\r\nAccept:*/*", true);
+    f.close(rt.io());
+    const out = try tmp.dir.readFileAlloc(rt.io(), "h.json", testing.allocator, .unlimited);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "session") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Bearer") == null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "\"value\":\"[redacted]\""));
+    try testing.expect(std.mem.indexOf(u8, out, "{\"name\":\"Accept\",\"value\":\"*/*\"}") != null);
 }

@@ -2,7 +2,7 @@ const std = @import("std");
 const requests = @import("requests.zig");
 const clipboard = @import("clipboard.zig");
 
-pub fn entryMatchesSearch(entry: *const requests.Entry, term: []const u8) bool {
+pub fn entryMatchesSearch(entry: *const requests.Summary, term: []const u8) bool {
     if (term.len == 0) return true;
     // Match against path (case-insensitive)
     const path = entry.getPath();
@@ -24,8 +24,8 @@ pub fn entryMatchesSearch(entry: *const requests.Entry, term: []const u8) bool {
 
 const testing = std.testing;
 
-fn makeTestEntry(method: []const u8, path: []const u8, status: u16, state: requests.EntryState) requests.Entry {
-    var e = requests.Entry{};
+fn makeTestEntry(method: []const u8, path: []const u8, status: u16, state: requests.EntryState) requests.Summary {
+    var e = requests.Summary{};
     const m_len: u8 = @intCast(@min(method.len, e.method.len));
     @memcpy(e.method[0..m_len], method[0..m_len]);
     e.method_len = m_len;

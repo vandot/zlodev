@@ -108,26 +108,22 @@ pub fn shouldInterceptResponse(method: []const u8, path: []const u8) bool {
     return matchesPattern(method, path);
 }
 
-/// Internal pattern matching — must be called with pattern_mutex held.
+const http_methods = [_][]const u8{ "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE" };
+
+/// Internal pattern matching — must be called with pattern_mutex held. A leading
+/// HTTP method word must equal the method; the rest (or a pattern without a
+/// method word) is a case-insensitive path substring.
 fn matchesPattern(method: []const u8, path: []const u8) bool {
-    if (pattern_len == 0) return true;
-
-    const pat = pattern_buf[0..pattern_len];
-
-    if (std.ascii.findIgnoreCase(method, pat) != null) return true;
-    if (std.ascii.findIgnoreCase(path, pat) != null) return true;
-
-    // Build "METHOD PATH" for combined match
-    var combined: [520]u8 = undefined;
-    if (method.len + 1 + path.len <= combined.len) {
-        @memcpy(combined[0..method.len], method);
-        combined[method.len] = ' ';
-        @memcpy(combined[method.len + 1 ..][0..path.len], path);
-        const full = combined[0 .. method.len + 1 + path.len];
-        if (std.ascii.findIgnoreCase(full, pat) != null) return true;
+    const pat = std.mem.trim(u8, pattern_buf[0..pattern_len], " ");
+    if (pat.len == 0) return true;
+    const word_end = std.mem.indexOfScalar(u8, pat, ' ') orelse pat.len;
+    for (http_methods) |m| {
+        if (!std.ascii.eqlIgnoreCase(pat[0..word_end], m)) continue;
+        if (!std.ascii.eqlIgnoreCase(method, m)) return false;
+        const rest = std.mem.trim(u8, pat[word_end..], " ");
+        return rest.len == 0 or std.ascii.findIgnoreCase(path, rest) != null;
     }
-
-    return false;
+    return std.ascii.findIgnoreCase(path, pat) != null;
 }
 
 /// Acquire a free intercept slot and register it to a ring backing index.
@@ -448,4 +444,29 @@ test "dropAll signals all active slots" {
     s.event.reset();
     release(s);
     try std.testing.expectEqual(@as(usize, 0), getPendingCount());
+}
+
+test "method pattern doesn't hold a path that contains the word" {
+    enabled.store(true, .release);
+    setPattern("POST");
+    try testing.expect(!shouldInterceptRequest("GET", "/posts"));
+    try testing.expect(shouldInterceptRequest("post", "/x"));
+    enabled.store(false, .release);
+}
+
+test "non-method pattern matches the path only" {
+    enabled.store(true, .release);
+    setPattern("ET");
+    try testing.expect(!shouldInterceptRequest("GET", "/x"));
+    setPattern("api");
+    try testing.expect(shouldInterceptRequest("GET", "/v1/api/x"));
+    enabled.store(false, .release);
+}
+
+test "method pattern tolerates extra spaces" {
+    enabled.store(true, .release);
+    setPattern("  POST   /api ");
+    try testing.expect(shouldInterceptRequest("POST", "/api/auth"));
+    try testing.expect(!shouldInterceptRequest("POST", "/login"));
+    enabled.store(false, .release);
 }
