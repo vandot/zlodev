@@ -653,10 +653,18 @@ fn handleConnection(
 
         // Check for WebSocket upgrade
         if (http_wire.isWebSocketUpgrade(req_hdr_section)) {
-            handleWebSocket(ssl, req_buf[0..total], config, .{
+            var ws_ip_buf: [64]u8 = undefined;
+            const ws_target: WsTarget = .{
                 .is_external = route_result.hostname != null,
                 .host = route_result.hostname orelse config.target_host,
                 .port = upstream_port,
+            };
+            handleWebSocket(ssl, req_buf[0..total], config, ws_target, .{
+                .is_external = ws_target.is_external,
+                .upstream_host = ws_target.host,
+                .client_host = host,
+                .client_ip = formatAddress(client_addr, &ws_ip_buf),
+                .domain = config.domain,
             }, client_ctx, conn_id, &entry);
             return;
         }
@@ -1485,6 +1493,7 @@ fn handleWebSocket(
     raw_request: []const u8,
     config: *const ProxyConfig,
     target: WsTarget,
+    fwd: RequestForward,
     client_ctx: ?*ssl_c.SSL_CTX,
     conn_id: u64,
     entry: *requests.Entry,
@@ -1500,28 +1509,20 @@ fn handleWebSocket(
     };
     defer upstream.close();
 
-    // Forward the upgrade request. Local: as-is. External: Host becomes the upstream
-    // (original kept as X-Forwarded-Host), like forwardRequest; Origin is untouched.
-    if (target.is_external) {
-        const first_end = std.mem.indexOf(u8, raw_request, "\r\n") orelse return;
-        const hdr_end = std.mem.indexOf(u8, raw_request, "\r\n\r\n") orelse return;
-        const headers = if (first_end + 2 <= hdr_end) raw_request[first_end + 2 .. hdr_end] else raw_request[0..0];
-        const sink = UpstreamSink{ .upstream = upstream };
-        sink.write(raw_request[0 .. first_end + 2]);
-        http_wire.forwardHeaders(headers, sink, .{ .skip = &.{"host:"} }, config.domain);
-        sink.write("Host: ");
-        sink.write(target.host);
-        sink.write("\r\n");
-        if (http_wire.getHeaderValue(headers, "host:")) |client_host| {
-            sink.write("X-Forwarded-Host: ");
-            sink.write(client_host);
-            sink.write("\r\n");
-        }
-        sink.write("\r\n");
-        sink.write(raw_request[hdr_end + 4 ..]);
-    } else {
-        upstream.writeAll(raw_request) catch return;
-    }
+    // Forward the upgrade head with the same header policy as plain requests:
+    // X-Real-IP, X-Forwarded-Proto, and on external routes Host rewritten (original
+    // kept as X-Forwarded-Host). Origin is untouched.
+    const first_end = std.mem.indexOf(u8, raw_request, "\r\n") orelse return;
+    const hdr_end = std.mem.indexOf(u8, raw_request, "\r\n\r\n") orelse return;
+    var line_parts = std.mem.splitScalar(u8, raw_request[0..first_end], ' ');
+    const method = line_parts.next() orelse return;
+    const uri = line_parts.next() orelse return;
+    const headers = if (first_end + 2 <= hdr_end) raw_request[first_end + 2 .. hdr_end] else raw_request[0..0];
+    var upstream_failed = false;
+    const sink = UpstreamSink{ .upstream = upstream, .failed = &upstream_failed };
+    forwardRequestHead(sink, method, uri, headers, false, fwd);
+    sink.write(raw_request[hdr_end + 4 ..]);
+    if (upstream_failed) return;
 
     // Read upstream response (expect 101 Switching Protocols) within --timeout
     const head_src = UpstreamReader{ .conn = upstream, .deadline_ms = deadlineAfter(config.upstream_timeout_s) };
@@ -1553,9 +1554,9 @@ fn handleWebSocket(
     const elapsed = rt.milliTimestamp() - entry.timestamp;
     entry.duration_ms = if (elapsed > 0) @intCast(elapsed) else 0;
     // Store response headers
-    if (std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n")) |first_end| {
-        if (std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n\r\n")) |hdr_end| {
-            const resp_hdrs = resp_buf[first_end + 2 .. hdr_end];
+    if (std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n")) |resp_line_end| {
+        if (std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n\r\n")) |resp_hdr_end| {
+            const resp_hdrs = resp_buf[resp_line_end + 2 .. resp_hdr_end];
             const rh_len = @min(resp_hdrs.len, requests.max_header_len);
             @memcpy(entry.resp_headers[0..rh_len], resp_hdrs[0..rh_len]);
             entry.resp_headers_len = @intCast(rh_len);
@@ -2648,6 +2649,66 @@ test "WebSocket upgrade on an external route reaches the upstream over TLS" {
     try testing.expect(std.mem.indexOf(u8, head, "\r\nX-Forwarded-Host: dev.lo\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, head, "\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, head, "\r\nOrigin: https://dev.lo\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, head, "\r\nX-Real-IP: 127.0.0.1\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, head, "\r\nX-Forwarded-Proto: https\r\n") != null);
+}
+
+test "WebSocket upgrade on a local route gets X-Real-IP and X-Forwarded-Proto" {
+    var up = RecordingUpstream{ .response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" };
+    try up.start(18367);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18366, 18367);
+    defer px.stop();
+
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /hmr HTTP/1.1\r\nHost: dev.lo\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", "\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 101"));
+
+    const got = up.received();
+    try testing.expect(std.mem.startsWith(u8, got, "GET /hmr HTTP/1.1\r\n"));
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nHost: dev.lo\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nUpgrade: websocket\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nConnection: Upgrade\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Real-IP: 127.0.0.1\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-Proto: https\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\n"));
+}
+
+test "chunked upload arriving in two writes is relayed whole and the next request still answers" {
+    var up = RecordingUpstream{};
+    try up.start(18369);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18368, 18369);
+    defer px.stop();
+
+    // 5,000 bytes as 5 chunks of 1,000 (0x3e8), split mid-chunk across two writes.
+    const chunk = "3e8\r\n" ++ rep("x", 1000) ++ "\r\n";
+    const body = chunk ++ chunk ++ chunk ++ chunk ++ chunk ++ "0\r\n\r\n";
+    const head = "POST /upload HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const split = 2500;
+    const before = freshRing();
+    const first = head ++ body[0..split];
+    if (ssl_c.SSL_write(px.client, first.ptr, first.len) <= 0) return error.WriteFailed;
+    rt.sleepMs(200);
+    const rest = body[split..] ++ "GET /next HTTP/1.1\r\nHost: dev.lo\r\n\r\n";
+    if (ssl_c.SSL_write(px.client, rest.ptr, rest.len) <= 0) return error.WriteFailed;
+    var buf: [4096]u8 = undefined;
+    _ = try px.readResponses(2, "ok", &buf);
+    try testing.expect(std.mem.startsWith(u8, up.received(), "GET /next "));
+
+    const e = try testing.allocator.create(requests.Entry);
+    defer testing.allocator.destroy(e);
+    const deadline = rt.milliTimestamp() + 2000;
+    while (requests.getCount() < before + 2) {
+        if (rt.milliTimestamp() > deadline) return error.NoEntry;
+        rt.sleepMs(10);
+    }
+    try testing.expect(requests.copyEntry(before, e));
+    try testing.expectEqualStrings("/upload", e.getPath());
+    try testing.expectEqual(@as(u64, 5000), e.req_body_total);
 }
 
 test "long headers, URLs and methods reach upstream intact" {
