@@ -10,6 +10,7 @@ const tui = @import("tui.zig");
 const shutdown = @import("shutdown.zig");
 const intercept = @import("intercept.zig");
 const subprocess = @import("subprocess.zig");
+const cli = @import("cli.zig");
 const build_options = @import("build_options");
 
 const version = build_options.version;
@@ -87,31 +88,31 @@ pub fn main(init: std.process.Init) !void {
             command = .uninstall;
         } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--local")) {
             local = true;
-        } else if (flagValue(arg, "-p", "--port")) |val| {
+        } else if (takeFlag(arg, "-p", "--port", &args)) |val| {
             target_port = std.fmt.parseInt(u16, val, 10) catch {
                 std.debug.print("invalid port value: {s}\n", .{val});
                 std.process.exit(1);
             };
             port_set = true;
-        } else if (flagValue(arg, "-b", "--bind")) |val| {
+        } else if (takeFlag(arg, "-b", "--bind", &args)) |val| {
             bind_addr = val;
             bind_set = true;
             bind_explicit = true;
-        } else if (flagValue(arg, null, "--max-body")) |val| {
-            max_body = parseSize(val) orelse {
+        } else if (takeFlag(arg, null, "--max-body", &args)) |val| {
+            max_body = cli.parseSize(val) orelse {
                 std.debug.print("invalid max-body value: {s}\n", .{val});
                 std.process.exit(1);
             };
             max_body_set = true;
-        } else if (flagValue(arg, null, "--timeout")) |val| {
+        } else if (takeFlag(arg, null, "--timeout", &args)) |val| {
             timeout_s = proxy.parseTimeoutSeconds(val) orelse {
                 std.debug.print("invalid timeout value: {s}\n", .{val});
                 std.process.exit(1);
             };
             timeout_set = true;
-        } else if (flagValue(arg, null, "--route")) |val| {
+        } else if (takeFlag(arg, null, "--route", &args)) |val| {
             addRoute(allocator, &routes, &route_count, val);
-        } else if (flagValue(arg, "-c", "--config")) |val| {
+        } else if (takeFlag(arg, "-c", "--config", &args)) |val| {
             config_path = val;
         } else if (std.mem.eql(u8, arg, "--no-tui")) {
             no_tui = true;
@@ -124,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
             cert_only = true;
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--force")) {
             force = true;
-        } else if (flagValue(arg, null, "--command")) |val| {
+        } else if (takeFlag(arg, null, "--command", &args)) |val| {
             command_str = val;
             command_set = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
@@ -136,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
         } else {
             std.debug.print("unknown argument: {s}\n", .{arg});
             printHelp();
-            return;
+            std.process.exit(1);
         }
     }
 
@@ -194,6 +195,10 @@ pub fn main(init: std.process.Init) !void {
         const trimmed = std.mem.trim(u8, cmd, " \t");
         if (trimmed.len == 0) {
             std.debug.print("--command value cannot be empty\n", .{});
+            std.process.exit(1);
+        }
+        if (cmd.len > subprocess.max_command_len) {
+            std.debug.print("--command is longer than {d} bytes\n", .{subprocess.max_command_len});
             std.process.exit(1);
         }
         if (dns_only) {
@@ -312,12 +317,11 @@ fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool,
             if (!std.mem.eql(u8, avahi, "active")) {
                 // Configure systemd-resolved for mDNS
                 const resolved_conf = "[Resolve]\nMulticastDNS=yes\nLLMNR=no";
-                const tmp_file = try std.Io.Dir.cwd().createFile(rt.io(), "/tmp/zlodev_resolved.conf", .{});
-                try tmp_file.writeStreamingAll(rt.io(), resolved_conf);
-                tmp_file.close(rt.io());
+                const tmp_conf = try sys.writeTmpFile(allocator, "resolved_conf", resolved_conf);
+                defer allocator.free(tmp_conf);
+                defer sys.removeTmpFile(tmp_conf);
                 try sys.sudoCmd(allocator, &.{ "sudo", "mkdir", "-p", "/etc/systemd/resolved.conf.d" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", "/tmp/zlodev_resolved.conf", "/etc/systemd/resolved.conf.d/zlodev.conf" });
-                std.Io.Dir.cwd().deleteFile(rt.io(), "/tmp/zlodev_resolved.conf") catch {};
+                try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_conf, "/etc/systemd/resolved.conf.d/zlodev.conf" });
                 sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
             }
         },
@@ -676,40 +680,22 @@ fn printHelp() void {
         \\  Priority: subdomain > longest path > default port
         \\
         \\SIZE accepts suffixes: K (KB), M (MB), G (GB). Example: --max-body=50M
+        \\Value options also accept a space: --port 3000
         \\
     , .{version});
 }
 
-/// Extract value from --flag=VALUE or -f=VALUE style arguments.
-/// Returns the value after '=' if the arg matches, null otherwise.
-fn flagValue(arg: []const u8, short: ?[]const u8, long: []const u8) ?[]const u8 {
-    if (short) |s| {
-        const prefix = s;
-        if (arg.len > prefix.len and arg[prefix.len] == '=' and std.mem.startsWith(u8, arg, prefix)) {
-            return arg[prefix.len + 1 ..];
-        }
-    }
-    if (arg.len > long.len and arg[long.len] == '=' and std.mem.startsWith(u8, arg, long)) {
-        return arg[long.len + 1 ..];
-    }
-    return null;
-}
-
-/// Parse a size string with optional suffix: K, M, G. Returns bytes.
-fn parseSize(val: []const u8) ?usize {
-    if (val.len == 0) return null;
-    const last = val[val.len - 1];
-    if (last == 'K' or last == 'k') {
-        const n = std.fmt.parseInt(usize, val[0 .. val.len - 1], 10) catch return null;
-        return n * 1024;
-    } else if (last == 'M' or last == 'm') {
-        const n = std.fmt.parseInt(usize, val[0 .. val.len - 1], 10) catch return null;
-        return n * 1024 * 1024;
-    } else if (last == 'G' or last == 'g') {
-        const n = std.fmt.parseInt(usize, val[0 .. val.len - 1], 10) catch return null;
-        return n * 1024 * 1024 * 1024;
-    }
-    return std.fmt.parseInt(usize, val, 10) catch null;
+/// Value of a value flag, from `--flag=value` or the next argument; exits 1 when
+/// the flag ends the command line.
+fn takeFlag(arg: []const u8, short: ?[]const u8, long: []const u8, args: anytype) ?[]const u8 {
+    return switch (cli.matchFlag(arg, short, long)) {
+        .none => null,
+        .value => |v| v,
+        .needs_next => args.next() orelse {
+            std.debug.print("missing value for {s}\n", .{long});
+            std.process.exit(1);
+        },
+    };
 }
 
 fn detectPort() u16 {
@@ -890,7 +876,7 @@ fn readConfigFile(
         } else if (lineValue(line, "bind") orelse lineValue(line, "b")) |val| {
             result.bind = allocator.dupe(u8, val) catch null;
         } else if (lineValue(line, "max-body")) |val| {
-            result.max_body = parseSize(val) orelse {
+            result.max_body = cli.parseSize(val) orelse {
                 std.debug.print("config: invalid max-body value: {s}\n", .{val});
                 std.process.exit(1);
             };

@@ -8,31 +8,9 @@ const rt = @import("rt.zig");
 
 const c = @import("cert_c");
 
-pub fn getBasePath(buf: []u8) ![]const u8 {
-    switch (builtin.os.tag) {
-        .macos => {
-            const home = compat.getenv("HOME") orelse return error.NoHomeDir;
-            return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "Library/Application Support/zlodev", .{home});
-        },
-        .windows => {
-            const local_env = compat.getenv("LocalAppData") orelse return error.NoLocalAppData;
-            return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "zlodev", .{local_env});
-        },
-        else => {
-            // Linux
-            const xdg = compat.getenv("XDG_DATA_HOME");
-            if (xdg) |data_home| {
-                return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "zlodev", .{data_home});
-            }
-            const home = compat.getenv("HOME") orelse return error.NoHomeDir;
-            return std.fmt.bufPrint(buf, "{s}" ++ sep ++ ".local/share/zlodev", .{home});
-        },
-    }
-}
-
 pub fn getCertPath(buf: []u8, domain: []const u8) ![]const u8 {
     var base_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const base = try getBasePath(&base_buf);
+    const base = try sys.dataDir(&base_buf);
     return std.fmt.bufPrint(buf, "{s}" ++ sep ++ "{s}", .{ base, domain });
 }
 

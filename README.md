@@ -150,6 +150,8 @@ zlodev start --dns          start DNS server only (log mode)
 -h, --help                 show help
 ```
 
+Value options also accept a space: `--port 3000`.
+
 `SIZE` accepts suffixes: `K` (KB), `M` (MB), `G` (GB). Example: `--max-body=50M`
 
 Request bodies up to `--max-body` are forwarded in full (larger ones get `413`); the TUI keeps the first 32 KB of each body for display.
@@ -438,6 +440,14 @@ zlodev install --dns
 On Linux, `install` stops with an error unless systemd is PID 1 and `systemd-resolved` is active, and fails if `systemd-networkd` can't be reloaded (for example when it is masked). zlodev reloads networkd with `networkctl reload` rather than restarting it, so your other network interfaces are left alone. If the reload failed, run `zlodev uninstall --dns` to remove the half-written `zlodev0` interface files before trying again.
 
 On Windows, make sure "Use secure DNS" is disabled in your browser — Chromium browsers bypass the system DNS resolver when this is enabled.
+
+### Logs
+
+With the TUI on, errors go to `zlodev.log` in the zlodev data folder (`~/.local/share/zlodev` or `$XDG_DATA_HOME/zlodev` on Linux, `~/Library/Application Support/zlodev` on macOS, `%LocalAppData%\zlodev` on Windows). Over 1 MB it is moved to `zlodev.log.1` at start. Older versions wrote to `~/.zlodev/zlodev.log`; that file can be deleted.
+
+### Vite: "Blocked request. This host is not allowed"
+
+Vite 5.1+ checks the `Host` header. Add the zlodev domain to `vite.config`: `server: { allowedHosts: ['dev.lo', '.dev.lo'] }` (with `-l`, add your `<host>.local`).
 
 ### Mobile device can't connect
 
