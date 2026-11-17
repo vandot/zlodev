@@ -720,8 +720,9 @@ pub const NssDb = struct { path: []u8, kind: NssKind };
 /// NSS databases browsers read on Linux, which ignore the system CA bundle.
 /// `[0]` is always `<home>/.pki/nssdb` (deb/rpm Chrome, Chromium, Brave, Edge,
 /// Vivaldi, Opera), even when missing; the rest exist: snap apps' own
-/// `.pki/nssdb` and Firefox profiles (dirs holding cert9.db).
-pub fn nssDatabases(allocator: std.mem.Allocator, home: []const u8) ![]NssDb {
+/// `.pki/nssdb` and Firefox profiles (dirs holding cert9.db), including newer
+/// Firefox's XDG location (`config_home` = `$XDG_CONFIG_HOME`, else `<home>/.config`).
+pub fn nssDatabases(allocator: std.mem.Allocator, home: []const u8, config_home: ?[]const u8) ![]NssDb {
     var list: std.ArrayListUnmanaged(NssDb) = .empty;
     errdefer {
         for (list.items) |db| allocator.free(db.path);
@@ -732,6 +733,11 @@ pub fn nssDatabases(allocator: std.mem.Allocator, home: []const u8) ![]NssDb {
     var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     try appendExistingDbs(allocator, &list, try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ "snap", .{home}), "current" ++ sep ++ ".pki" ++ sep ++ "nssdb", .snap);
     try appendExistingDbs(allocator, &list, try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ ".mozilla" ++ sep ++ "firefox", .{home}), "", .firefox);
+    const xdg_firefox = if (config_home) |dir|
+        try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ "mozilla" ++ sep ++ "firefox", .{dir})
+    else
+        try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ ".config" ++ sep ++ "mozilla" ++ sep ++ "firefox", .{home});
+    try appendExistingDbs(allocator, &list, xdg_firefox, "", .firefox);
     try appendExistingDbs(allocator, &list, try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ "snap" ++ sep ++ "firefox" ++ sep ++ "common" ++ sep ++ ".mozilla" ++ sep ++ "firefox", .{home}), "", .firefox);
     return list.toOwnedSlice(allocator);
 }
@@ -779,7 +785,7 @@ const certutil_missing_fmt = "warning: certutil not found, so Chrome and Firefox
 /// Linux. Runs as the user, not sudo; failures only warn.
 fn addToNss(allocator: std.mem.Allocator, domain: []const u8, ca_path: []const u8) void {
     const home = compat.getenv("HOME") orelse return;
-    const dbs = nssDatabases(allocator, home) catch return;
+    const dbs = nssDatabases(allocator, home, compat.getenv("XDG_CONFIG_HOME")) catch return;
     defer freeNssDatabases(allocator, dbs);
     var nick_buf: [256]u8 = undefined;
     const nick = nssNickname(&nick_buf, domain) catch return;
@@ -827,7 +833,7 @@ fn addToNss(allocator: std.mem.Allocator, domain: []const u8, ca_path: []const u
 /// Remove the CA from every NSS database that exists. Never creates one.
 fn removeFromNss(allocator: std.mem.Allocator, domain: []const u8) void {
     const home = compat.getenv("HOME") orelse return;
-    const dbs = nssDatabases(allocator, home) catch return;
+    const dbs = nssDatabases(allocator, home, compat.getenv("XDG_CONFIG_HOME")) catch return;
     defer freeNssDatabases(allocator, dbs);
     var nick_buf: [256]u8 = undefined;
     const nick = nssNickname(&nick_buf, domain) catch return;
@@ -1292,7 +1298,7 @@ test "nssDatabases lists ~/.pki/nssdb first even when it is missing" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(rt.io(), "home");
     var buf: [256]u8 = undefined;
-    const dbs = try nssDatabases(std.testing.allocator, try tmpPathZ(&buf, &tmp, "home"));
+    const dbs = try nssDatabases(std.testing.allocator, try tmpPathZ(&buf, &tmp, "home"), null);
     defer freeNssDatabases(std.testing.allocator, dbs);
     try std.testing.expectEqual(@as(usize, 1), dbs.len);
     try std.testing.expectEqual(NssKind.chromium, dbs[0].kind);
@@ -1315,7 +1321,7 @@ test "nssDatabases finds snap databases and Firefox profiles that exist" {
     try touchFile(tmp.dir, h ++ ".var" ++ sep ++ "app" ++ sep ++ "com.brave.Browser" ++ sep ++ ".pki" ++ sep ++ "nssdb" ++ sep ++ "cert9.db");
 
     var buf: [256]u8 = undefined;
-    const dbs = try nssDatabases(std.testing.allocator, try tmpPathZ(&buf, &tmp, "home"));
+    const dbs = try nssDatabases(std.testing.allocator, try tmpPathZ(&buf, &tmp, "home"), null);
     defer freeNssDatabases(std.testing.allocator, dbs);
 
     try std.testing.expectEqual(@as(usize, 6), dbs.len);
@@ -1369,4 +1375,23 @@ test "bundleWithoutCa keeps a legacy block holding another CA" {
 
 test "bundleWithoutCa returns null when the domain has no block" {
     try std.testing.expect((try bundleWithoutCa(std.testing.allocator, "roots\n", "dev.lo", test_pem)) == null);
+}
+
+test "nssDatabases finds Firefox profiles in the XDG config dir" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try touchFile(tmp.dir, "home" ++ sep ++ ".config" ++ sep ++ "mozilla" ++ sep ++ "firefox" ++ sep ++ "p1.default" ++ sep ++ "cert9.db");
+    try touchFile(tmp.dir, "xdg" ++ sep ++ "mozilla" ++ sep ++ "firefox" ++ sep ++ "p2.default" ++ sep ++ "cert9.db");
+    var home_buf: [256]u8 = undefined;
+    var xdg_buf: [256]u8 = undefined;
+    const home = try tmpPathZ(&home_buf, &tmp, "home");
+
+    const default_dbs = try nssDatabases(std.testing.allocator, home, null);
+    defer freeNssDatabases(std.testing.allocator, default_dbs);
+    try std.testing.expect(hasDb(default_dbs, "p1.default", .firefox));
+
+    const xdg_dbs = try nssDatabases(std.testing.allocator, home, try tmpPathZ(&xdg_buf, &tmp, "xdg"));
+    defer freeNssDatabases(std.testing.allocator, xdg_dbs);
+    try std.testing.expect(hasDb(xdg_dbs, "p2.default", .firefox));
+    try std.testing.expect(!hasDb(xdg_dbs, "p1.default", .firefox));
 }
