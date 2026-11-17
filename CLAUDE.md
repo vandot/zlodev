@@ -26,6 +26,9 @@ zig test src/rt.zig                  # run runtime (Io, timestamps, worker slots
 zig test src/compat.zig              # run socket layer tests
 zig test src/http_server.zig         # run HTTP server tests
 zig test src/shutdown.zig            # run shutdown/signal tests
+zig test src/cli.zig                 # run CLI flag/size parsing tests
+zig test src/sys.zig -lc             # run temp file / data dir tests
+zig test src/log.zig -lc             # run log file tests
 zig test tests/install.zig           # run install/uninstall tests
 zig test tests/integration.zig       # run integration tests (needs running zlodev + httpbin, see CI)
 ```
@@ -52,7 +55,8 @@ log.zig           Structured logging (stderr or file when TUI is active, mutex-p
 search.zig        Entry search/filter logic
 clipboard.zig     Copy-as-curl and case-insensitive string helpers
 har.zig           HAR (HTTP Archive) export
-sys.zig           System command helpers (sudo, tmp files, dir checks)
+sys.zig           System command helpers (sudo, private tmp files, dir checks, data dir `dataDir`)
+cli.zig           Pure CLI helpers (flag matching, size parsing)
 compat.zig        Cross-platform socket layer (Winsock on Windows, BSD sockets on POSIX: bind/listen/accept/connect/UDP, poll, SocketStream)
 rt.zig            Process-wide std.Io handle, timestamps, sleep, worker spawn + slot caps
 win32.zig         Win32/Winsock bindings Zig 0.17 std no longer exposes (console, sockets, job objects)
@@ -111,6 +115,7 @@ win32.zig         Win32/Winsock bindings Zig 0.17 std no longer exposes (console
 - After `sslSendError`, always `return` (never `continue` in keep-alive loop) — TLS state may be corrupted.
 - Proxy-made errors go through `failRequest` (reason as body, entry w/ `error_msg`, or `finishFailed` for held entries; TUI shows `502!`). `--timeout` (`upstream_timeout_s`) = connect (`compat.tcpConnectTimeout`) + response-head deadline → 504; upstream reads go through `UpstreamReader` (poll + shutdown check; TLS upstream sockets non-blocking after handshake, `WouldBlock` → re-poll), body relay has no deadline (SSE/long poll safe).
 - Proxy-owned headers (`proxy_owned_headers`): client `Accept-Encoding`, `Cache-Control`, `X-Forwarded-*`, `X-Real-IP` dropped; `writeProxyHeaders` emits its own (XFF appends `client_xff`, `Accept-Encoding: identity`). Port-80 redirect host via `http_wire.sameSiteHost`.
+- Temp files for sudo: `sys.writeTmpFile` (random name, exclusive, 0600) + `sudo install -m 644` + `sys.removeTmpFile`. Log: `<sys.dataDir>/zlodev.log`, rotated at 1 MB on open. CLI value flags take `--flag=value` or `--flag value` (`cli.matchFlag`); unknown args exit 1.
 - `forwardResponseFromEntry` emits recomputed `Content-Length`, even for zero-length bodies, except for bodiless responses (HEAD/1xx/204/304).
 - Responses to HEAD and 1xx/204/304 never carry body (`http_wire.responseHasBody`): proxy reads no body, keeps connection alive, forwards upstream headers unchanged (HEAD keeps `Content-Length`). `readResponseHead` skips interim 1xx heads (100 Continue, 103 Early Hints), returns 101 as final. Proxy tests needing full `handleConnection` path use `ProxyHarness` + `FakeUpstream`.
 - TUI split-pane layout uses `win.child()` for clipping; requests pane rendered into child window w/ `draw_footer=false` so footer not drawn mid-split.
