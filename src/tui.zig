@@ -1116,6 +1116,8 @@ fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Entry, se
         const status_text = std.fmt.bufPrint(&status_buf, "{d}", .{entry.status}) catch "?";
         const status_color = statusColor(entry.status);
         writeAscii(win, 11, row, status_text, .{ .fg = status_color, .bg = bg });
+        // Answered by zlodev itself (upstream down, timeout, too large): mark it.
+        if (entry.error_len > 0) writeAscii(win, 11 + @as(u16, @intCast(status_text.len)), row, "!", .{ .fg = red, .bg = bg, .bold = true });
     }
 
     var dur_buf: [16]u8 = undefined;
@@ -1184,6 +1186,7 @@ fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const reques
     var method_path_buf: [600]u8 = undefined;
     var req_trunc_buf: [64]u8 = undefined;
     var resp_trunc_buf: [64]u8 = undefined;
+    var error_buf: [200]u8 = undefined;
     const method_path = std.fmt.bufPrint(&method_path_buf, "{s} {s}", .{ e.getMethod(), e.getPath() }) catch "";
     lines[line_count] = .{ .text = method_path, .style = .{ .fg = white } };
     line_count += 1;
@@ -1222,6 +1225,14 @@ fn drawDetail(alloc: std.mem.Allocator, win: vaxis.Window, entry: ?*const reques
         }
         lines[line_count] = .{ .text = "", .style = .{} };
         line_count += 1;
+    }
+
+    // zlodev answered this request itself: say why, above the (empty) response.
+    if (e.error_len > 0) {
+        const red: vaxis.Color = .{ .rgb = .{ 0xf8, 0x51, 0x49 } };
+        const reason = std.fmt.bufPrint(&error_buf, "zlodev: {s}", .{e.getError()}) catch "zlodev: request failed";
+        pushLine(&lines, &line_count, .{ .text = reason, .style = .{ .fg = red, .bold = true } });
+        pushLine(&lines, &line_count, .{ .text = "", .style = .{} });
     }
 
     // Response headers

@@ -62,6 +62,8 @@ pub fn main(init: std.process.Init) !void {
     var cert_only: bool = false;
     var max_body: usize = proxy.default_max_request_body;
     var max_body_set = false;
+    var timeout_s: u32 = proxy.default_upstream_timeout_s;
+    var timeout_set = false;
     var routes: [proxy.max_routes]proxy.Route = undefined;
     var route_count: usize = 0;
     defer for (routes[0..route_count]) |route| {
@@ -101,6 +103,12 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             max_body_set = true;
+        } else if (flagValue(arg, null, "--timeout")) |val| {
+            timeout_s = proxy.parseTimeoutSeconds(val) orelse {
+                std.debug.print("invalid timeout value: {s}\n", .{val});
+                std.process.exit(1);
+            };
+            timeout_set = true;
         } else if (flagValue(arg, null, "--route")) |val| {
             addRoute(allocator, &routes, &route_count, val);
         } else if (flagValue(arg, "-c", "--config")) |val| {
@@ -156,6 +164,9 @@ pub fn main(init: std.process.Init) !void {
             if (!max_body_set) if (cfg.max_body) |mb| {
                 max_body = mb;
             };
+            if (!timeout_set) if (cfg.timeout) |t| {
+                timeout_s = t;
+            };
             if (cfg.local) local = true;
             if (cfg.dns) dns_only = true;
             if (cfg.intercept_pattern) |pat| intercept.enableWithPattern(pat);
@@ -172,7 +183,7 @@ pub fn main(init: std.process.Init) !void {
 
     // When using --dns with start, no other options apply
     if (command == .start and dns_only) {
-        if (port_set or bind_set or no_tui_set or max_body_set or route_count > 0 or insecure_upstream) {
+        if (port_set or bind_set or no_tui_set or max_body_set or timeout_set or route_count > 0 or insecure_upstream) {
             std.debug.print("--dns cannot be combined with other start options\n", .{});
             std.process.exit(1);
         }
@@ -241,7 +252,7 @@ pub fn main(init: std.process.Init) !void {
             if (dns_only) {
                 try doStartDns(tld);
             } else {
-                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, !local and !bind_explicit, no_tui, max_body, routes[0..route_count], command_str, insecure_upstream);
+                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, !local and !bind_explicit, no_tui, max_body, routes[0..route_count], command_str, insecure_upstream, timeout_s);
             }
         },
         .uninstall => {
@@ -415,6 +426,7 @@ fn doStart(
     routes: []const proxy.Route,
     command: ?[]const u8,
     insecure_upstream: bool,
+    upstream_timeout_s: u32,
 ) !void {
     // Check if another instance is already running
     if (isPortListening(bind_addr, 443)) {
@@ -529,6 +541,7 @@ fn doStart(
         .routes = routes,
         .domain = domain_owned,
         .insecure_upstream = insecure_upstream,
+        .upstream_timeout_s = upstream_timeout_s,
     };
     if (insecure_upstream) {
         std.debug.print("warning: --insecure-upstream: certificates of external routes are not verified\n", .{});
@@ -630,6 +643,7 @@ fn printHelp() void {
         \\  --route=PATTERN=TARGET     route by subdomain or path (repeatable)
         \\  -c=PATH, --config=PATH     config file path [default .zlodev]
         \\  --max-body=SIZE            max request body size [default 10M]
+        \\  --timeout=SECONDS          upstream connect/response timeout [default 30, 0 = none]
         \\  --command=CMD              run CMD as subprocess (stopped on exit)
         \\  --no-tui                   disable TUI, log to stderr
         \\  --insecure-upstream        don't verify external route certificates
@@ -650,6 +664,7 @@ fn printHelp() void {
         \\    command=npm run dev
         \\    no-tui
         \\    insecure-upstream
+        \\    timeout=60
         \\  CLI arguments override config file values.
         \\
         \\Routes:
@@ -843,6 +858,7 @@ const ConfigResult = struct {
     no_tui: bool = false,
     insecure_upstream: bool = false,
     max_body: ?usize = null,
+    timeout: ?u32 = null,
     local: bool = false,
     dns: bool = false,
     intercept_pattern: ?[]const u8 = null,
@@ -876,6 +892,11 @@ fn readConfigFile(
         } else if (lineValue(line, "max-body")) |val| {
             result.max_body = parseSize(val) orelse {
                 std.debug.print("config: invalid max-body value: {s}\n", .{val});
+                std.process.exit(1);
+            };
+        } else if (lineValue(line, "timeout")) |val| {
+            result.timeout = proxy.parseTimeoutSeconds(val) orelse {
+                std.debug.print("config: invalid timeout value: {s}\n", .{val});
                 std.process.exit(1);
             };
         } else if (lineValue(line, "route")) |val| {

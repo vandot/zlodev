@@ -14,6 +14,13 @@ const win32 = @import("win32.zig");
 const ssl_c = @import("ssl_c");
 
 pub const default_max_request_body: usize = 10 * 1024 * 1024; // 10MB
+pub const default_upstream_timeout_s: u32 = 30;
+
+/// `--timeout` / `timeout=` value: whole seconds, 0 (no limit) to one day.
+pub fn parseTimeoutSeconds(val: []const u8) ?u32 {
+    const n = std.fmt.parseInt(u32, val, 10) catch return null;
+    return if (n <= 86400) n else null;
+}
 
 pub const Route = struct {
     kind: enum { subdomain, path },
@@ -39,6 +46,8 @@ pub const ProxyConfig = struct {
     domain: []const u8 = "dev.lo",
     /// Skip certificate verification for external routes (`--insecure-upstream`).
     insecure_upstream: bool = false,
+    /// Upstream connect + response-head deadline in seconds (`--timeout`); 0 = none.
+    upstream_timeout_s: u32 = default_upstream_timeout_s,
 };
 
 var conn_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
@@ -107,14 +116,29 @@ fn resolveRoute(config: *const ProxyConfig, host: []const u8, uri: []const u8) R
 /// Upstream connection abstraction — wraps either a plain socket (local) or TLS (external).
 const UpstreamConn = struct {
     sock: compat.SocketStream,
+    /// TLS upstreams (external routes) run non-blocking after the handshake: poll
+    /// readiness can come from records that hold no data (TLS 1.3 session tickets),
+    /// and a blocking SSL_read would then wait past any deadline or shutdown.
     ssl_conn: ?*ssl_c.SSL = null,
+    /// How long a TLS write may wait for the socket (`--timeout`; 0 = no limit).
+    write_timeout_ms: u32 = 0,
 
     fn writeAll(self: UpstreamConn, data: []const u8) !void {
         if (self.ssl_conn) |s| {
             var sent: usize = 0;
             while (sent < data.len) {
                 const n = ssl_c.SSL_write(s, @ptrCast(data[sent..].ptr), @intCast(data.len - sent));
-                if (n <= 0) return error.SslWrite;
+                if (n <= 0) {
+                    const events: i16 = switch (ssl_c.SSL_get_error(s, n)) {
+                        ssl_c.SSL_ERROR_WANT_WRITE => compat.POLL.OUT,
+                        ssl_c.SSL_ERROR_WANT_READ => compat.POLL.IN,
+                        else => return error.SslWrite,
+                    };
+                    var fds = [1]compat.pollfd{.{ .fd = self.sock.handle, .events = events, .revents = 0 }};
+                    const wait_ms = if (self.write_timeout_ms == 0) std.math.maxInt(u32) else self.write_timeout_ms;
+                    if (compat.pollWhileRunning(&fds, wait_ms, shutdown.isRunning) != .ready) return error.SslWrite;
+                    continue;
+                }
                 sent += @intCast(n);
             }
         } else {
@@ -122,10 +146,15 @@ const UpstreamConn = struct {
         }
     }
 
+    /// `error.WouldBlock` (TLS only): nothing to read yet; poll and try again.
     pub fn read(self: UpstreamConn, buf: []u8) !usize {
         if (self.ssl_conn) |s| {
             const n = ssl_c.SSL_read(s, @ptrCast(buf.ptr), @intCast(buf.len));
-            if (n <= 0) return error.SslRead;
+            if (n <= 0) return switch (ssl_c.SSL_get_error(s, n)) {
+                ssl_c.SSL_ERROR_WANT_READ, ssl_c.SSL_ERROR_WANT_WRITE => error.WouldBlock,
+                ssl_c.SSL_ERROR_ZERO_RETURN => 0,
+                else => error.SslRead,
+            };
             return @intCast(n);
         } else {
             return self.sock.read(buf);
@@ -140,6 +169,43 @@ const UpstreamConn = struct {
         self.sock.close();
     }
 };
+
+/// Reads the upstream through poll, so a deadline can end the wait (`error.Timeout`)
+/// and shutdown is noticed within a second. `deadline_ms` 0 = wait until data,
+/// close or shutdown. TLS bytes BoringSSL already decrypted are read without polling.
+const UpstreamReader = struct {
+    conn: UpstreamConn,
+    deadline_ms: i64 = 0,
+
+    pub fn read(self: UpstreamReader, buf: []u8) !usize {
+        while (true) {
+            const pending = if (self.conn.ssl_conn) |s| ssl_c.SSL_pending(s) > 0 else false;
+            if (!pending) {
+                var fds = [1]compat.pollfd{.{ .fd = self.conn.sock.handle, .events = compat.POLL.IN, .revents = 0 }};
+                const wait_ms: u32 = if (self.deadline_ms == 0) std.math.maxInt(u32) else blk: {
+                    const left = self.deadline_ms - rt.milliTimestamp();
+                    break :blk if (left > 0) @intCast(left) else 0;
+                };
+                switch (compat.pollWhileRunning(&fds, wait_ms, shutdown.isRunning)) {
+                    .ready => {},
+                    .timeout => return error.Timeout,
+                    .stopped, .failed => return error.Closed,
+                }
+            }
+            // A TLS record with no application data (session ticket) or half a
+            // record: nothing to hand back yet, so wait again within the deadline.
+            return self.conn.read(buf) catch |e| {
+                if (e == error.WouldBlock) continue;
+                return e;
+            };
+        }
+    }
+};
+
+/// Absolute deadline `timeout_s` from now; 0 = none.
+fn deadlineAfter(timeout_s: u32) i64 {
+    return if (timeout_s == 0) 0 else rt.milliTimestamp() + @as(i64, timeout_s) * 1000;
+}
 
 /// Root bundles tried after BoringSSL's defaults (`/etc/ssl/cert.pem`, `/etc/ssl/certs`,
 /// `SSL_CERT_FILE`/`SSL_CERT_DIR`). The first that loads wins.
@@ -401,10 +467,20 @@ fn rejectConnectionAndRelease(ssl: *ssl_c.SSL, client_sock: compat.socket_t, con
     rejectConnection(ssl, client_sock, conn_id);
 }
 
-/// Resolve, connect, and (for external routes) TLS-handshake an upstream connection.
-/// On any failure the specific cause is logged and `error.UpstreamUnavailable` is
-/// returned; the caller maps that to a single 502. Sets send/recv timeouts on the
-/// socket before returning.
+const UpstreamError = error{ DnsFailed, ConnectRefused, ConnectFailed, ConnectTimeout, TlsFailed, UpstreamCertUntrusted };
+
+fn connectError(e: compat.SocketError) UpstreamError {
+    return switch (e) {
+        error.UnknownHostName => error.DnsFailed,
+        error.ConnectionRefused => error.ConnectRefused,
+        error.TimedOut => error.ConnectTimeout,
+        else => error.ConnectFailed,
+    };
+}
+
+/// Resolve, connect (within `--timeout`), and for external routes TLS-handshake an
+/// upstream connection. Each failure is logged and returned as its own error so the
+/// caller can tell the client why. Sets send/recv timeouts on the socket.
 fn connectUpstream(
     is_external: bool,
     upstream_host: []const u8,
@@ -412,11 +488,12 @@ fn connectUpstream(
     config: *const ProxyConfig,
     client_ctx: ?*ssl_c.SSL_CTX,
     conn_id: u64,
-) !UpstreamConn {
+) UpstreamError!UpstreamConn {
+    const timeout_ms = config.upstream_timeout_s * 1000;
     // Resolve + connect — DNS for external, IP parse for local
     const upstream_sock: compat.socket_t = blk: {
         if (is_external) {
-            break :blk compat.tcpConnectHost(upstream_host, upstream_port) catch |e| {
+            break :blk compat.tcpConnectHost(upstream_host, upstream_port, timeout_ms) catch |e| {
                 switch (e) {
                     error.UnknownHostName => log.err(
                         "component=proxy conn={d} op=dns_resolve host={s} error={any}",
@@ -427,23 +504,23 @@ fn connectUpstream(
                         .{ conn_id, upstream_host, e },
                     ),
                 }
-                return error.UpstreamUnavailable;
+                return connectError(e);
             };
         } else {
             const addr = std.Io.net.IpAddress.parse(config.target_host, upstream_port) catch {
-                return error.UpstreamUnavailable;
+                return error.ConnectFailed;
             };
-            break :blk compat.tcpConnect(addr) catch |e| {
+            break :blk compat.tcpConnectTimeout(addr, timeout_ms) catch |e| {
                 log.err("component=proxy conn={d} op=upstream_connect host={s} error={any}", .{ conn_id, upstream_host, e });
-                return error.UpstreamUnavailable;
+                return connectError(e);
             };
         }
     };
 
     // Before the TLS handshake: an upstream that accepts TCP but never answers
     // the handshake must not pin this worker forever.
-    setSocketTimeout(upstream_sock, .recv, 30);
-    setSocketTimeout(upstream_sock, .send, 30);
+    setSocketTimeout(upstream_sock, .recv, config.upstream_timeout_s);
+    setSocketTimeout(upstream_sock, .send, config.upstream_timeout_s);
 
     // Wrap in TLS for external upstreams; plain socket for local
     var upstream_ssl_obj: ?*ssl_c.SSL = null;
@@ -452,16 +529,22 @@ fn connectUpstream(
             // client_ctx is null — SSL_CTX allocation failed at startup
             log.err("component=proxy conn={d} op=external_tls error=no_client_ctx", .{conn_id});
             compat.closeSocket(upstream_sock);
-            return error.UpstreamUnavailable;
+            return error.TlsFailed;
         };
         const us = upstreamHandshake(cctx, upstream_sock, upstream_host, conn_id) catch |e| {
             compat.closeSocket(upstream_sock);
-            return e;
+            return if (e == error.UpstreamCertUntrusted) error.UpstreamCertUntrusted else error.TlsFailed;
         };
         upstream_ssl_obj = us;
+        // See UpstreamConn: from here on TLS reads and writes never block.
+        compat.setBlocking(upstream_sock, false) catch {
+            ssl_c.SSL_free(us);
+            compat.closeSocket(upstream_sock);
+            return error.TlsFailed;
+        };
     }
 
-    return UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj };
+    return UpstreamConn{ .sock = .{ .handle = upstream_sock }, .ssl_conn = upstream_ssl_obj, .write_timeout_ms = timeout_ms };
 }
 
 fn handleConnection(
@@ -515,7 +598,9 @@ fn handleConnection(
 
         if (headers_end == null) {
             if (total == req_buf.len) {
-                sslSendError(ssl, 431, "Request Header Fields Too Large");
+                var big = requests.Entry{ .timestamp = rt.milliTimestamp() };
+                fillRequestLine(&big, req_buf[0..total]);
+                failRequest(ssl, &big, null, 431, "request head over 16KB");
                 discardPendingInput(ssl, client_sock);
             }
             return; // client closed, or a head that doesn't fit
@@ -581,7 +666,9 @@ fn handleConnection(
         const content_length: usize = if (req_chunked) 0 else http_wire.getContentLength(req_hdr_section) orelse 0;
         if (content_length > config.max_request_body) {
             log.err("component=proxy conn={d} op=body_read bytes={d} max={d} error=body_too_large", .{ conn_id, content_length, config.max_request_body });
-            sslSendError(ssl, 413, "Request Entity Too Large");
+            entry.req_body_truncated = true;
+            var rb: [64]u8 = undefined;
+            failRequest(ssl, &entry, null, 413, std.fmt.bufPrint(&rb, "body over --max-body ({d} bytes)", .{content_length}) catch "body over --max-body");
             discardPendingInput(ssl, client_sock);
             return;
         }
@@ -610,11 +697,12 @@ fn handleConnection(
                 probe = p;
                 switch (p.outcome) {
                     .parse_error => {
-                        sslSendError(ssl, 400, "Bad Request");
+                        entry.req_body_truncated = true;
+                        failRequest(ssl, &entry, null, 400, "bad chunked encoding");
                         discardPendingInput(ssl, client_sock);
                         return;
                     },
-                    .ended => return, // client gone mid-body
+                    .ended, .timed_out => return, // client gone mid-body
                     .too_large => fits = false,
                     .complete => {
                         entry.req_body_len = @intCast(dec.captured);
@@ -656,6 +744,8 @@ fn handleConnection(
             }
         }
 
+        const held: ?usize = if (was_intercepted) intercept_backing_idx else null;
+
         // Ensure intercepted entries are unpinned on any early exit after this point.
         // Normal completion paths call finishEntry/finishResponseIntercept explicitly,
         // which set status/duration before unpinning — so this defer only fires for
@@ -670,14 +760,9 @@ fn handleConnection(
         const upstream_host = route_result.hostname orelse config.target_host;
 
         const upstream = connectUpstream(is_external, upstream_host, upstream_port, config, client_ctx, conn_id) catch |e| {
-            const dur = rt.milliTimestamp() - start_time;
-            if (was_intercepted) {
-                requests.finishEntry(intercept_backing_idx, 502, if (dur > 0) @intCast(dur) else 0, "", "");
-            }
-            sslSendError(ssl, 502, if (e == error.UpstreamCertUntrusted)
-                "Upstream certificate not trusted (use --insecure-upstream to skip verification)"
-            else
-                "Bad Gateway");
+            var rb: [192]u8 = undefined;
+            const r = connectReason(&rb, e, upstream_host, upstream_port, config.upstream_timeout_s);
+            failRequest(ssl, &entry, held, r.status, r.reason);
             return;
         };
         defer upstream.close();
@@ -689,8 +774,7 @@ fn handleConnection(
         defer if (fwd_snapshot) |s| std.heap.page_allocator.destroy(s);
         const fwd_entry: *const requests.Entry = if (was_intercepted) blk: {
             const s = std.heap.page_allocator.create(requests.Entry) catch {
-                requests.finishEntry(intercept_backing_idx, 502, 0, "", "");
-                sslSendError(ssl, 502, "Bad Gateway");
+                failRequest(ssl, &entry, held, 502, "out of memory");
                 return;
             };
             fwd_snapshot = s;
@@ -728,13 +812,16 @@ fn handleConnection(
                 entry.req_body_truncated = pr.truncated;
                 if (pr.over_limit) {
                     log.err("component=proxy conn={d} op=body_read max={d} error=body_too_large", .{ conn_id, config.max_request_body });
-                    sslSendError(ssl, 413, "Request Entity Too Large");
+                    entry.req_body_truncated = true;
+                    var rb: [64]u8 = undefined;
+                    failRequest(ssl, &entry, null, 413, std.fmt.bufPrint(&rb, "body over --max-body ({d} bytes)", .{dec.decoded_total}) catch "body over --max-body");
                     discardPendingInput(ssl, client_sock);
                     return;
                 }
                 if (pr.state != .done and !upstream_failed) {
                     if (pr.state == .parse_error) {
-                        sslSendError(ssl, 400, "Bad Request");
+                        entry.req_body_truncated = true;
+                        failRequest(ssl, &entry, null, 400, "bad chunked encoding");
                         discardPendingInput(ssl, client_sock);
                     }
                     return; // bad framing, or client gone mid-body
@@ -753,7 +840,7 @@ fn handleConnection(
             // Upstream stopped taking the request (closed, or a 30s send timeout):
             // don't drain the rest of the upload into it.
             log.err("component=proxy conn={d} op=upstream_write error=write_failed", .{conn_id});
-            sslSendError(ssl, 502, "Bad Gateway");
+            failRequest(ssl, &entry, held, 502, "upstream stopped reading the request");
             discardPendingInput(ssl, client_sock);
             return;
         }
@@ -762,7 +849,19 @@ fn handleConnection(
 
         // Read and parse the upstream response head
         var resp_buf: [16384]u8 = undefined;
-        const head = http_wire.readResponseHead(upstream, &resp_buf) orelse return;
+        const head_src = UpstreamReader{ .conn = upstream, .deadline_ms = deadlineAfter(config.upstream_timeout_s) };
+        const head = switch (http_wire.readResponseHeadResult(head_src, &resp_buf)) {
+            .head => |h| h,
+            .closed => {
+                failRequest(ssl, &entry, held, 502, "upstream closed before responding");
+                return;
+            },
+            .timeout => {
+                var rb: [48]u8 = undefined;
+                failRequest(ssl, &entry, held, 504, std.fmt.bufPrint(&rb, "no response within {d}s", .{config.upstream_timeout_s}) catch "no response in time");
+                return;
+            },
+        };
         entry.status = head.status;
 
         // Capture response headers
@@ -799,21 +898,23 @@ fn handleConnection(
         if (intercept.shouldInterceptResponse(method, uri)) resp_hold: {
             // Hold only a response whose capture is complete; else relay it unheld.
             var fits = !entry.resp_headers_truncated;
+            // The probe gives up at --timeout; what it read so far is relayed unheld.
+            const probe_src = UpstreamReader{ .conn = upstream, .deadline_ms = deadlineAfter(config.upstream_timeout_s) };
             if (fits and has_body) {
                 if (is_chunked or resp_content_length == null) {
                     const raw = std.heap.page_allocator.alloc(u8, probe_cap) catch break :resp_hold;
                     resp_probe_buf = raw;
                     if (is_chunked) {
-                        const p = probeChunked(&resp_dec, head.initial_body, upstream, &entry.resp_body, raw);
+                        const p = probeChunked(&resp_dec, head.initial_body, probe_src, &entry.resp_body, raw);
                         if (p.outcome == .complete) {
                             entry.resp_body_len = @intCast(resp_dec.captured);
                             entry.resp_body_total = resp_dec.decoded_total;
-                        } else if (p.outcome == .too_large) {
+                        } else if (p.outcome == .too_large or p.outcome == .timed_out) {
                             fits = false;
                             prefetched = p.raw;
                         } else return; // bad framing or upstream gone before the end
                     } else {
-                        const p = probeUntilClose(head.initial_body, upstream, raw[0 .. requests.max_body_len + 1]);
+                        const p = probeUntilClose(head.initial_body, probe_src, raw[0 .. requests.max_body_len + 1]);
                         if (p.complete) {
                             @memcpy(entry.resp_body[0..p.raw.len], p.raw);
                             entry.resp_body_len = @intCast(p.raw.len);
@@ -824,9 +925,14 @@ fn handleConnection(
                         }
                     }
                 } else if (resp_content_length.? <= requests.max_body_len) {
-                    const br = http_wire.streamBody(head.initial_body, upstream, http_wire.NullSink{}, resp_content_length, &entry.resp_body);
+                    const br = http_wire.streamBody(head.initial_body, probe_src, http_wire.NullSink{}, resp_content_length, &entry.resp_body);
                     entry.resp_body_len = @intCast(br.captured);
                     entry.resp_body_total = br.total;
+                    if (br.total < resp_content_length.?) {
+                        // Timed out (or closed) short: the bytes read sit in the capture.
+                        fits = false;
+                        prefetched = entry.resp_body[0..br.captured];
+                    }
                 } else {
                     fits = false;
                 }
@@ -897,7 +1003,7 @@ fn handleConnection(
             continue;
         }
 
-        relayResponse(ssl, head, upstream, &entry, relay_ctx, &resp_dec, prefetched);
+        relayResponse(ssl, head, UpstreamReader{ .conn = upstream }, &entry, relay_ctx, &resp_dec, prefetched);
 
         const elapsed = rt.milliTimestamp() - start_time;
         entry.duration_ms = if (elapsed > 0) @intCast(elapsed) else 0;
@@ -1056,7 +1162,7 @@ const RelayCtx = struct {
 /// body, capturing up to max_body_len into `entry`. `prefetched` holds body bytes an
 /// intercept probe already read (relayed first); for chunked bodies `dec` carries
 /// the probe's decoder state, else it is fresh.
-fn relayResponse(ssl: *ssl_c.SSL, head: http_wire.ResponseHead, upstream: UpstreamConn, entry: *requests.Entry, ctx: RelayCtx, dec: *http_wire.ChunkedDecoder, prefetched: []const u8) void {
+fn relayResponse(ssl: *ssl_c.SSL, head: http_wire.ResponseHead, upstream: UpstreamReader, entry: *requests.Entry, ctx: RelayCtx, dec: *http_wire.ChunkedDecoder, prefetched: []const u8) void {
     const sink = SslSink{ .ssl = ssl };
     sslWriteAll(ssl, head.status_line);
     http_wire.forwardHeaders(head.headers, sink, .{
@@ -1078,6 +1184,14 @@ fn relayResponse(ssl: *ssl_c.SSL, head: http_wire.ResponseHead, upstream: Upstre
         entry.resp_body_len = @intCast(pr.captured);
         entry.resp_body_truncated = pr.truncated;
         entry.resp_body_total = dec.decoded_total;
+    } else if (prefetched.len > 0 and ctx.content_length != null) {
+        // Content-Length body whose intercept fit read timed out: its first bytes
+        // are already in the capture; relay them, then stream the rest.
+        sink.write(prefetched);
+        const br = http_wire.streamBody("", upstream, sink, ctx.content_length.? - prefetched.len, entry.resp_body[prefetched.len..]);
+        entry.resp_body_len = @intCast(prefetched.len + br.captured);
+        entry.resp_body_truncated = br.truncated;
+        entry.resp_body_total = prefetched.len + br.total;
     } else if (prefetched.len > 0) {
         // Read-to-close body the probe outgrew: relay it, capture its head, stream the rest.
         sink.write(prefetched);
@@ -1101,7 +1215,11 @@ fn probeUntilClose(initial: []const u8, src: anytype, raw: []u8) struct { comple
     @memcpy(raw[0..initial.len], initial);
     var len: usize = initial.len;
     while (len < raw.len) {
-        const n = src.read(raw[len..]) catch 0;
+        // A timeout is not the end of the body: report it as not complete.
+        const n = src.read(raw[len..]) catch |e| {
+            if (http_wire.isTimeout(e)) return .{ .complete = false, .raw = raw[0..len] };
+            return .{ .complete = true, .raw = raw[0..len] };
+        };
         if (n == 0) return .{ .complete = true, .raw = raw[0..len] };
         len += n;
     }
@@ -1168,7 +1286,7 @@ fn discardPendingInput(ssl: *ssl_c.SSL, sock: compat.socket_t) void {
 const probe_cap = 4 * requests.max_body_len;
 
 const Probe = struct {
-    outcome: enum { complete, too_large, parse_error, ended },
+    outcome: enum { complete, too_large, parse_error, ended, timed_out },
     /// The message bytes read so far, framing included — relayed first if not held.
     raw: []const u8,
     /// Bytes read past the end of the message (a pipelined request).
@@ -1187,7 +1305,10 @@ fn probeChunked(dec: *http_wire.ChunkedDecoder, initial: []const u8, src: anytyp
         if (dec.state == .parse_error) return .{ .outcome = .parse_error, .raw = raw[0..scan], .leftover = "" };
         if (dec.state == .done) return .{ .outcome = if (dec.truncated) .too_large else .complete, .raw = raw[0..scan], .leftover = raw[scan..len] };
         if (dec.truncated or len == raw.len) return .{ .outcome = .too_large, .raw = raw[0..scan], .leftover = "" };
-        const n = src.read(raw[len..]) catch 0;
+        const n = src.read(raw[len..]) catch |e| {
+            if (http_wire.isTimeout(e)) return .{ .outcome = .timed_out, .raw = raw[0..scan], .leftover = "" };
+            return .{ .outcome = .ended, .raw = raw[0..scan], .leftover = "" };
+        };
         if (n == 0) return .{ .outcome = .ended, .raw = raw[0..scan], .leftover = "" };
         len += n;
     }
@@ -1294,6 +1415,69 @@ fn sslSendError(ssl: *ssl_c.SSL, status: u16, message: []const u8) void {
     sslWriteAll(ssl, response);
 }
 
+/// Error response whose status line uses the standard phrase and whose body is
+/// `reason`, so the browser shows what went wrong.
+fn sslSendReason(ssl: *ssl_c.SSL, status: u16, reason: []const u8) void {
+    var buf: [512]u8 = undefined;
+    const response = std.fmt.bufPrint(&buf, "HTTP/1.1 {d} {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+        status, http_wire.reasonPhrase(status), reason.len, reason,
+    }) catch return;
+    sslWriteAll(ssl, response);
+}
+
+/// zlodev answered this request itself: tell the client, then record the entry
+/// with `status` and `reason`, finishing the held ring entry if it was intercepted.
+fn failRequest(ssl: *ssl_c.SSL, entry: *requests.Entry, held: ?usize, status: u16, reason: []const u8) void {
+    log.err("component=proxy op=fail_request method={s} uri={s} status={d} reason=\"{s}\"", .{ entry.getMethod(), entry.getPath(), status, reason });
+    sslSendReason(ssl, status, reason);
+    const elapsed = rt.milliTimestamp() - entry.timestamp;
+    const dur: u64 = if (elapsed > 0) @intCast(elapsed) else 0;
+    if (held) |idx| {
+        requests.finishFailed(idx, status, dur, reason);
+        return;
+    }
+    entry.status = status;
+    entry.duration_ms = dur;
+    entry.setError(reason);
+    requests.push(entry.*);
+}
+
+const FailReason = struct { status: u16, reason: []const u8 };
+
+fn connectReason(buf: []u8, e: UpstreamError, host: []const u8, port: u16, timeout_s: u32) FailReason {
+    return switch (e) {
+        error.ConnectRefused => .{ .status = 502, .reason = std.fmt.bufPrint(buf, "connection refused {s}:{d}", .{ host, port }) catch "connection refused" },
+        error.ConnectFailed => .{ .status = 502, .reason = std.fmt.bufPrint(buf, "connect failed {s}:{d}", .{ host, port }) catch "connect failed" },
+        error.DnsFailed => .{ .status = 502, .reason = std.fmt.bufPrint(buf, "DNS lookup failed {s}", .{host}) catch "DNS lookup failed" },
+        error.ConnectTimeout => .{ .status = 504, .reason = std.fmt.bufPrint(buf, "connect timed out after {d}s {s}:{d}", .{ timeout_s, host, port }) catch "connect timed out" },
+        error.TlsFailed => .{ .status = 502, .reason = std.fmt.bufPrint(buf, "TLS handshake failed {s}", .{host}) catch "TLS handshake failed" },
+        error.UpstreamCertUntrusted => .{ .status = 502, .reason = std.fmt.bufPrint(buf, "upstream certificate not trusted {s} (use --insecure-upstream to skip verification)", .{host}) catch "upstream certificate not trusted" },
+    };
+}
+
+/// Fill method, path and the headers that fit from a head too big to parse whole.
+/// No request line in the bytes: method and path are "?".
+fn fillRequestLine(entry: *requests.Entry, head: []const u8) void {
+    const line_end = std.mem.indexOf(u8, head, "\r\n");
+    var method: []const u8 = "?";
+    var path: []const u8 = "?";
+    if (line_end) |le| {
+        var parts = std.mem.splitScalar(u8, head[0..le], ' ');
+        method = parts.next() orelse "?";
+        path = parts.next() orelse "?";
+    }
+    entry.method_len = @intCast(@min(method.len, entry.method.len));
+    @memcpy(entry.method[0..entry.method_len], method[0..entry.method_len]);
+    entry.path_len = @intCast(@min(path.len, entry.path.len));
+    @memcpy(entry.path[0..entry.path_len], path[0..entry.path_len]);
+    entry.path_truncated = path.len > entry.path.len or line_end == null;
+    const rest = if (line_end) |le| head[le + 2 ..] else "";
+    const n = @min(rest.len, requests.max_header_len);
+    @memcpy(entry.req_headers[0..n], rest[0..n]);
+    entry.req_headers_len = @intCast(n);
+    entry.req_headers_truncated = true;
+}
+
 const WsTarget = struct { is_external: bool, host: []const u8, port: u16 };
 
 fn handleWebSocket(
@@ -1309,10 +1493,9 @@ fn handleWebSocket(
 
     // Same connect path as plain requests: external routes get TLS + verification.
     const upstream = connectUpstream(target.is_external, target.host, target.port, config, client_ctx, conn_id) catch |e| {
-        sslSendError(ssl, 502, if (e == error.UpstreamCertUntrusted)
-            "Upstream certificate not trusted (use --insecure-upstream to skip verification)"
-        else
-            "Bad Gateway");
+        var rb: [192]u8 = undefined;
+        const r = connectReason(&rb, e, target.host, target.port, config.upstream_timeout_s);
+        failRequest(ssl, entry, null, r.status, r.reason);
         return;
     };
     defer upstream.close();
@@ -1340,16 +1523,27 @@ fn handleWebSocket(
         upstream.writeAll(raw_request) catch return;
     }
 
-    // Read upstream response (expect 101 Switching Protocols)
+    // Read upstream response (expect 101 Switching Protocols) within --timeout
+    const head_src = UpstreamReader{ .conn = upstream, .deadline_ms = deadlineAfter(config.upstream_timeout_s) };
     var resp_buf: [4096]u8 = undefined;
     var resp_total: usize = 0;
+    var timed_out = false;
     while (resp_total < resp_buf.len) {
-        const n = upstream.read(resp_buf[resp_total..]) catch break;
+        const n = head_src.read(resp_buf[resp_total..]) catch |e| {
+            timed_out = http_wire.isTimeout(e);
+            break;
+        };
         if (n == 0) break;
         resp_total += n;
         if (std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n\r\n") != null) break;
     }
-    if (resp_total == 0) return;
+    if (resp_total == 0) {
+        if (timed_out) {
+            var rb: [48]u8 = undefined;
+            failRequest(ssl, entry, null, 504, std.fmt.bufPrint(&rb, "no response within {d}s", .{config.upstream_timeout_s}) catch "no response in time");
+        } else failRequest(ssl, entry, null, 502, "upstream closed before responding");
+        return;
+    }
 
     // Forward response to client
     sslWriteAll(ssl, resp_buf[0..resp_total]);
@@ -1413,7 +1607,10 @@ fn relayWebSocket(ssl: *ssl_c.SSL, upstream: UpstreamConn) void {
         if (fds[1].revents & compat.POLL.IN != 0) {
             // Same drain for a TLS upstream (external route).
             const ok = while (true) {
-                const n = upstream.read(&pipe_buf) catch break false;
+                const n = upstream.read(&pipe_buf) catch |e| {
+                    if (e == error.WouldBlock) break true; // TLS record with no data yet
+                    break false;
+                };
                 if (n == 0) break false;
                 sslWriteAll(ssl, pipe_buf[0..n]);
                 const pending = if (upstream.ssl_conn) |us| ssl_c.SSL_pending(us) else 0;
@@ -1700,7 +1897,7 @@ test "replay sends a captured chunked request de-chunked" {
     );
 }
 
-test "connectUpstream returns UpstreamUnavailable for an unresolvable external host" {
+test "connectUpstream returns DnsFailed for an unresolvable external host" {
     const cfg = ProxyConfig{
         .target_host = "127.0.0.1",
         .target_port = 1,
@@ -1713,7 +1910,7 @@ test "connectUpstream returns UpstreamUnavailable for an unresolvable external h
         .routes = &.{},
         .domain = "dev.lo",
     };
-    try testing.expectError(error.UpstreamUnavailable, connectUpstream(true, "nonexistent.invalid", 443, &cfg, null, 1));
+    try testing.expectError(error.DnsFailed, connectUpstream(true, "nonexistent.invalid", 443, &cfg, null, 1));
 }
 
 const DrainTestWorker = struct {
@@ -2021,6 +2218,11 @@ const RecordingUpstream = struct {
     response: []const u8 = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
     /// False: hang up right after the request head, without reading the body or answering.
     read_body: bool = true,
+    /// Wait this long after reading the request before answering (sliced, ends on stop).
+    delay_ms: u32 = 0,
+    /// Written `gap_ms` after `response`: a stream that goes quiet, then continues.
+    response2: []const u8 = "",
+    gap_ms: u32 = 0,
     buf: []u8 = &.{},
     len: std.atomic.Value(usize) = .init(0),
     thread: std.Thread = undefined,
@@ -2054,8 +2256,22 @@ const RecordingUpstream = struct {
                 continue;
             }
             self.len.store(readRequest(s, self.buf), .release);
+            sleepWhileRunning(self.delay_ms, isRunning);
             s.writeAll(self.response) catch {};
+            if (self.response2.len > 0) {
+                sleepWhileRunning(self.gap_ms, isRunning);
+                s.writeAll(self.response2) catch {};
+            }
             compat.closeSocket(conn.sock);
+        }
+    }
+
+    fn sleepWhileRunning(ms: u32, running_fn: *const fn () bool) void {
+        var left = ms;
+        while (left > 0 and running_fn()) {
+            const step = @min(left, 50);
+            rt.sleepMs(step);
+            left -= step;
         }
     }
 
@@ -2152,6 +2368,7 @@ const ProxyHarness = struct {
         routes: []const Route = &.{},
         client_ctx: ?*ssl_c.SSL_CTX = null,
         max_request_body: usize = default_max_request_body,
+        upstream_timeout_s: u32 = default_upstream_timeout_s,
     };
 
     fn startWith(self: *ProxyHarness, port: u16, upstream_port: u16, routes: []const Route, client_ctx: ?*ssl_c.SSL_CTX) !void {
@@ -2176,13 +2393,15 @@ const ProxyHarness = struct {
             .server_ident = "test",
             .routes = opts.routes,
             .max_request_body = opts.max_request_body,
+            .upstream_timeout_s = opts.upstream_timeout_s,
         };
         _ = proxy_workers.fetchAdd(1, .acq_rel);
         const client_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
         // handleConnection owns the server SSL and the server-side socket from here.
         self.thread = try std.Thread.spawn(.{}, handleConnection, .{ server, self.tcp.b, client_addr, &self.config, @as(u64, 1), opts.client_ctx });
         if (ssl_c.SSL_connect(self.client) != 1) return error.Handshake;
-        setSocketTimeout(self.tcp.a, .recv, 3);
+        // Generous: tests with a 2s upstream pause must not trip it on a loaded CI runner.
+        setSocketTimeout(self.tcp.a, .recv, 10);
     }
 
     /// Send `request` and read until the response ends with `want_suffix`.
@@ -2502,7 +2721,7 @@ test "Content-Length over --max-body gets 413" {
     try px.startOpts(18304, 18305, .{ .max_request_body = 1000 });
     defer px.stop();
     var buf: [4096]u8 = undefined;
-    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 2000\r\n\r\n" ++ rep("x", 2000), "Request Entity Too Large", &buf);
+    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 2000\r\n\r\n" ++ rep("x", 2000), "(2000 bytes)", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 413"));
 }
 
@@ -2514,7 +2733,7 @@ test "chunked body over --max-body gets 413" {
     try px.startOpts(18306, 18307, .{ .max_request_body = 1000 });
     defer px.stop();
     var buf: [4096]u8 = undefined;
-    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n7d0\r\n" ++ rep("y", 2000) ++ "\r\n0\r\n\r\n", "Request Entity Too Large", &buf);
+    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n7d0\r\n" ++ rep("y", 2000) ++ "\r\n0\r\n\r\n", "bytes)", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 413"));
 }
 
@@ -2526,7 +2745,7 @@ test "request head over 16 KB gets 431" {
     try px.start(18308, 18309);
     defer px.stop();
     var buf: [4096]u8 = undefined;
-    const resp = try px.roundTrip("GET / HTTP/1.1\r\nHost: dev.lo\r\nX-Big: " ++ rep("b", 17000) ++ "\r\n\r\n", "Request Header Fields Too Large", &buf);
+    const resp = try px.roundTrip("GET / HTTP/1.1\r\nHost: dev.lo\r\nX-Big: " ++ rep("b", 17000) ++ "\r\n\r\n", "request head over 16KB", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 431"));
 }
 
@@ -2538,7 +2757,7 @@ test "malformed chunked request body gets 400" {
     try px.start(18310, 18311);
     defer px.stop();
     var buf: [4096]u8 = undefined;
-    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", "Bad Request", &buf);
+    const resp = try px.roundTrip("POST / HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", "bad chunked encoding", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400"));
 }
 
@@ -2790,6 +3009,307 @@ test "upstream that hangs up mid-upload gets the client a 502 at once" {
     const req = try std.mem.concat(testing.allocator, u8, &.{ "POST /up HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 1048576\r\n\r\n", body });
     defer testing.allocator.free(req);
     var buf: [4096]u8 = undefined;
-    const resp = try px.roundTrip(req, "Bad Gateway", &buf);
+    const resp = try px.roundTrip(req, "upstream stopped reading the request", &buf);
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 502"));
+}
+
+test "parseTimeoutSeconds accepts whole seconds up to a day" {
+    try testing.expectEqual(@as(?u32, 30), parseTimeoutSeconds("30"));
+    try testing.expectEqual(@as(?u32, 0), parseTimeoutSeconds("0"));
+    try testing.expectEqual(@as(?u32, 86400), parseTimeoutSeconds("86400"));
+    try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds("86401"));
+    try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds("30s"));
+    try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds(""));
+    try testing.expectEqual(@as(?u32, null), parseTimeoutSeconds("-1"));
+}
+
+test "connect refused answers 502 and records the reason" {
+    const before = freshRing();
+    var px: ProxyHarness = undefined;
+    try px.start(18340, 18341); // nothing listens on 18341
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /x HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "127.0.0.1:18341", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 502 Bad Gateway"));
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 502), e.status);
+    try testing.expectEqualStrings("connection refused 127.0.0.1:18341", e.getError());
+    try testing.expectEqualStrings("/x", e.getPath());
+}
+
+test "413 over --max-body is recorded" {
+    const before = freshRing();
+    var up = RecordingUpstream{};
+    try up.start(18343);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18342, 18343, .{ .max_request_body = 10 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip("POST /up HTTP/1.1\r\nHost: dev.lo\r\nContent-Length: 20\r\n\r\n01234567890123456789", "(20 bytes)", &buf);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 413), e.status);
+    try testing.expectEqualStrings("body over --max-body (20 bytes)", e.getError());
+    try testing.expect(e.requestTruncated());
+}
+
+test "chunked body over --max-body is recorded" {
+    const before = freshRing();
+    var up = RecordingUpstream{};
+    try up.start(18345);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18344, 18345, .{ .max_request_body = 10 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip("POST /c HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\n14\r\n01234567890123456789\r\n0\r\n\r\n", "bytes)", &buf);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 413), e.status);
+    try testing.expect(std.mem.startsWith(u8, e.getError(), "body over --max-body"));
+}
+
+test "bad chunked framing is recorded as 400" {
+    const before = freshRing();
+    var up = RecordingUpstream{};
+    try up.start(18347);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18346, 18347);
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip("POST /c HTTP/1.1\r\nHost: dev.lo\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", "bad chunked encoding", &buf);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 400), e.status);
+    try testing.expectEqualStrings("bad chunked encoding", e.getError());
+    try testing.expect(e.requestTruncated());
+}
+
+test "431 head over 16KB is recorded with its request line" {
+    const before = freshRing();
+    var px: ProxyHarness = undefined;
+    try px.start(18348, 18349);
+    defer px.stop();
+    const req = "GET /big HTTP/1.1\r\nX: " ++ rep("a", 17000) ++ "\r\n\r\n";
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip(req, "request head over 16KB", &buf);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 431), e.status);
+    try testing.expectEqualStrings("GET", e.getMethod());
+    try testing.expectEqualStrings("/big", e.getPath());
+    try testing.expect(e.req_headers_truncated);
+}
+
+test "held request whose upstream is down finishes with the reason" {
+    const before = freshRing();
+    intercept.enableWithPattern("req:/held");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18350, 18351); // nothing on 18351
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip("GET /held HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "127.0.0.1:18351", &buf);
+    // The connection closes after the error response.
+    var one: [1]u8 = undefined;
+    try testing.expect(ssl_c.SSL_read(px.client, &one, 1) <= 0);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 502), e.status);
+    try testing.expect(!e.pinned);
+    try testing.expectEqualStrings("connection refused 127.0.0.1:18351", e.getError());
+}
+
+test "no response head within --timeout answers 504" {
+    const before = freshRing();
+    var up = RecordingUpstream{ .delay_ms = 3000 };
+    try up.start(18353);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18352, 18353, .{ .upstream_timeout_s = 1 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const t0 = rt.milliTimestamp();
+    const resp = try px.roundTrip("GET /slow HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "no response within 1s", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 504 Gateway Timeout"));
+    try testing.expect(rt.milliTimestamp() - t0 < 2500);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 504), e.status);
+    try testing.expectEqualStrings("no response within 1s", e.getError());
+}
+
+test "upstream that closes without a head answers 502" {
+    const before = freshRing();
+    var up = RecordingUpstream{ .response = "" };
+    try up.start(18355);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18354, 18355);
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    _ = try px.roundTrip("GET / HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "upstream closed before responding", &buf);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 502), e.status);
+}
+
+test "a stream quiet for longer than --timeout after its head is relayed whole" {
+    var up = RecordingUpstream{
+        .response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: a\n\n",
+        .response2 = "data: b\n\n",
+        .gap_ms = 2000,
+    };
+    try up.start(18357);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18356, 18357, .{ .upstream_timeout_s = 1 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /events HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "data: b\n\n", &buf);
+    try testing.expect(std.mem.indexOf(u8, resp, "data: a\n\ndata: b\n\n") != null);
+}
+
+test "response intercept probe that hits --timeout relays unheld" {
+    const before = freshRing();
+    intercept.enableWithPattern("resp:/probe");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+    var up = RecordingUpstream{
+        .response = "HTTP/1.1 200 OK\r\n\r\nfirst-",
+        .response2 = "second",
+        .gap_ms = 2000,
+    };
+    try up.start(18359);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18358, 18359, .{ .upstream_timeout_s = 1 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /probe HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "first-second", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expect(e.too_large_to_intercept);
+}
+
+/// TLS upstream for an external route: handshakes, reads one request head, waits
+/// `delay_ms` (sliced, ends on stop), then answers with `response`.
+const SlowTlsUpstream = struct {
+    listener: compat.socket_t = undefined,
+    srv: TestServer = undefined,
+    thread: std.Thread = undefined,
+    delay_ms: u32 = 0,
+    response: []const u8 = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    /// Before the delay, send only a TLS record header: the proxy's socket polls
+    /// readable, but no complete record (and no data) arrives.
+    partial_record: bool = false,
+
+    var running: std.atomic.Value(bool) = .init(true);
+    fn isRunning() bool {
+        return running.load(.acquire);
+    }
+
+    fn start(self: *SlowTlsUpstream, port: u16) !void {
+        running.store(true, .release);
+        self.srv = try testServer("localhost");
+        self.listener = try compat.tcpListen(try std.Io.net.IpAddress.parseIp4("127.0.0.1", port));
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn serve(self: *SlowTlsUpstream) void {
+        var fds = [1]compat.pollfd{.{ .fd = self.listener, .events = compat.POLL.IN, .revents = 0 }};
+        if (compat.pollWhileRunning(&fds, 15_000, isRunning) != .ready) return;
+        const conn = compat.accept(self.listener) catch return;
+        defer compat.closeSocket(conn.sock);
+        setSocketTimeout(conn.sock, .recv, 5);
+        const ssl = ssl_c.SSL_new(self.srv.ctx) orelse return;
+        defer ssl_c.SSL_free(ssl);
+        _ = ssl_c.SSL_set_fd(ssl, compat.socketToFd(conn.sock));
+        if (ssl_c.SSL_accept(ssl) != 1) return;
+        var head: [4096]u8 = undefined;
+        var len: usize = 0;
+        while (std.mem.indexOf(u8, head[0..len], "\r\n\r\n") == null and len < head.len) {
+            const n = ssl_c.SSL_read(ssl, head[len..].ptr, @intCast(head.len - len));
+            if (n <= 0) return;
+            len += @intCast(n);
+        }
+        if (self.partial_record) {
+            const s = compat.SocketStream{ .handle = conn.sock };
+            s.writeAll("\x17\x03\x03\x00\x40") catch return; // application_data, 64 bytes promised
+            RecordingUpstream.sleepWhileRunning(self.delay_ms, isRunning);
+            return;
+        }
+        RecordingUpstream.sleepWhileRunning(self.delay_ms, isRunning);
+        _ = ssl_c.SSL_write(ssl, self.response.ptr, @intCast(self.response.len));
+        _ = ssl_c.SSL_shutdown(ssl);
+    }
+
+    fn stop(self: *SlowTlsUpstream) void {
+        running.store(false, .release);
+        self.thread.join();
+        compat.closeSocket(self.listener);
+        ssl_c.SSL_CTX_free(self.srv.ctx);
+        ssl_c.X509_free(self.srv.cert);
+    }
+};
+
+test "external TLS route answers 504 when no response head comes within --timeout" {
+    const before = freshRing();
+    var up = SlowTlsUpstream{ .delay_ms = 3000, .partial_record = true };
+    try up.start(18361);
+    defer up.stop();
+    const cctx = createClientSslCtx(true) orelse return error.SslCtx;
+    defer ssl_c.SSL_CTX_free(cctx);
+    const routes = [_]Route{.{ .kind = .path, .pattern = "/ext", .port = 18361, .hostname = "127.0.0.1" }};
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18360, 1, .{ .routes = &routes, .client_ctx = cctx, .upstream_timeout_s = 1 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const t0 = rt.milliTimestamp();
+    const resp = try px.roundTrip("GET /ext HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "no response within 1s", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 504"));
+    try testing.expect(rt.milliTimestamp() - t0 < 2500);
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 504), e.status);
+}
+
+test "external TLS route relays a response slower than one socket read" {
+    var up = SlowTlsUpstream{ .delay_ms = 1500 };
+    try up.start(18363);
+    defer up.stop();
+    const cctx = createClientSslCtx(true) orelse return error.SslCtx;
+    defer ssl_c.SSL_CTX_free(cctx);
+    const routes = [_]Route{.{ .kind = .path, .pattern = "/ext", .port = 18363, .hostname = "127.0.0.1" }};
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18362, 1, .{ .routes = &routes, .client_ctx = cctx, .upstream_timeout_s = 10 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /ext HTTP/1.1\r\nHost: dev.lo\r\n\r\n", "ok", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
+}
+
+test "WebSocket upgrade with no response within --timeout answers 504" {
+    const before = freshRing();
+    var up = RecordingUpstream{ .delay_ms = 3000 };
+    try up.start(18365);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.startOpts(18364, 18365, .{ .upstream_timeout_s = 1 });
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /ws HTTP/1.1\r\nHost: dev.lo\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", "no response within 1s", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 504"));
+    var e: requests.Entry = undefined;
+    try waitNewestEntry(before, &e);
+    try testing.expectEqual(@as(u16, 504), e.status);
 }
