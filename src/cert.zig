@@ -491,6 +491,7 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
                 try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, try anchorPath(&anchor_buf, store, domain) });
                 try sys.sudoCmd(allocator, store.refresh);
             }
+            addToNss(allocator, domain, ca_path);
         },
         .windows => {
             std.debug.print("installing CA and generating certificate\n", .{});
@@ -533,6 +534,7 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
                 if (sameFileContents(allocator, legacy, ca_path)) try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", legacy });
                 try sys.sudoCmd(allocator, store.refresh);
             }
+            removeFromNss(allocator, domain);
         },
         .windows => {
             std.debug.print("uninstalling and removing CA\n", .{});
@@ -699,6 +701,135 @@ pub fn anchorFileName(buf: []u8, domain: []const u8, ext: []const u8) ![]const u
 /// Nickname of the CA in browsers' NSS databases.
 pub fn nssNickname(buf: []u8, domain: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "zlodev {s} CA", .{domain});
+}
+
+pub const NssKind = enum { chromium, snap, firefox };
+pub const NssDb = struct { path: []u8, kind: NssKind };
+
+/// NSS databases browsers read on Linux, which ignore the system CA bundle.
+/// `[0]` is always `<home>/.pki/nssdb` (deb/rpm Chrome, Chromium, Brave, Edge,
+/// Vivaldi, Opera), even when missing; the rest exist: snap apps' own
+/// `.pki/nssdb` and Firefox profiles (dirs holding cert9.db).
+pub fn nssDatabases(allocator: std.mem.Allocator, home: []const u8) ![]NssDb {
+    var list: std.ArrayListUnmanaged(NssDb) = .empty;
+    errdefer {
+        for (list.items) |db| allocator.free(db.path);
+        list.deinit(allocator);
+    }
+    try appendDb(allocator, &list, try std.fmt.allocPrint(allocator, "{s}" ++ sep ++ ".pki" ++ sep ++ "nssdb", .{home}), .chromium);
+
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    try appendExistingDbs(allocator, &list, try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ "snap", .{home}), "current" ++ sep ++ ".pki" ++ sep ++ "nssdb", .snap);
+    try appendExistingDbs(allocator, &list, try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ ".mozilla" ++ sep ++ "firefox", .{home}), "", .firefox);
+    try appendExistingDbs(allocator, &list, try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ "snap" ++ sep ++ "firefox" ++ sep ++ "common" ++ sep ++ ".mozilla" ++ sep ++ "firefox", .{home}), "", .firefox);
+    return list.toOwnedSlice(allocator);
+}
+
+pub fn freeNssDatabases(allocator: std.mem.Allocator, dbs: []NssDb) void {
+    for (dbs) |db| allocator.free(db.path);
+    allocator.free(dbs);
+}
+
+fn appendDb(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(NssDb), path: []u8, kind: NssKind) !void {
+    errdefer allocator.free(path);
+    try list.append(allocator, .{ .path = path, .kind = kind });
+}
+
+/// Appends `<root>/<subdir>/<suffix>` for each subdir of `root` whose NSS
+/// database exists. A missing `root` adds nothing.
+fn appendExistingDbs(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(NssDb), root: []const u8, suffix: []const u8, kind: NssKind) !void {
+    var dir = std.Io.Dir.cwd().openDir(rt.io(), root, .{ .iterate = true }) catch return;
+    defer dir.close(rt.io());
+    var it = dir.iterate();
+    while (it.next(rt.io()) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const path = if (suffix.len == 0)
+            try std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "{s}", .{ root, entry.name })
+        else
+            try std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "{s}" ++ sep ++ "{s}", .{ root, entry.name, suffix });
+        if (!nssDbExists(allocator, path)) {
+            allocator.free(path);
+            continue;
+        }
+        try appendDb(allocator, list, path, kind);
+    }
+}
+
+fn nssDbExists(allocator: std.mem.Allocator, db_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "cert9.db", .{db_dir}) catch return false;
+    defer allocator.free(path);
+    std.Io.Dir.cwd().access(rt.io(), path, .{}) catch return false;
+    return true;
+}
+
+const certutil_missing_fmt = "warning: certutil not found, so Chrome and Firefox won't trust {s}. Install libnss3-tools (Debian/Ubuntu), nss-tools (Fedora) or nss (Arch), then run 'zlodev install -f'\n";
+
+/// Add the CA to the NSS databases Chromium-based browsers and Firefox read on
+/// Linux. Runs as the user, not sudo; failures only warn.
+fn addToNss(allocator: std.mem.Allocator, domain: []const u8, ca_path: []const u8) void {
+    const home = compat.getenv("HOME") orelse return;
+    const dbs = nssDatabases(allocator, home) catch return;
+    defer freeNssDatabases(allocator, dbs);
+    var nick_buf: [256]u8 = undefined;
+    const nick = nssNickname(&nick_buf, domain) catch return;
+    for (dbs) |db| {
+        var arg_buf: [std.Io.Dir.max_path_bytes + 4]u8 = undefined;
+        const db_arg = std.fmt.bufPrint(&arg_buf, "sql:{s}", .{db.path}) catch continue;
+        if (!nssDbExists(allocator, db.path)) {
+            // Only ~/.pki/nssdb is listed while missing: create it so a browser started later trusts the CA.
+            makePrivateDir(db.path) catch {
+                std.debug.print("warning: could not add CA to {s}\n", .{db.path});
+                continue;
+            };
+            switch (sys.runUserCmd(&.{ "certutil", "-N", "--empty-password", "-d", db_arg })) {
+                .ok => {},
+                .missing => {
+                    std.debug.print(certutil_missing_fmt, .{domain});
+                    return;
+                },
+                .failed => {
+                    std.debug.print("warning: could not add CA to {s}\n", .{db.path});
+                    continue;
+                },
+            }
+        }
+        // Clear an entry left by an earlier CA under the same nickname (install -f).
+        if (sys.runUserCmd(&.{ "certutil", "-D", "-d", db_arg, "-n", nick }) == .missing) {
+            std.debug.print(certutil_missing_fmt, .{domain});
+            return;
+        }
+        switch (sys.runUserCmd(&.{ "certutil", "-A", "-d", db_arg, "-t", "C,,", "-n", nick, "-i", ca_path })) {
+            .ok => switch (db.kind) {
+                .chromium => std.debug.print("CA added to Chromium-based browsers ({s})\n", .{db.path}),
+                .snap => std.debug.print("CA added to {s}\n", .{db.path}),
+                .firefox => std.debug.print("CA added to Firefox profile {s}; restart Firefox if it is running\n", .{std.fs.path.basename(db.path)}),
+            },
+            .missing => {
+                std.debug.print(certutil_missing_fmt, .{domain});
+                return;
+            },
+            .failed => std.debug.print("warning: could not add CA to {s}\n", .{db.path}),
+        }
+    }
+}
+
+/// Remove the CA from every NSS database that exists. Never creates one.
+fn removeFromNss(allocator: std.mem.Allocator, domain: []const u8) void {
+    const home = compat.getenv("HOME") orelse return;
+    const dbs = nssDatabases(allocator, home) catch return;
+    defer freeNssDatabases(allocator, dbs);
+    var nick_buf: [256]u8 = undefined;
+    const nick = nssNickname(&nick_buf, domain) catch return;
+    for (dbs) |db| {
+        if (!nssDbExists(allocator, db.path)) continue;
+        var arg_buf: [std.Io.Dir.max_path_bytes + 4]u8 = undefined;
+        const db_arg = std.fmt.bufPrint(&arg_buf, "sql:{s}", .{db.path}) catch continue;
+        switch (sys.runUserCmd(&.{ "certutil", "-D", "-d", db_arg, "-n", nick })) {
+            .ok => std.debug.print("CA removed from {s}\n", .{db.path}),
+            .missing => return,
+            .failed => {}, // no entry for this domain
+        }
+    }
 }
 
 /// True when both files exist and hold the same bytes.
@@ -1130,4 +1261,58 @@ test "runUserCmd reports success and failure" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     try std.testing.expectEqual(sys.RunResult.ok, sys.runUserCmd(&.{"true"}));
     try std.testing.expectEqual(sys.RunResult.failed, sys.runUserCmd(&.{"false"}));
+}
+
+fn touchFile(dir: std.Io.Dir, path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(rt.io(), parent);
+    const f = try dir.createFile(rt.io(), path, .{});
+    f.close(rt.io());
+}
+
+fn hasDb(dbs: []const NssDb, suffix: []const u8, kind: NssKind) bool {
+    for (dbs) |db| {
+        if (db.kind == kind and std.mem.endsWith(u8, db.path, suffix)) return true;
+    }
+    return false;
+}
+
+test "nssDatabases lists ~/.pki/nssdb first even when it is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(rt.io(), "home");
+    var buf: [256]u8 = undefined;
+    const dbs = try nssDatabases(std.testing.allocator, try tmpPathZ(&buf, &tmp, "home"));
+    defer freeNssDatabases(std.testing.allocator, dbs);
+    try std.testing.expectEqual(@as(usize, 1), dbs.len);
+    try std.testing.expectEqual(NssKind.chromium, dbs[0].kind);
+    try std.testing.expect(std.mem.endsWith(u8, dbs[0].path, "home" ++ sep ++ ".pki" ++ sep ++ "nssdb"));
+}
+
+test "nssDatabases finds snap databases and Firefox profiles that exist" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = "home" ++ sep;
+    const snap_db = sep ++ "current" ++ sep ++ ".pki" ++ sep ++ "nssdb";
+    try touchFile(tmp.dir, h ++ "snap" ++ sep ++ "brave" ++ snap_db ++ sep ++ "cert9.db");
+    try touchFile(tmp.dir, h ++ "snap" ++ sep ++ "chromium" ++ snap_db ++ sep ++ "cert9.db");
+    try tmp.dir.createDirPath(rt.io(), h ++ "snap" ++ sep ++ "spotify" ++ sep ++ "current");
+    const ff = h ++ ".mozilla" ++ sep ++ "firefox" ++ sep;
+    try touchFile(tmp.dir, ff ++ "abc.default-release" ++ sep ++ "cert9.db");
+    try touchFile(tmp.dir, ff ++ "My Profile" ++ sep ++ "cert9.db");
+    try tmp.dir.createDirPath(rt.io(), ff ++ "Crash Reports");
+    try touchFile(tmp.dir, h ++ "snap" ++ sep ++ "firefox" ++ sep ++ "common" ++ sep ++ ".mozilla" ++ sep ++ "firefox" ++ sep ++ "xyz.default" ++ sep ++ "cert9.db");
+    try touchFile(tmp.dir, h ++ ".var" ++ sep ++ "app" ++ sep ++ "com.brave.Browser" ++ sep ++ ".pki" ++ sep ++ "nssdb" ++ sep ++ "cert9.db");
+
+    var buf: [256]u8 = undefined;
+    const dbs = try nssDatabases(std.testing.allocator, try tmpPathZ(&buf, &tmp, "home"));
+    defer freeNssDatabases(std.testing.allocator, dbs);
+
+    try std.testing.expectEqual(@as(usize, 6), dbs.len);
+    try std.testing.expectEqual(NssKind.chromium, dbs[0].kind);
+    try std.testing.expect(hasDb(dbs, "brave" ++ snap_db, .snap));
+    try std.testing.expect(hasDb(dbs, "chromium" ++ snap_db, .snap));
+    try std.testing.expect(hasDb(dbs, "abc.default-release", .firefox));
+    try std.testing.expect(hasDb(dbs, "My Profile", .firefox));
+    try std.testing.expect(hasDb(dbs, "xyz.default", .firefox));
+    for (dbs) |db| try std.testing.expect(std.mem.indexOf(u8, db.path, ".var") == null);
 }

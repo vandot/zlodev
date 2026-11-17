@@ -111,11 +111,43 @@ fn anchorExists(domain: []const u8) bool {
     return false;
 }
 
+const fake_firefox_profile = ".mozilla/firefox/zlodevtest.default";
+
+fn homePath(buf: []u8, rel: []const u8) ![]const u8 {
+    const home = getEnvOwned("HOME") orelse return error.NoHomeDir;
+    defer testing.allocator.free(home);
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ home, rel });
+}
+
+/// True when `certutil -L` finds the domain's CA in the NSS database at `rel` under $HOME.
+fn nssHas(rel: []const u8, domain: []const u8) bool {
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = homePath(&dir_buf, rel) catch return false;
+    var arg_buf: [std.Io.Dir.max_path_bytes + 4]u8 = undefined;
+    const db_arg = std.fmt.bufPrint(&arg_buf, "sql:{s}", .{dir}) catch return false;
+    var nick_buf: [512]u8 = undefined;
+    const nick = std.fmt.bufPrint(&nick_buf, "zlodev {s} CA", .{domain}) catch return false;
+    const term = runCmd(&.{ "certutil", "-L", "-d", db_arg, "-n", nick }) catch return false;
+    return std.meta.eql(term, std.process.Child.Term{ .exited = 0 });
+}
+
+/// A Firefox profile with an empty NSS database, so install has one to find.
+fn createFakeFirefoxProfile() !void {
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try homePath(&dir_buf, fake_firefox_profile);
+    var db_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (fileExists(try std.fmt.bufPrint(&db_buf, "{s}/cert9.db", .{dir}))) return;
+    try std.Io.Dir.cwd().createDirPath(testing.io, dir);
+    var arg_buf: [std.Io.Dir.max_path_bytes + 4]u8 = undefined;
+    try runCmdExpectSuccess(&.{ "certutil", "-N", "--empty-password", "-d", try std.fmt.bufPrint(&arg_buf, "sql:{s}", .{dir}) });
+}
+
 // --- Default mode (dev.lo) ---
 
 test "install and verify" {
     try testing.expect(fileExists(binary_path));
 
+    if (builtin.os.tag == .linux) try createFakeFirefoxProfile();
     try runCmdExpectSuccess(&.{ binary_path, "install" });
     try verifyCertFiles("dev.lo");
 
@@ -128,6 +160,8 @@ test "install and verify" {
             try testing.expect(fileExists("/etc/systemd/network/zlodev0.network"));
             try testing.expect(fileExists("/etc/systemd/network/zlodev0.netdev"));
             try testing.expect(anchorExists("dev.lo"));
+            try testing.expect(nssHas(".pki/nssdb", "dev.lo"));
+            try testing.expect(nssHas(fake_firefox_profile, "dev.lo"));
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (!(Get-DnsClientNrptRule | Where { $_.Namespace -eq '.lo' })) { exit 1 }" });
@@ -140,6 +174,10 @@ test "install and verify" {
 test "install -f succeeds when already installed" {
     try runCmdExpectSuccess(&.{ binary_path, "install", "-f" });
     try verifyCertFiles("dev.lo");
+    if (builtin.os.tag == .linux) {
+        try testing.expect(anchorExists("dev.lo"));
+        try testing.expect(nssHas(".pki/nssdb", "dev.lo"));
+    }
 }
 
 test "uninstall and verify" {
@@ -156,6 +194,8 @@ test "uninstall and verify" {
             try testing.expect(!fileExists("/etc/systemd/network/zlodev0.network"));
             try testing.expect(!fileExists("/etc/systemd/network/zlodev0.netdev"));
             try testing.expect(!anchorExists("dev.lo"));
+            try testing.expect(!nssHas(".pki/nssdb", "dev.lo"));
+            try testing.expect(!nssHas(fake_firefox_profile, "dev.lo"));
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (Get-DnsClientNrptRule | Where { $_.Namespace -eq '.lo' }) { exit 1 }" });
@@ -197,6 +237,7 @@ test "install --local and verify" {
         },
         .linux => {
             try testing.expect(anchorExists(domain));
+            try testing.expect(nssHas(".pki/nssdb", domain));
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", cn });
@@ -234,6 +275,7 @@ test "uninstall --local and verify" {
         },
         .linux => {
             try testing.expect(!anchorExists(domain));
+            try testing.expect(!nssHas(".pki/nssdb", domain));
         },
         .windows => {
             const term_wl = try runCmd(&.{ "certutil", "-verifystore", "Root", cn });
