@@ -1058,7 +1058,8 @@ const RequestForward = struct {
 const proxy_owned_headers = [_][]const u8{ "cache-control:", "accept-encoding:", "x-forwarded-host:", "x-forwarded-for:", "x-forwarded-proto:", "x-real-ip:" };
 
 /// The proxy's own headers after the forwarded block: the external Host rewrite,
-/// X-Forwarded-Host (original Host), X-Forwarded-For, X-Real-IP, X-Forwarded-Proto, no-cache.
+/// X-Forwarded-Host (original Host), X-Forwarded-For, X-Real-IP, X-Forwarded-Proto,
+/// Accept-Encoding: identity, no-cache.
 fn writeProxyHeaders(sink: anytype, ctx: RequestForward) void {
     if (ctx.is_external) {
         sink.write("Host: ");
@@ -1081,6 +1082,8 @@ fn writeProxyHeaders(sink: anytype, ctx: RequestForward) void {
     sink.write(ctx.client_ip);
     sink.write("\r\n");
     sink.write("X-Forwarded-Proto: https\r\n");
+    // Explicit: a request without Accept-Encoding accepts any coding (RFC 9110 12.5.3).
+    sink.write("Accept-Encoding: identity\r\n");
     sink.write("Cache-Control: no-cache\r\n");
     sink.write("Pragma: no-cache\r\n");
 }
@@ -1868,7 +1871,7 @@ test "forwardRequest emits a local request, dropping cache-control and content-l
         "GET /api/x HTTP/1.1\r\n" ++
             "Host: dev.lo\r\nAccept: */*\r\n" ++
             "X-Forwarded-Host: dev.lo\r\nX-Forwarded-For: 10.0.0.1\r\n" ++
-            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
+            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nAccept-Encoding: identity\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
             "Content-Length: 0\r\n\r\n",
         out[0..len],
     );
@@ -1888,7 +1891,7 @@ test "forwardRequest rewrites Host and adds X-Forwarded-Host for external routes
     try testing.expectEqualStrings(
         "POST /login HTTP/1.1\r\n" ++
             "Host: staging.example.com\r\nX-Forwarded-Host: dev.lo\r\nX-Forwarded-For: 10.0.0.1\r\n" ++
-            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
+            "X-Real-IP: 10.0.0.1\r\nX-Forwarded-Proto: https\r\nAccept-Encoding: identity\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
             "Content-Length: 2\r\n\r\nhi",
         out[0..len],
     );
@@ -1914,7 +1917,8 @@ test "forwardRequest appends to the client's X-Forwarded-For and drops client pr
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "X-Forwarded-Proto:"));
     try testing.expect(std.mem.indexOf(u8, got, "X-Forwarded-Host: dev.lo\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, got, "evil") == null);
-    try testing.expect(std.ascii.findIgnoreCase(got, "accept-encoding") == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Accept-Encoding"));
+    try testing.expect(std.mem.indexOf(u8, got, "Accept-Encoding: identity\r\n") != null);
 }
 
 test "forwardRequest recomputes Content-Length from the body, ignoring the original" {
@@ -2734,7 +2738,9 @@ test "upstream gets no Accept-Encoding and the forwarding headers on a local rou
     var buf: [4096]u8 = undefined;
     _ = try px.roundTrip("GET /a HTTP/1.1\r\nHost: dev.lo\r\nAccept-Encoding: gzip, deflate, br\r\nX-Forwarded-For: 9.9.9.9\r\n\r\n", "ok", &buf);
     const got = up.received();
-    try testing.expect(std.ascii.findIgnoreCase(got, "accept-encoding") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nAccept-Encoding: identity\r\n") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Accept-Encoding"));
+    try testing.expect(std.mem.indexOf(u8, got, "gzip") == null);
     try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-Host: dev.lo\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-For: 9.9.9.9, 127.0.0.1\r\n") != null);
 }
