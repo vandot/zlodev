@@ -2399,7 +2399,8 @@ const ProxyHarness = struct {
         // handleConnection owns the server SSL and the server-side socket from here.
         self.thread = try std.Thread.spawn(.{}, handleConnection, .{ server, self.tcp.b, client_addr, &self.config, @as(u64, 1), opts.client_ctx });
         if (ssl_c.SSL_connect(self.client) != 1) return error.Handshake;
-        setSocketTimeout(self.tcp.a, .recv, 3);
+        // Generous: tests with a 2s upstream pause must not trip it on a loaded CI runner.
+        setSocketTimeout(self.tcp.a, .recv, 10);
     }
 
     /// Send `request` and read until the response ends with `want_suffix`.
