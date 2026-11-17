@@ -438,6 +438,28 @@ fn makePrivateDir(path: []const u8) !void {
     if (builtin.os.tag != .windows) try cwd.setFilePermissions(rt.io(), path, .fromMode(0o700), .{});
 }
 
+const AnchorStore = struct { dir: []const u8, ext: []const u8, refresh: []const []const u8 };
+
+/// System trust-anchor dirs, first existing one wins: Fedora/RHEL, Debian/Ubuntu, Arch, openSUSE.
+const linux_anchor_stores = [_]AnchorStore{
+    .{ .dir = "/etc/pki/ca-trust/source/anchors", .ext = "pem", .refresh = &.{ "sudo", "update-ca-trust", "extract" } },
+    .{ .dir = "/usr/local/share/ca-certificates", .ext = "crt", .refresh = &.{ "sudo", "update-ca-certificates" } },
+    .{ .dir = "/etc/ca-certificates/trust-source/anchors", .ext = "crt", .refresh = &.{ "sudo", "trust", "extract-compat" } },
+    .{ .dir = "/usr/share/pki/trust/anchors", .ext = "pem", .refresh = &.{ "sudo", "update-ca-certificates" } },
+};
+
+fn linuxAnchorStore() ?AnchorStore {
+    for (linux_anchor_stores) |store| {
+        if (sys.dirExists(store.dir)) return store;
+    }
+    return null;
+}
+
+fn anchorPath(buf: []u8, store: AnchorStore, domain: []const u8) ![]const u8 {
+    var name_buf: [256]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ store.dir, try anchorFileName(&name_buf, domain, store.ext) });
+}
+
 pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cert_dir = try getCertPath(&path_buf, domain);
@@ -464,25 +486,18 @@ pub fn installCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         },
         .linux => {
             std.debug.print("installing CA and generating certificate, please provide sudo password when asked\n", .{});
-            if (sys.dirExists("/etc/pki/ca-trust/source/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, "/etc/pki/ca-trust/source/anchors/zlodevCA.pem" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-trust", "extract" });
-            } else if (sys.dirExists("/usr/local/share/ca-certificates")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, "/usr/local/share/ca-certificates/zlodevCA.crt" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-certificates" });
-            } else if (sys.dirExists("/etc/ca-certificates/trust-source/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, "/etc/ca-certificates/trust-source/anchors/zlodevCA.crt" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "trust", "extract-compat" });
-            } else if (sys.dirExists("/usr/share/pki/trust/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, "/usr/share/pki/trust/anchors/zlodevCA.pem" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-certificates" });
+            if (linuxAnchorStore()) |store| {
+                var anchor_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                try sys.sudoCmd(allocator, &.{ "sudo", "cp", ca_path, try anchorPath(&anchor_buf, store, domain) });
+                try sys.sudoCmd(allocator, store.refresh);
             }
+            addToNss(allocator, domain, ca_path);
         },
         .windows => {
             std.debug.print("installing CA and generating certificate\n", .{});
             try sys.sudoCmd(allocator, &.{ "certutil", "-addstore", "Root", ca_path });
             // Also add CA to Git's OpenSSL CA bundle so tools like Git's curl can verify certs
-            appendToGitCaBundle(allocator, ca_path);
+            appendToGitCaBundle(allocator, domain, ca_path);
         },
         else => {},
     }
@@ -500,6 +515,8 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         std.debug.print("no certificates found for {s}\n", .{domain});
         return;
     }
+    var ca_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const ca_path = try std.fmt.bufPrint(&ca_path_buf, "{s}" ++ sep ++ "zlodevCA.pem", .{cert_dir});
 
     switch (builtin.os.tag) {
         .macos => {
@@ -508,19 +525,16 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
         },
         .linux => {
             std.debug.print("uninstalling and removing CA, please provide sudo password when asked\n", .{});
-            if (sys.dirExists("/etc/pki/ca-trust/source/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/pki/ca-trust/source/anchors/zlodevCA.pem" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-trust", "extract" });
-            } else if (sys.dirExists("/usr/local/share/ca-certificates")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/usr/local/share/ca-certificates/zlodevCA.crt" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-certificates" });
-            } else if (sys.dirExists("/etc/ca-certificates/trust-source/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/ca-certificates/trust-source/anchors/zlodevCA.crt" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "trust", "extract-compat" });
-            } else if (sys.dirExists("/usr/share/pki/trust/anchors")) {
-                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/usr/share/pki/trust/anchors/zlodevCA.pem" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "update-ca-certificates" });
+            if (linuxAnchorStore()) |store| {
+                var anchor_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", try anchorPath(&anchor_buf, store, domain) });
+                // Older versions used one file for every domain: remove it only if it holds this CA.
+                var legacy_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const legacy = try std.fmt.bufPrint(&legacy_buf, "{s}/zlodevCA.{s}", .{ store.dir, store.ext });
+                if (sameFileContents(allocator, legacy, ca_path)) try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", legacy });
+                try sys.sudoCmd(allocator, store.refresh);
             }
+            removeFromNss(allocator, domain);
         },
         .windows => {
             std.debug.print("uninstalling and removing CA\n", .{});
@@ -532,7 +546,7 @@ pub fn uninstallCA(allocator: std.mem.Allocator, domain: []const u8) !void {
             sys.sudoCmd(allocator, &.{ "certutil", "-delstore", "Root", cn }) catch {
                 std.debug.print("failed to remove certificate from store\n", .{});
             };
-            removeFromGitCaBundle(allocator);
+            removeFromGitCaBundle(allocator, domain, ca_path);
         },
         else => {},
     }
@@ -557,92 +571,103 @@ fn removeFromKeychain(allocator: std.mem.Allocator, cert_dir: []const u8) void {
     };
 }
 
-const ca_bundle_marker_begin = "\n# BEGIN zlodev CA\n";
-const ca_bundle_marker_end = "# END zlodev CA\n";
+// Markers written by versions before per-domain blocks; only read for cleanup.
+const legacy_bundle_begin = "\n# BEGIN zlodev CA\n";
+const legacy_bundle_end = "# END zlodev CA\n";
 
-/// Append the zlodev CA PEM to Git's OpenSSL CA bundle so tools using
-/// OpenSSL (e.g. Git's bundled curl) can verify zlodev certificates.
-fn appendToGitCaBundle(allocator: std.mem.Allocator, ca_pem_path: []const u8) void {
+const BundleBlock = struct { start: usize, stop: usize, body: []const u8 };
+
+fn findBlock(content: []const u8, begin: []const u8, end: []const u8) ?BundleBlock {
+    const start = std.mem.indexOf(u8, content, begin) orelse return null;
+    const body_start = start + begin.len;
+    const end_at = std.mem.indexOfPos(u8, content, body_start, end) orelse return null;
+    return .{ .start = start, .stop = end_at + end.len, .body = content[body_start..end_at] };
+}
+
+/// `content` with a block for `domain` appended; null when that domain already has one.
+pub fn bundleWithCa(allocator: std.mem.Allocator, content: []const u8, domain: []const u8, pem: []const u8) !?[]u8 {
+    var begin_buf: [320]u8 = undefined;
+    var end_buf: [320]u8 = undefined;
+    const begin = try std.fmt.bufPrint(&begin_buf, "\n# BEGIN zlodev CA {s}\n", .{domain});
+    const end = try std.fmt.bufPrint(&end_buf, "# END zlodev CA {s}\n", .{domain});
+    if (std.mem.indexOf(u8, content, begin) != null) return null;
+    return try std.mem.concat(allocator, u8, &.{ content, begin, pem, end });
+}
+
+/// `content` without `domain`'s block, and without an older unnamed block when it
+/// holds this CA's PEM (so the other domain's CA survives). Null when nothing changed.
+pub fn bundleWithoutCa(allocator: std.mem.Allocator, content: []const u8, domain: []const u8, pem: []const u8) !?[]u8 {
+    var begin_buf: [320]u8 = undefined;
+    var end_buf: [320]u8 = undefined;
+    const begin = try std.fmt.bufPrint(&begin_buf, "\n# BEGIN zlodev CA {s}\n", .{domain});
+    const end = try std.fmt.bufPrint(&end_buf, "# END zlodev CA {s}\n", .{domain});
+    var owned: ?[]u8 = null;
+    errdefer if (owned) |o| allocator.free(o);
+    var current = content;
+    if (findBlock(current, begin, end)) |b| {
+        owned = try std.mem.concat(allocator, u8, &.{ current[0..b.start], current[b.stop..] });
+        current = owned.?;
+    }
+    if (findBlock(current, legacy_bundle_begin, legacy_bundle_end)) |b| {
+        if (std.mem.eql(u8, b.body, pem)) {
+            const next = try std.mem.concat(allocator, u8, &.{ current[0..b.start], current[b.stop..] });
+            if (owned) |o| allocator.free(o);
+            owned = next;
+        }
+    }
+    return owned;
+}
+
+fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.zlodev_tmp", .{path});
+    defer allocator.free(tmp_path);
+    const tmp_file = try std.Io.Dir.createFileAbsolute(rt.io(), tmp_path, .{});
+    tmp_file.writeStreamingAll(rt.io(), bytes) catch |e| {
+        tmp_file.close(rt.io());
+        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
+        return e;
+    };
+    tmp_file.close(rt.io());
+    std.Io.Dir.renameAbsolute(tmp_path, path, rt.io()) catch |e| {
+        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
+        return e;
+    };
+}
+
+/// Append the domain's CA to Git's OpenSSL CA bundle so tools using OpenSSL
+/// (e.g. Git's bundled curl) can verify zlodev certificates.
+fn appendToGitCaBundle(allocator: std.mem.Allocator, domain: []const u8, ca_pem_path: []const u8) void {
     const bundle_path = getGitCaBundlePath(allocator) orelse return;
     defer allocator.free(bundle_path);
-
-    // Read CA PEM content
     const ca_content = std.Io.Dir.cwd().readFileAlloc(rt.io(), ca_pem_path, allocator, .limited(8192)) catch {
         std.debug.print("warning: could not read CA file for Git bundle\n", .{});
         return;
     };
     defer allocator.free(ca_content);
-
-    // Check if already present
     const bundle_content = std.Io.Dir.cwd().readFileAlloc(rt.io(), bundle_path, allocator, .limited(4 * 1024 * 1024)) catch {
         std.debug.print("warning: could not read Git CA bundle\n", .{});
         return;
     };
     defer allocator.free(bundle_content);
-    if (std.mem.indexOf(u8, bundle_content, "# BEGIN zlodev CA") != null) return;
-
-    // Build new content in memory
-    var new_content: std.ArrayListUnmanaged(u8) = .empty;
-    defer new_content.deinit(allocator);
-    new_content.appendSlice(allocator, bundle_content) catch return;
-    new_content.appendSlice(allocator, ca_bundle_marker_begin) catch return;
-    new_content.appendSlice(allocator, ca_content) catch return;
-    new_content.appendSlice(allocator, ca_bundle_marker_end) catch return;
-
-    // Write atomically via temp file + rename
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}.zlodev_tmp", .{bundle_path}) catch return;
-    defer allocator.free(tmp_path);
-
-    const tmp_file = std.Io.Dir.createFileAbsolute(rt.io(), tmp_path, .{}) catch return;
-    tmp_file.writeStreamingAll(rt.io(), new_content.items) catch {
-        tmp_file.close(rt.io());
-        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
-        return;
-    };
-    tmp_file.close(rt.io());
-
-    std.Io.Dir.renameAbsolute(tmp_path, bundle_path, rt.io()) catch {
-        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
-        return;
-    };
-
+    const new_content = (bundleWithCa(allocator, bundle_content, domain, ca_content) catch return) orelse return;
+    defer allocator.free(new_content);
+    writeFileAtomic(allocator, bundle_path, new_content) catch return;
     std.debug.print("CA also added to Git CA bundle at {s}\n", .{bundle_path});
 }
 
-/// Remove the zlodev CA from Git's OpenSSL CA bundle.
-fn removeFromGitCaBundle(allocator: std.mem.Allocator) void {
+/// Remove the domain's CA from Git's OpenSSL CA bundle.
+fn removeFromGitCaBundle(allocator: std.mem.Allocator, domain: []const u8, ca_pem_path: []const u8) void {
     const bundle_path = getGitCaBundlePath(allocator) orelse return;
     defer allocator.free(bundle_path);
-
+    // Without the PEM only the named block can go; a legacy block never matches "".
+    const pem = std.Io.Dir.cwd().readFileAlloc(rt.io(), ca_pem_path, allocator, .limited(8192)) catch
+        allocator.dupe(u8, "") catch return;
+    defer allocator.free(pem);
     const content = std.Io.Dir.cwd().readFileAlloc(rt.io(), bundle_path, allocator, .limited(4 * 1024 * 1024)) catch return;
     defer allocator.free(content);
-
-    const begin = std.mem.indexOf(u8, content, ca_bundle_marker_begin) orelse return;
-    const after_begin = begin + ca_bundle_marker_begin.len;
-    const end_marker = std.mem.indexOfPos(u8, content, after_begin, ca_bundle_marker_end) orelse return;
-    const end = end_marker + ca_bundle_marker_end.len;
-
-    // Write to a temporary file, then rename atomically
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}.zlodev_tmp", .{bundle_path}) catch return;
-    defer allocator.free(tmp_path);
-
-    const tmp_file = std.Io.Dir.createFileAbsolute(rt.io(), tmp_path, .{}) catch return;
-    tmp_file.writeStreamingAll(rt.io(), content[0..begin]) catch {
-        tmp_file.close(rt.io());
-        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
-        return;
-    };
-    tmp_file.writeStreamingAll(rt.io(), content[end..]) catch {
-        tmp_file.close(rt.io());
-        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
-        return;
-    };
-    tmp_file.close(rt.io());
-
-    std.Io.Dir.renameAbsolute(tmp_path, bundle_path, rt.io()) catch {
-        std.Io.Dir.deleteFileAbsolute(rt.io(), tmp_path) catch {};
-        return;
-    };
+    const new_content = (bundleWithoutCa(allocator, content, domain, pem) catch return) orelse return;
+    defer allocator.free(new_content);
+    writeFileAtomic(allocator, bundle_path, new_content) catch return;
     std.debug.print("CA removed from Git CA bundle\n", .{});
 }
 
@@ -677,6 +702,161 @@ fn getGitCaBundlePath(allocator: std.mem.Allocator) ?[]const u8 {
         return allocator.dupe(u8, path) catch return null;
     }
     return null;
+}
+
+/// Trust-anchor file name for `domain`, so `install` and `install -l` don't share one file.
+pub fn anchorFileName(buf: []u8, domain: []const u8, ext: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "zlodevCA-{s}.{s}", .{ domain, ext });
+}
+
+/// Nickname of the CA in browsers' NSS databases.
+pub fn nssNickname(buf: []u8, domain: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "zlodev {s} CA", .{domain});
+}
+
+pub const NssKind = enum { chromium, snap, firefox };
+pub const NssDb = struct { path: []u8, kind: NssKind };
+
+/// NSS databases browsers read on Linux, which ignore the system CA bundle.
+/// `[0]` is always `<home>/.pki/nssdb` (deb/rpm Chrome, Chromium, Brave, Edge,
+/// Vivaldi, Opera), even when missing; the rest exist: snap apps' own
+/// `.pki/nssdb` and Firefox profiles (dirs holding cert9.db), including newer
+/// Firefox's XDG location (`config_home` = `$XDG_CONFIG_HOME`, else `<home>/.config`).
+pub fn nssDatabases(allocator: std.mem.Allocator, home: []const u8, config_home: ?[]const u8) ![]NssDb {
+    var list: std.ArrayListUnmanaged(NssDb) = .empty;
+    errdefer {
+        for (list.items) |db| allocator.free(db.path);
+        list.deinit(allocator);
+    }
+    try appendDb(allocator, &list, try std.fmt.allocPrint(allocator, "{s}" ++ sep ++ ".pki" ++ sep ++ "nssdb", .{home}), .chromium);
+
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    try appendExistingDbs(allocator, &list, try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ "snap", .{home}), "current" ++ sep ++ ".pki" ++ sep ++ "nssdb", .snap);
+    try appendExistingDbs(allocator, &list, try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ ".mozilla" ++ sep ++ "firefox", .{home}), "", .firefox);
+    const xdg_firefox = if (config_home) |dir|
+        try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ "mozilla" ++ sep ++ "firefox", .{dir})
+    else
+        try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ ".config" ++ sep ++ "mozilla" ++ sep ++ "firefox", .{home});
+    try appendExistingDbs(allocator, &list, xdg_firefox, "", .firefox);
+    try appendExistingDbs(allocator, &list, try std.fmt.bufPrint(&root_buf, "{s}" ++ sep ++ "snap" ++ sep ++ "firefox" ++ sep ++ "common" ++ sep ++ ".mozilla" ++ sep ++ "firefox", .{home}), "", .firefox);
+    return list.toOwnedSlice(allocator);
+}
+
+pub fn freeNssDatabases(allocator: std.mem.Allocator, dbs: []NssDb) void {
+    for (dbs) |db| allocator.free(db.path);
+    allocator.free(dbs);
+}
+
+fn appendDb(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(NssDb), path: []u8, kind: NssKind) !void {
+    errdefer allocator.free(path);
+    try list.append(allocator, .{ .path = path, .kind = kind });
+}
+
+/// Appends `<root>/<subdir>/<suffix>` for each subdir of `root` whose NSS
+/// database exists. A missing `root` adds nothing.
+fn appendExistingDbs(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(NssDb), root: []const u8, suffix: []const u8, kind: NssKind) !void {
+    var dir = std.Io.Dir.cwd().openDir(rt.io(), root, .{ .iterate = true }) catch return;
+    defer dir.close(rt.io());
+    var it = dir.iterate();
+    while (it.next(rt.io()) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const path = if (suffix.len == 0)
+            try std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "{s}", .{ root, entry.name })
+        else
+            try std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "{s}" ++ sep ++ "{s}", .{ root, entry.name, suffix });
+        if (!nssDbExists(allocator, path)) {
+            allocator.free(path);
+            continue;
+        }
+        try appendDb(allocator, list, path, kind);
+    }
+}
+
+fn nssDbExists(allocator: std.mem.Allocator, db_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "cert9.db", .{db_dir}) catch return false;
+    defer allocator.free(path);
+    std.Io.Dir.cwd().access(rt.io(), path, .{}) catch return false;
+    return true;
+}
+
+const certutil_missing_fmt = "warning: certutil not found, so Chrome and Firefox won't trust {s}. Install libnss3-tools (Debian/Ubuntu), nss-tools (Fedora) or nss (Arch), then run 'zlodev install -f'\n";
+
+/// Add the CA to the NSS databases Chromium-based browsers and Firefox read on
+/// Linux. Runs as the user, not sudo; failures only warn.
+fn addToNss(allocator: std.mem.Allocator, domain: []const u8, ca_path: []const u8) void {
+    const home = compat.getenv("HOME") orelse return;
+    const dbs = nssDatabases(allocator, home, compat.getenv("XDG_CONFIG_HOME")) catch return;
+    defer freeNssDatabases(allocator, dbs);
+    var nick_buf: [256]u8 = undefined;
+    const nick = nssNickname(&nick_buf, domain) catch return;
+    for (dbs) |db| {
+        var arg_buf: [std.Io.Dir.max_path_bytes + 4]u8 = undefined;
+        const db_arg = std.fmt.bufPrint(&arg_buf, "sql:{s}", .{db.path}) catch continue;
+        if (!nssDbExists(allocator, db.path)) {
+            // Only ~/.pki/nssdb is listed while missing: create it so a browser started later trusts the CA.
+            makePrivateDir(db.path) catch {
+                std.debug.print("warning: could not add CA to {s}\n", .{db.path});
+                continue;
+            };
+            switch (sys.runUserCmd(&.{ "certutil", "-N", "--empty-password", "-d", db_arg })) {
+                .ok => {},
+                .missing => {
+                    std.debug.print(certutil_missing_fmt, .{domain});
+                    return;
+                },
+                .failed => {
+                    std.debug.print("warning: could not add CA to {s}\n", .{db.path});
+                    continue;
+                },
+            }
+        }
+        // Clear an entry left by an earlier CA under the same nickname (install -f).
+        if (sys.runUserCmd(&.{ "certutil", "-D", "-d", db_arg, "-n", nick }) == .missing) {
+            std.debug.print(certutil_missing_fmt, .{domain});
+            return;
+        }
+        switch (sys.runUserCmd(&.{ "certutil", "-A", "-d", db_arg, "-t", "C,,", "-n", nick, "-i", ca_path })) {
+            .ok => switch (db.kind) {
+                .chromium => std.debug.print("CA added to Chromium-based browsers ({s})\n", .{db.path}),
+                .snap => std.debug.print("CA added to {s}\n", .{db.path}),
+                .firefox => std.debug.print("CA added to Firefox profile {s}; restart Firefox if it is running\n", .{std.fs.path.basename(db.path)}),
+            },
+            .missing => {
+                std.debug.print(certutil_missing_fmt, .{domain});
+                return;
+            },
+            .failed => std.debug.print("warning: could not add CA to {s}\n", .{db.path}),
+        }
+    }
+}
+
+/// Remove the CA from every NSS database that exists. Never creates one.
+fn removeFromNss(allocator: std.mem.Allocator, domain: []const u8) void {
+    const home = compat.getenv("HOME") orelse return;
+    const dbs = nssDatabases(allocator, home, compat.getenv("XDG_CONFIG_HOME")) catch return;
+    defer freeNssDatabases(allocator, dbs);
+    var nick_buf: [256]u8 = undefined;
+    const nick = nssNickname(&nick_buf, domain) catch return;
+    for (dbs) |db| {
+        if (!nssDbExists(allocator, db.path)) continue;
+        var arg_buf: [std.Io.Dir.max_path_bytes + 4]u8 = undefined;
+        const db_arg = std.fmt.bufPrint(&arg_buf, "sql:{s}", .{db.path}) catch continue;
+        switch (sys.runUserCmd(&.{ "certutil", "-D", "-d", db_arg, "-n", nick })) {
+            .ok => std.debug.print("CA removed from {s}\n", .{db.path}),
+            .missing => return,
+            .failed => {}, // no entry for this domain
+        }
+    }
+}
+
+/// True when both files exist and hold the same bytes.
+fn sameFileContents(allocator: std.mem.Allocator, a: []const u8, b: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    const x = cwd.readFileAlloc(rt.io(), a, allocator, .limited(64 * 1024)) catch return false;
+    defer allocator.free(x);
+    const y = cwd.readFileAlloc(rt.io(), b, allocator, .limited(64 * 1024)) catch return false;
+    defer allocator.free(y);
+    return std.mem.eql(u8, x, y);
 }
 
 fn getFingerprint(ca_path: []const u8) ![40]u8 {
@@ -1058,4 +1238,160 @@ test "keptWarning names the error, expiry date and fix" {
         "renewal failed (CaKeyNotFound), expires 2026-11-14 - run zlodev install -f",
         keptWarning(&buf, error.CaKeyNotFound, 1794614400),
     );
+}
+
+test "anchorFileName and nssNickname carry the domain" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("zlodevCA-dev.lo.crt", try anchorFileName(&buf, "dev.lo", "crt"));
+    try std.testing.expectEqualStrings("zlodevCA-myhost.local.pem", try anchorFileName(&buf, "myhost.local", "pem"));
+    try std.testing.expectEqualStrings("zlodev dev.lo CA", try nssNickname(&buf, "dev.lo"));
+}
+
+test "anchorFileName and nssNickname fit a 63-character host" {
+    const domain = "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh" ++ ".local"; // 63 chars
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, "zlodevCA-".len + domain.len + ".crt".len), (try anchorFileName(&buf, domain, "crt")).len);
+    try std.testing.expectEqual(@as(usize, "zlodev ".len + domain.len + " CA".len), (try nssNickname(&buf, domain)).len);
+}
+
+test "sameFileContents compares bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(rt.io(), .{ .sub_path = "a.pem", .data = "PEM-A\n" });
+    try tmp.dir.writeFile(rt.io(), .{ .sub_path = "a2.pem", .data = "PEM-A\n" });
+    try tmp.dir.writeFile(rt.io(), .{ .sub_path = "b.pem", .data = "PEM-B\n" });
+    var a: [256]u8 = undefined;
+    var a2: [256]u8 = undefined;
+    var b: [256]u8 = undefined;
+    var missing: [256]u8 = undefined;
+    const pa = try tmpPathZ(&a, &tmp, "a.pem");
+    try std.testing.expect(sameFileContents(std.testing.allocator, pa, try tmpPathZ(&a2, &tmp, "a2.pem")));
+    try std.testing.expect(!sameFileContents(std.testing.allocator, pa, try tmpPathZ(&b, &tmp, "b.pem")));
+    try std.testing.expect(!sameFileContents(std.testing.allocator, pa, try tmpPathZ(&missing, &tmp, "none.pem")));
+}
+
+test "runUserCmd reports a missing binary" {
+    try std.testing.expectEqual(sys.RunResult.missing, sys.runUserCmd(&.{"zlodev-no-such-binary-7f3a"}));
+}
+
+test "runUserCmd reports success and failure" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectEqual(sys.RunResult.ok, sys.runUserCmd(&.{"true"}));
+    try std.testing.expectEqual(sys.RunResult.failed, sys.runUserCmd(&.{"false"}));
+}
+
+fn touchFile(dir: std.Io.Dir, path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(rt.io(), parent);
+    const f = try dir.createFile(rt.io(), path, .{});
+    f.close(rt.io());
+}
+
+fn hasDb(dbs: []const NssDb, suffix: []const u8, kind: NssKind) bool {
+    for (dbs) |db| {
+        if (db.kind == kind and std.mem.endsWith(u8, db.path, suffix)) return true;
+    }
+    return false;
+}
+
+test "nssDatabases lists ~/.pki/nssdb first even when it is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(rt.io(), "home");
+    var buf: [256]u8 = undefined;
+    const dbs = try nssDatabases(std.testing.allocator, try tmpPathZ(&buf, &tmp, "home"), null);
+    defer freeNssDatabases(std.testing.allocator, dbs);
+    try std.testing.expectEqual(@as(usize, 1), dbs.len);
+    try std.testing.expectEqual(NssKind.chromium, dbs[0].kind);
+    try std.testing.expect(std.mem.endsWith(u8, dbs[0].path, "home" ++ sep ++ ".pki" ++ sep ++ "nssdb"));
+}
+
+test "nssDatabases finds snap databases and Firefox profiles that exist" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = "home" ++ sep;
+    const snap_db = sep ++ "current" ++ sep ++ ".pki" ++ sep ++ "nssdb";
+    try touchFile(tmp.dir, h ++ "snap" ++ sep ++ "brave" ++ snap_db ++ sep ++ "cert9.db");
+    try touchFile(tmp.dir, h ++ "snap" ++ sep ++ "chromium" ++ snap_db ++ sep ++ "cert9.db");
+    try tmp.dir.createDirPath(rt.io(), h ++ "snap" ++ sep ++ "spotify" ++ sep ++ "current");
+    const ff = h ++ ".mozilla" ++ sep ++ "firefox" ++ sep;
+    try touchFile(tmp.dir, ff ++ "abc.default-release" ++ sep ++ "cert9.db");
+    try touchFile(tmp.dir, ff ++ "My Profile" ++ sep ++ "cert9.db");
+    try tmp.dir.createDirPath(rt.io(), ff ++ "Crash Reports");
+    try touchFile(tmp.dir, h ++ "snap" ++ sep ++ "firefox" ++ sep ++ "common" ++ sep ++ ".mozilla" ++ sep ++ "firefox" ++ sep ++ "xyz.default" ++ sep ++ "cert9.db");
+    try touchFile(tmp.dir, h ++ ".var" ++ sep ++ "app" ++ sep ++ "com.brave.Browser" ++ sep ++ ".pki" ++ sep ++ "nssdb" ++ sep ++ "cert9.db");
+
+    var buf: [256]u8 = undefined;
+    const dbs = try nssDatabases(std.testing.allocator, try tmpPathZ(&buf, &tmp, "home"), null);
+    defer freeNssDatabases(std.testing.allocator, dbs);
+
+    try std.testing.expectEqual(@as(usize, 6), dbs.len);
+    try std.testing.expectEqual(NssKind.chromium, dbs[0].kind);
+    try std.testing.expect(hasDb(dbs, "brave" ++ snap_db, .snap));
+    try std.testing.expect(hasDb(dbs, "chromium" ++ snap_db, .snap));
+    try std.testing.expect(hasDb(dbs, "abc.default-release", .firefox));
+    try std.testing.expect(hasDb(dbs, "My Profile", .firefox));
+    try std.testing.expect(hasDb(dbs, "xyz.default", .firefox));
+    for (dbs) |db| try std.testing.expect(std.mem.indexOf(u8, db.path, ".var") == null);
+}
+
+const test_pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+const other_pem = "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
+
+const dev_block = "\n# BEGIN zlodev CA dev.lo\n" ++ test_pem ++ "# END zlodev CA dev.lo\n";
+const host_block = "\n# BEGIN zlodev CA host.local\n" ++ other_pem ++ "# END zlodev CA host.local\n";
+
+const legacy_test_bundle = "roots\n\n# BEGIN zlodev CA\n" ++ test_pem ++ "# END zlodev CA\n";
+
+test "bundleWithCa appends a block named for the domain" {
+    const out = (try bundleWithCa(std.testing.allocator, "roots\n", "dev.lo", test_pem)).?;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("roots\n" ++ dev_block, out);
+}
+
+test "bundleWithCa skips a domain already present and adds a second domain" {
+    const first = "roots\n" ++ dev_block;
+    try std.testing.expect((try bundleWithCa(std.testing.allocator, first, "dev.lo", test_pem)) == null);
+    const out = (try bundleWithCa(std.testing.allocator, first, "host.local", other_pem)).?;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(first ++ host_block, out);
+}
+
+test "bundleWithoutCa removes only the named domain" {
+    const both = "roots\n" ++ dev_block ++ host_block;
+    const out = (try bundleWithoutCa(std.testing.allocator, both, "host.local", other_pem)).?;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("roots\n" ++ dev_block, out);
+}
+
+test "bundleWithoutCa removes a legacy block holding this CA" {
+    const out = (try bundleWithoutCa(std.testing.allocator, legacy_test_bundle, "dev.lo", test_pem)).?;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("roots\n", out);
+}
+
+test "bundleWithoutCa keeps a legacy block holding another CA" {
+    try std.testing.expect((try bundleWithoutCa(std.testing.allocator, legacy_test_bundle, "host.local", other_pem)) == null);
+}
+
+test "bundleWithoutCa returns null when the domain has no block" {
+    try std.testing.expect((try bundleWithoutCa(std.testing.allocator, "roots\n", "dev.lo", test_pem)) == null);
+}
+
+test "nssDatabases finds Firefox profiles in the XDG config dir" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try touchFile(tmp.dir, "home" ++ sep ++ ".config" ++ sep ++ "mozilla" ++ sep ++ "firefox" ++ sep ++ "p1.default" ++ sep ++ "cert9.db");
+    try touchFile(tmp.dir, "xdg" ++ sep ++ "mozilla" ++ sep ++ "firefox" ++ sep ++ "p2.default" ++ sep ++ "cert9.db");
+    var home_buf: [256]u8 = undefined;
+    var xdg_buf: [256]u8 = undefined;
+    const home = try tmpPathZ(&home_buf, &tmp, "home");
+
+    const default_dbs = try nssDatabases(std.testing.allocator, home, null);
+    defer freeNssDatabases(std.testing.allocator, default_dbs);
+    try std.testing.expect(hasDb(default_dbs, "p1.default", .firefox));
+
+    const xdg_dbs = try nssDatabases(std.testing.allocator, home, try tmpPathZ(&xdg_buf, &tmp, "xdg"));
+    defer freeNssDatabases(std.testing.allocator, xdg_dbs);
+    try std.testing.expect(hasDb(xdg_dbs, "p2.default", .firefox));
+    try std.testing.expect(!hasDb(xdg_dbs, "p1.default", .firefox));
 }

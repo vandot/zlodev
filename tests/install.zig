@@ -94,11 +94,60 @@ fn verifyCertDirRemoved(domain: []const u8) !void {
     try testing.expect(!fileExists(cert_dir));
 }
 
+const linux_anchor_dirs = [_]struct { dir: []const u8, ext: []const u8 }{
+    .{ .dir = "/etc/pki/ca-trust/source/anchors", .ext = "pem" },
+    .{ .dir = "/usr/local/share/ca-certificates", .ext = "crt" },
+    .{ .dir = "/etc/ca-certificates/trust-source/anchors", .ext = "crt" },
+    .{ .dir = "/usr/share/pki/trust/anchors", .ext = "pem" },
+};
+
+/// True when the per-domain system trust anchor exists in any distro's anchor dir.
+fn anchorExists(domain: []const u8) bool {
+    for (linux_anchor_dirs) |a| {
+        var buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/zlodevCA-{s}.{s}", .{ a.dir, domain, a.ext }) catch continue;
+        if (fileExists(path)) return true;
+    }
+    return false;
+}
+
+const fake_firefox_profile = ".mozilla/firefox/zlodevtest.default";
+
+fn homePath(buf: []u8, rel: []const u8) ![]const u8 {
+    const home = getEnvOwned("HOME") orelse return error.NoHomeDir;
+    defer testing.allocator.free(home);
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ home, rel });
+}
+
+/// True when `certutil -L` finds the domain's CA in the NSS database at `rel` under $HOME.
+fn nssHas(rel: []const u8, domain: []const u8) bool {
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = homePath(&dir_buf, rel) catch return false;
+    var arg_buf: [std.Io.Dir.max_path_bytes + 4]u8 = undefined;
+    const db_arg = std.fmt.bufPrint(&arg_buf, "sql:{s}", .{dir}) catch return false;
+    var nick_buf: [512]u8 = undefined;
+    const nick = std.fmt.bufPrint(&nick_buf, "zlodev {s} CA", .{domain}) catch return false;
+    const term = runCmd(&.{ "certutil", "-L", "-d", db_arg, "-n", nick }) catch return false;
+    return std.meta.eql(term, std.process.Child.Term{ .exited = 0 });
+}
+
+/// A Firefox profile with an empty NSS database, so install has one to find.
+fn createFakeFirefoxProfile() !void {
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try homePath(&dir_buf, fake_firefox_profile);
+    var db_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (fileExists(try std.fmt.bufPrint(&db_buf, "{s}/cert9.db", .{dir}))) return;
+    try std.Io.Dir.cwd().createDirPath(testing.io, dir);
+    var arg_buf: [std.Io.Dir.max_path_bytes + 4]u8 = undefined;
+    try runCmdExpectSuccess(&.{ "certutil", "-N", "--empty-password", "-d", try std.fmt.bufPrint(&arg_buf, "sql:{s}", .{dir}) });
+}
+
 // --- Default mode (dev.lo) ---
 
 test "install and verify" {
     try testing.expect(fileExists(binary_path));
 
+    if (builtin.os.tag == .linux) try createFakeFirefoxProfile();
     try runCmdExpectSuccess(&.{ binary_path, "install" });
     try verifyCertFiles("dev.lo");
 
@@ -110,11 +159,9 @@ test "install and verify" {
         .linux => {
             try testing.expect(fileExists("/etc/systemd/network/zlodev0.network"));
             try testing.expect(fileExists("/etc/systemd/network/zlodev0.netdev"));
-            const found = fileExists("/usr/local/share/ca-certificates/zlodevCA.crt") or
-                fileExists("/etc/pki/ca-trust/source/anchors/zlodevCA.pem") or
-                fileExists("/etc/ca-certificates/trust-source/anchors/zlodevCA.crt") or
-                fileExists("/usr/share/pki/trust/anchors/zlodevCA.pem");
-            try testing.expect(found);
+            try testing.expect(anchorExists("dev.lo"));
+            try testing.expect(nssHas(".pki/nssdb", "dev.lo"));
+            try testing.expect(nssHas(fake_firefox_profile, "dev.lo"));
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (!(Get-DnsClientNrptRule | Where { $_.Namespace -eq '.lo' })) { exit 1 }" });
@@ -127,6 +174,10 @@ test "install and verify" {
 test "install -f succeeds when already installed" {
     try runCmdExpectSuccess(&.{ binary_path, "install", "-f" });
     try verifyCertFiles("dev.lo");
+    if (builtin.os.tag == .linux) {
+        try testing.expect(anchorExists("dev.lo"));
+        try testing.expect(nssHas(".pki/nssdb", "dev.lo"));
+    }
 }
 
 test "uninstall and verify" {
@@ -142,11 +193,9 @@ test "uninstall and verify" {
         .linux => {
             try testing.expect(!fileExists("/etc/systemd/network/zlodev0.network"));
             try testing.expect(!fileExists("/etc/systemd/network/zlodev0.netdev"));
-            const found = fileExists("/usr/local/share/ca-certificates/zlodevCA.crt") or
-                fileExists("/etc/pki/ca-trust/source/anchors/zlodevCA.pem") or
-                fileExists("/etc/ca-certificates/trust-source/anchors/zlodevCA.crt") or
-                fileExists("/usr/share/pki/trust/anchors/zlodevCA.pem");
-            try testing.expect(!found);
+            try testing.expect(!anchorExists("dev.lo"));
+            try testing.expect(!nssHas(".pki/nssdb", "dev.lo"));
+            try testing.expect(!nssHas(fake_firefox_profile, "dev.lo"));
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "Powershell.exe", "-Command", "if (Get-DnsClientNrptRule | Where { $_.Namespace -eq '.lo' }) { exit 1 }" });
@@ -187,11 +236,8 @@ test "install --local and verify" {
             try runCmdExpectSuccess(&.{ "security", "find-certificate", "-c", cn, "/Library/Keychains/System.keychain" });
         },
         .linux => {
-            const found = fileExists("/usr/local/share/ca-certificates/zlodevCA.crt") or
-                fileExists("/etc/pki/ca-trust/source/anchors/zlodevCA.pem") or
-                fileExists("/etc/ca-certificates/trust-source/anchors/zlodevCA.crt") or
-                fileExists("/usr/share/pki/trust/anchors/zlodevCA.pem");
-            try testing.expect(found);
+            try testing.expect(anchorExists(domain));
+            try testing.expect(nssHas(".pki/nssdb", domain));
         },
         .windows => {
             try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", cn });
@@ -228,11 +274,8 @@ test "uninstall --local and verify" {
             try testing.expect(!std.meta.eql(term, std.process.Child.Term{ .exited = 0 }));
         },
         .linux => {
-            const found = fileExists("/usr/local/share/ca-certificates/zlodevCA.crt") or
-                fileExists("/etc/pki/ca-trust/source/anchors/zlodevCA.pem") or
-                fileExists("/etc/ca-certificates/trust-source/anchors/zlodevCA.crt") or
-                fileExists("/usr/share/pki/trust/anchors/zlodevCA.pem");
-            try testing.expect(!found);
+            try testing.expect(!anchorExists(domain));
+            try testing.expect(!nssHas(".pki/nssdb", domain));
         },
         .windows => {
             const term_wl = try runCmd(&.{ "certutil", "-verifystore", "Root", cn });
@@ -240,4 +283,70 @@ test "uninstall --local and verify" {
         },
         else => {},
     }
+}
+
+/// Git for Windows' CA bundle contents, or null when there is none.
+fn gitBundleContent() ?[]u8 {
+    const res = std.process.run(testing.allocator, testing.io, .{ .argv = &.{ "git", "config", "--system", "http.sslCAInfo" } }) catch return null;
+    defer testing.allocator.free(res.stdout);
+    defer testing.allocator.free(res.stderr);
+    const configured = std.mem.trim(u8, res.stdout, " \t\r\n");
+    const path = if (configured.len > 0) configured else "C:\\Program Files\\Git\\mingw64\\etc\\ssl\\certs\\ca-bundle.crt";
+    return std.Io.Dir.cwd().readFileAlloc(testing.io, path, testing.allocator, .limited(4 * 1024 * 1024)) catch null;
+}
+
+fn bundleHas(content: []const u8, domain: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const marker = std.fmt.bufPrint(&buf, "# BEGIN zlodev CA {s}\n", .{domain}) catch return false;
+    return std.mem.indexOf(u8, content, marker) != null;
+}
+
+// --- Both domains side by side ---
+
+test "install --cert and install -l --cert keep separate trust entries" {
+    var hostname_buf: [hostname_max]u8 = undefined;
+    const hostname = getHostname(&hostname_buf);
+    var domain_buf: [512]u8 = undefined;
+    const domain = try std.fmt.bufPrint(&domain_buf, "{s}.local", .{hostname});
+
+    try runCmdExpectSuccess(&.{ binary_path, "install", "--cert" });
+    try runCmdExpectSuccess(&.{ binary_path, "install", "-l", "--cert" });
+    switch (builtin.os.tag) {
+        .linux => {
+            try testing.expect(anchorExists("dev.lo"));
+            try testing.expect(anchorExists(domain));
+            try testing.expect(nssHas(".pki/nssdb", "dev.lo"));
+            try testing.expect(nssHas(".pki/nssdb", domain));
+        },
+        .windows => if (gitBundleContent()) |content| {
+            defer testing.allocator.free(content);
+            try testing.expect(bundleHas(content, "dev.lo"));
+            try testing.expect(bundleHas(content, domain));
+        },
+        else => {},
+    }
+
+    try runCmdExpectSuccess(&.{ binary_path, "uninstall", "-l", "--cert" });
+    try verifyCertFiles("dev.lo");
+    switch (builtin.os.tag) {
+        .macos => try runCmdExpectSuccess(&.{ "security", "find-certificate", "-c", "dev.lo CA", "/Library/Keychains/System.keychain" }),
+        .linux => {
+            try testing.expect(anchorExists("dev.lo"));
+            try testing.expect(!anchorExists(domain));
+            try testing.expect(nssHas(".pki/nssdb", "dev.lo"));
+            try testing.expect(!nssHas(".pki/nssdb", domain));
+        },
+        .windows => {
+            try runCmdExpectSuccess(&.{ "certutil", "-verifystore", "Root", "dev.lo CA" });
+            if (gitBundleContent()) |content| {
+                defer testing.allocator.free(content);
+                try testing.expect(bundleHas(content, "dev.lo"));
+                try testing.expect(!bundleHas(content, domain));
+            }
+        },
+        else => {},
+    }
+
+    try runCmdExpectSuccess(&.{ binary_path, "uninstall", "--cert" });
+    try verifyCertDirRemoved("dev.lo");
 }
