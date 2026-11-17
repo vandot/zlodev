@@ -50,6 +50,7 @@ jobs:
           zig test src/shutdown.zig
           zig test src/compat.zig
           zig test src/sys.zig -lc
+          zig test src/cli.zig
 
       - name: Test intercept
         run: zig test src/intercept.zig
@@ -130,6 +131,7 @@ jobs:
           zig test src/shutdown.zig
           zig test src/compat.zig
           zig test src/sys.zig -lc
+          zig test src/cli.zig
 
       - name: Test intercept
         run: zig test src/intercept.zig
@@ -192,6 +194,7 @@ jobs:
           zig test src/shutdown.zig
           zig test src/compat.zig
           zig test src/sys.zig -lc
+          zig test src/cli.zig
 
       - name: Test intercept
         run: zig test src/intercept.zig

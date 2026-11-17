@@ -299,7 +299,8 @@ pub fn clearAll() void {
 // Process Lifecycle
 // ---------------------------------------------------------------------------
 
-var command_buf: [1024]u8 = undefined;
+pub const max_command_len = 1024;
+var command_buf: [max_command_len]u8 = undefined;
 var command_len: usize = 0;
 var child_process: ?std.process.Child = null;
 var stdout_thread: ?std.Thread = null;
