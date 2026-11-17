@@ -559,7 +559,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                     const total = subprocess.getLineCount();
                                     logs_scroll = total;
                                 } else {
-                                    cursor = std.math.maxInt(usize);
+                                    cursor = filtered_count -| 1;
                                 }
                             }
                             if (key.matches('g', .{})) {
@@ -575,9 +575,9 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 cursor = 0;
                                 scroll_offset = 0;
                             }
-                            if (key.matches(vaxis.Key.enter, .{}) and filtered_count > 0) {
+                            if (key.matches(vaxis.Key.enter, .{})) {
                                 // Map filtered cursor to real logical index
-                                detail_index = filter_map[cursor];
+                                detail_index = search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue;
                                 detail_scroll = 0;
                                 view = .detail;
                             }
@@ -589,20 +589,21 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                     intercept_len = 0;
                                 }
                             }
-                            if (key.matches('a', .{}) and filtered_count > 0)
-                                acceptEntry(filter_map[cursor]);
+                            if (key.matches('a', .{}))
+                                acceptEntry(search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue);
                             if (key.matches('A', .{}))
                                 intercept.acceptAll();
                             if (key.matches('C', .{}))
                                 requests.clearAll();
-                            if (key.matches('*', .{}) and filtered_count > 0) {
-                                const bi = requests.logicalToBackingIndex(filter_map[cursor]) orelse continue;
+                            if (key.matches('*', .{})) {
+                                const bi = requests.logicalToBackingIndex(search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue) orelse continue;
                                 requests.toggleStar(bi);
                             }
-                            if (key.matches('d', .{}) and filtered_count > 0)
-                                dropOrDeleteEntry(filter_map[cursor]);
-                            if (key.matches('c', .{}) and filtered_count > 0) {
-                                const msg: []const u8 = switch (clipboard.copyAsCurl(alloc, filter_map[cursor], domain)) {
+                            if (key.matches('d', .{}))
+                                dropOrDeleteEntry(search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue);
+                            if (key.matches('c', .{})) {
+                                const sel = search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue;
+                                const msg: []const u8 = switch (clipboard.copyAsCurl(alloc, sel, domain)) {
                                     .copied => "Copied as curl!",
                                     .truncated => "Request too large to copy: captured copy is truncated",
                                     .missing => "",
@@ -624,10 +625,11 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 }
                                 flash_time = rt.milliTimestamp();
                             }
-                            if (key.matches('r', .{}) and filtered_count > 0) {
-                                if (edit_state.openForReplay(alloc, filter_map[cursor])) {
+                            if (key.matches('r', .{})) {
+                                const sel = search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue;
+                                if (edit_state.openForReplay(alloc, sel)) {
                                     view = .edit;
-                                } else if (filter_map[cursor] < summary_count and summaries[filter_map[cursor]].request_truncated) {
+                                } else if (sel < summary_count and summaries[sel].request_truncated) {
                                     const msg = "Request too large to replay: captured copy is truncated";
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
@@ -641,15 +643,15 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
                                     flash_time = rt.milliTimestamp();
-                                } else if (filtered_count > 0) {
-                                    const msg: []const u8 = if (replayEntry(filter_map[cursor])) "Replayed!" else "Request too large to replay: captured copy is truncated";
+                                } else if (search.selectedIndex(&filter_map, filtered_count, cursor)) |sel| {
+                                    const msg: []const u8 = if (replayEntry(sel)) "Replayed!" else "Request too large to replay: captured copy is truncated";
                                     @memcpy(flash_buf[0..msg.len], msg);
                                     flash_len = msg.len;
                                     flash_time = rt.milliTimestamp();
                                 }
                             }
-                            if (key.matches('e', .{}) and filtered_count > 0) {
-                                if (edit_state.open(alloc, filter_map[cursor])) view = .edit;
+                            if (key.matches('e', .{})) {
+                                if (edit_state.open(alloc, search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue)) view = .edit;
                             }
                         },
                         .detail => {
@@ -798,7 +800,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
             filtered_count = raw_count;
         }
 
-        // Clamp cursor to filtered list (before any event handlers access filter_map[cursor])
+        // Clamp cursor to filtered list (key handlers read it through search.selectedIndex)
         if (filtered_count > 0) {
             if (cursor >= filtered_count) cursor = filtered_count - 1;
         } else {
