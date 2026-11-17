@@ -312,12 +312,11 @@ fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool,
             if (!std.mem.eql(u8, avahi, "active")) {
                 // Configure systemd-resolved for mDNS
                 const resolved_conf = "[Resolve]\nMulticastDNS=yes\nLLMNR=no";
-                const tmp_file = try std.Io.Dir.cwd().createFile(rt.io(), "/tmp/zlodev_resolved.conf", .{});
-                try tmp_file.writeStreamingAll(rt.io(), resolved_conf);
-                tmp_file.close(rt.io());
+                const tmp_conf = try sys.writeTmpFile(allocator, "resolved_conf", resolved_conf);
+                defer allocator.free(tmp_conf);
+                defer sys.removeTmpFile(tmp_conf);
                 try sys.sudoCmd(allocator, &.{ "sudo", "mkdir", "-p", "/etc/systemd/resolved.conf.d" });
-                try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", "/tmp/zlodev_resolved.conf", "/etc/systemd/resolved.conf.d/zlodev.conf" });
-                std.Io.Dir.cwd().deleteFile(rt.io(), "/tmp/zlodev_resolved.conf") catch {};
+                try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_conf, "/etc/systemd/resolved.conf.d/zlodev.conf" });
                 sys.sudoCmd(allocator, &.{ "sudo", "systemctl", "restart", "systemd-resolved.service" }) catch {};
             }
         },

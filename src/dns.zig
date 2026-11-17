@@ -353,9 +353,10 @@ pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []c
             defer allocator.free(text);
             const tmp_path = try sys.writeTmpFile(allocator, "dns_resolver", text);
             defer allocator.free(tmp_path);
+            defer sys.removeTmpFile(tmp_path);
             const dest = try std.fmt.allocPrint(allocator, "/etc/resolver/{s}", .{tld});
             defer allocator.free(dest);
-            try sys.sudoCmd(allocator, &.{ "sudo", "mv", tmp_path, dest });
+            try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_path, dest });
         },
         .linux => {
             const network_text = if (port == 53)
@@ -365,11 +366,13 @@ pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []c
             defer allocator.free(network_text);
             const tmp_network = try sys.writeTmpFile(allocator, "dns_network", network_text);
             defer allocator.free(tmp_network);
+            defer sys.removeTmpFile(tmp_network);
             try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_network, "/etc/systemd/network/zlodev0.network" });
 
             const netdev_text = "[NetDev]\nName=zlodev0\nKind=dummy\n";
             const tmp_netdev = try sys.writeTmpFile(allocator, "dns_netdev", netdev_text);
             defer allocator.free(tmp_netdev);
+            defer sys.removeTmpFile(tmp_netdev);
             try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_netdev, "/etc/systemd/network/zlodev0.netdev" });
             const link_existed = if (std.Io.Dir.accessAbsolute(rt.io(), "/sys/class/net/zlodev0", .{})) |_| true else |_| false;
             // networkd creates the zlodev0 dummy interface; without it .lo never resolves.
