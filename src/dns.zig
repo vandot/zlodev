@@ -411,6 +411,62 @@ fn reloadNetworkd(allocator: std.mem.Allocator) !void {
     };
 }
 
+const networkd_network_path = "/etc/systemd/network/zlodev0.network";
+const networkd_netdev_path = "/etc/systemd/network/zlodev0.netdev";
+
+fn pathExists(path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(rt.io(), path, .{}) catch return false;
+    return true;
+}
+
+fn detectLinuxBackend(allocator: std.mem.Allocator) ?LinuxBackend {
+    const nd = sys.runCmdOutput(allocator, &.{ "systemctl", "is-active", "systemd-networkd.service" });
+    defer if (nd) |s| allocator.free(s);
+    const nm = sys.runCmdOutput(allocator, &.{ "systemctl", "is-active", "NetworkManager.service" });
+    defer if (nm) |s| allocator.free(s);
+    return chooseLinuxBackend(nd orelse "", nm orelse "");
+}
+
+fn nmConnectionExists() bool {
+    return sys.runUserCmd(&.{ "nmcli", "-g", "NAME", "connection", "show", nm_connection }) == .ok;
+}
+
+fn installNetworkd(allocator: std.mem.Allocator, ip: []const u8, tld: []const u8) !void {
+    const network_text = try networkdNetworkText(allocator, ip, tld);
+    defer allocator.free(network_text);
+    const tmp_network = try sys.writeTmpFile(allocator, "dns_network", network_text);
+    defer allocator.free(tmp_network);
+    defer sys.removeTmpFile(tmp_network);
+    try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_network, networkd_network_path });
+
+    const netdev_text = "[NetDev]\nName=zlodev0\nKind=dummy\n";
+    const tmp_netdev = try sys.writeTmpFile(allocator, "dns_netdev", netdev_text);
+    defer allocator.free(tmp_netdev);
+    defer sys.removeTmpFile(tmp_netdev);
+    try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_netdev, networkd_netdev_path });
+    const link_existed = pathExists("/sys/class/net/zlodev0");
+    // networkd creates the zlodev0 dummy interface; without it .lo never resolves.
+    reloadNetworkd(allocator) catch |e| {
+        std.debug.print("could not reload systemd-networkd (needed for the zlodev0 interface); is it installed and not masked?\n", .{});
+        return e;
+    };
+    // Reinstall: reload alone leaves an existing link on the old .network (systemd < 249).
+    if (link_existed) sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "reconfigure", "zlodev0" }) catch {};
+}
+
+fn installNetworkManager(allocator: std.mem.Allocator, ip: []const u8, tld: []const u8) !void {
+    // Reinstall: replace the connection so it gets the current settings.
+    if (nmConnectionExists()) {
+        try sys.sudoCmd(allocator, &.{ "sudo", "nmcli", "connection", "delete", nm_connection });
+    }
+    const add = try nmcliAddArgs(allocator, ip, tld);
+    defer add.deinit(allocator);
+    sys.sudoCmd(allocator, &add.argv) catch |e| {
+        std.debug.print("could not create the zlodev NetworkManager connection\n", .{});
+        return e;
+    };
+}
+
 pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []const u8) !void {
     switch (builtin.os.tag) {
         .macos => {
@@ -426,29 +482,14 @@ pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []c
             try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_path, dest });
         },
         .linux => {
-            const network_text = if (port == 53)
-                try std.fmt.allocPrint(allocator, "[Match]\nName=zlodev0\n[Network]\nAddress={s}/32\nDomains=~{s}\nDNS={s}\n", .{ ip, tld, ip })
-            else
-                try std.fmt.allocPrint(allocator, "[Match]\nName=zlodev0\n[Network]\nAddress={s}/32\nDomains=~{s}\nDNS={s}:{d}\n", .{ ip, tld, ip, port });
-            defer allocator.free(network_text);
-            const tmp_network = try sys.writeTmpFile(allocator, "dns_network", network_text);
-            defer allocator.free(tmp_network);
-            defer sys.removeTmpFile(tmp_network);
-            try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_network, "/etc/systemd/network/zlodev0.network" });
-
-            const netdev_text = "[NetDev]\nName=zlodev0\nKind=dummy\n";
-            const tmp_netdev = try sys.writeTmpFile(allocator, "dns_netdev", netdev_text);
-            defer allocator.free(tmp_netdev);
-            defer sys.removeTmpFile(tmp_netdev);
-            try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_netdev, "/etc/systemd/network/zlodev0.netdev" });
-            const link_existed = if (std.Io.Dir.accessAbsolute(rt.io(), "/sys/class/net/zlodev0", .{})) |_| true else |_| false;
-            // networkd creates the zlodev0 dummy interface; without it .lo never resolves.
-            reloadNetworkd(allocator) catch |e| {
-                std.debug.print("could not reload systemd-networkd (needed for the zlodev0 interface); is it installed and not masked?\n", .{});
-                return e;
+            const backend = detectLinuxBackend(allocator) orelse {
+                std.debug.print("linux DNS setup needs systemd-networkd or NetworkManager to be running\n", .{});
+                std.process.exit(1);
             };
-            // Reinstall: reload alone leaves an existing link on the old .network (systemd < 249).
-            if (link_existed) sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "reconfigure", "zlodev0" }) catch {};
+            switch (backend) {
+                .networkd => try installNetworkd(allocator, ip, tld),
+                .network_manager => try installNetworkManager(allocator, ip, tld),
+            }
             sys.sudoCmd(allocator, &.{ "sudo", "resolvectl", "flush-caches" }) catch {};
         },
         .windows => {
@@ -468,13 +509,20 @@ pub fn uninstall(allocator: std.mem.Allocator, tld: []const u8) !void {
             try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", path });
         },
         .linux => {
-            try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.network" });
-            try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.netdev" });
-            // Only delete interface if it exists
-            if (std.Io.Dir.accessAbsolute(rt.io(), "/sys/class/net/zlodev0", .{})) |_| {
-                sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
-            } else |_| {}
-            reloadNetworkd(allocator) catch {};
+            if (nmConnectionExists()) {
+                sys.sudoCmd(allocator, &.{ "sudo", "nmcli", "connection", "delete", nm_connection }) catch {};
+            }
+            // Touch networkd only if zlodev configured it: reloadNetworkd falls
+            // back to a restart, which would start networkd on a
+            // NetworkManager-only system.
+            if (pathExists(networkd_network_path) or pathExists(networkd_netdev_path)) {
+                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", networkd_network_path });
+                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", networkd_netdev_path });
+                if (pathExists("/sys/class/net/zlodev0")) {
+                    sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
+                }
+                reloadNetworkd(allocator) catch {};
+            }
             sys.sudoCmd(allocator, &.{ "sudo", "resolvectl", "flush-caches" }) catch {};
         },
         .windows => {
