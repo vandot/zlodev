@@ -344,31 +344,53 @@ pub fn networkdNetworkText(allocator: std.mem.Allocator, ip: []const u8, tld: []
     return std.fmt.allocPrint(allocator, "[Match]\nName=zlodev0\n[Network]\nAddress={s}/32\nDomains=~{s}\nDNS={s}\n", .{ ip, tld, ip });
 }
 
-/// `sudo nmcli connection add ...` argv for the zlodev0 dummy connection.
-/// `argv` borrows `ip`; `addr` and `search` are owned, freed by `deinit`.
-pub const NmcliAdd = struct {
+/// `sudo nmcli connection add|modify ...` argv for the zlodev0 dummy
+/// connection. `add` creates it; `modify` updates an existing one in place,
+/// so a failed reinstall leaves the old connection working. `argv()` borrows
+/// `ip`; `addr` and `search` are owned, freed by `deinit`.
+pub const NmcliCmd = struct {
     addr: []u8,
     search: []u8,
-    argv: [24][]const u8,
+    buf: [24][]const u8,
+    len: usize,
 
-    pub fn deinit(self: *const NmcliAdd, allocator: std.mem.Allocator) void {
+    pub fn argv(self: *const NmcliCmd) []const []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    pub fn deinit(self: *const NmcliCmd, allocator: std.mem.Allocator) void {
         allocator.free(self.addr);
         allocator.free(self.search);
     }
 };
 
-pub fn nmcliAddArgs(allocator: std.mem.Allocator, ip: []const u8, tld: []const u8) !NmcliAdd {
+pub fn nmcliArgs(allocator: std.mem.Allocator, op: enum { add, modify }, ip: []const u8, tld: []const u8) !NmcliCmd {
     const addr = try std.fmt.allocPrint(allocator, "{s}/32", .{ip});
     errdefer allocator.free(addr);
     const search = try std.fmt.allocPrint(allocator, "~{s}", .{tld});
-    return .{ .addr = addr, .search = search, .argv = .{
-        "sudo",           "nmcli",    "connection",             "add",
-        "type",           "dummy",    "con-name",               nm_connection,
-        "ifname",         "zlodev0",  "ipv4.method",            "manual",
-        "ipv4.addresses", addr,       "ipv4.never-default",     "yes",
-        "ipv4.dns",       ip,         "ipv4.dns-search",        search,
-        "ipv6.method",    "disabled", "connection.autoconnect", "yes",
-    } };
+    var cmd: NmcliCmd = .{ .addr = addr, .search = search, .buf = undefined, .len = 0 };
+    const head: []const []const u8 = switch (op) {
+        .add => &.{ "sudo", "nmcli", "connection", "add", "type", "dummy", "con-name", nm_connection, "ifname", "zlodev0" },
+        .modify => &.{ "sudo", "nmcli", "connection", "modify", nm_connection },
+    };
+    const settings = [_][]const u8{
+        "ipv4.method",            "manual",
+        "ipv4.addresses",         addr,
+        "ipv4.never-default",     "yes",
+        "ipv4.dns",               ip,
+        "ipv4.dns-search",        search,
+        "ipv6.method",            "disabled",
+        "connection.autoconnect", "yes",
+    };
+    for (head) |a| {
+        cmd.buf[cmd.len] = a;
+        cmd.len += 1;
+    }
+    for (settings) |a| {
+        cmd.buf[cmd.len] = a;
+        cmd.len += 1;
+    }
+    return cmd;
 }
 
 /// zlodev 0.6.0 and earlier pointed resolved at port 5354.
@@ -459,10 +481,6 @@ fn installNetworkd(allocator: std.mem.Allocator, ip: []const u8, tld: []const u8
 }
 
 fn installNetworkManager(allocator: std.mem.Allocator, ip: []const u8, tld: []const u8) !void {
-    // Reinstall: replace the connection so it gets the current settings.
-    if (nmConnectionExists()) {
-        try sys.sudoCmd(allocator, &.{ "sudo", "nmcli", "connection", "delete", nm_connection });
-    }
     // Files from an earlier networkd install would keep the old-config warning
     // and make uninstall reload networkd; networkd isn't running, so no reload.
     if (pathExists(networkd_network_path) or pathExists(networkd_netdev_path)) {
@@ -471,12 +489,15 @@ fn installNetworkManager(allocator: std.mem.Allocator, ip: []const u8, tld: []co
             sys.sudoCmd(allocator, &.{ "sudo", "ip", "link", "delete", "zlodev0" }) catch {};
         }
     }
-    const add = try nmcliAddArgs(allocator, ip, tld);
-    defer add.deinit(allocator);
-    sys.sudoCmd(allocator, &add.argv) catch |e| {
+    // Reinstall: update the existing connection in place and reapply it.
+    const exists = nmConnectionExists();
+    const cmd = try nmcliArgs(allocator, if (exists) .modify else .add, ip, tld);
+    defer cmd.deinit(allocator);
+    sys.sudoCmd(allocator, cmd.argv()) catch |e| {
         std.debug.print("could not create the zlodev NetworkManager connection\n", .{});
         return e;
     };
+    if (exists) try sys.sudoCmd(allocator, &.{ "sudo", "nmcli", "connection", "up", nm_connection });
 }
 
 pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []const u8) !void {
@@ -814,8 +835,8 @@ test "networkdNetworkText routes the tld to the link's own address on port 53" {
     );
 }
 
-test "nmcliAddArgs builds the dummy connection command" {
-    const add = try nmcliAddArgs(std.testing.allocator, "192.0.0.8", "lo");
+test "nmcliArgs add builds the dummy connection command" {
+    const add = try nmcliArgs(std.testing.allocator, .add, "192.0.0.8", "lo");
     defer add.deinit(std.testing.allocator);
     const want = [_][]const u8{
         "sudo",           "nmcli",        "connection",             "add",
@@ -825,8 +846,22 @@ test "nmcliAddArgs builds the dummy connection command" {
         "ipv4.dns",       "192.0.0.8",    "ipv4.dns-search",        "~lo",
         "ipv6.method",    "disabled",     "connection.autoconnect", "yes",
     };
-    try std.testing.expectEqual(want.len, add.argv.len);
-    for (want, add.argv) |w, got| try std.testing.expectEqualStrings(w, got);
+    try std.testing.expectEqual(want.len, add.argv().len);
+    for (want, add.argv()) |w, got| try std.testing.expectEqualStrings(w, got);
+}
+
+test "nmcliArgs modify updates the existing connection in place" {
+    const cmd = try nmcliArgs(std.testing.allocator, .modify, "192.0.0.8", "lo");
+    defer cmd.deinit(std.testing.allocator);
+    const want = [_][]const u8{
+        "sudo",                   "nmcli",              "connection",     "modify",
+        "zlodev",                 "ipv4.method",        "manual",         "ipv4.addresses",
+        "192.0.0.8/32",           "ipv4.never-default", "yes",            "ipv4.dns",
+        "192.0.0.8",              "ipv4.dns-search",    "~lo",            "ipv6.method",
+        "disabled",               "connection.autoconnect", "yes",
+    };
+    try std.testing.expectEqual(want.len, cmd.argv().len);
+    for (want, cmd.argv()) |w, got| try std.testing.expectEqualStrings(w, got);
 }
 
 test "isLegacyNetworkd detects the 0.6.0 port-5354 config" {
