@@ -376,13 +376,13 @@ pub fn isLegacyNetworkd(contents: []const u8) bool {
     return std.mem.indexOf(u8, contents, ":5354") != null;
 }
 
-/// Start-time warning for Linux DNS setup. `network_file` is the contents of
+/// Start-time warning for Linux DNS setup (no "warning:" prefix, no newline). `network_file` is the contents of
 /// /etc/systemd/network/zlodev0.network (null if absent); `link_exists` is
 /// whether /sys/class/net/zlodev0 exists (both backends create it).
 pub fn linuxDnsWarning(network_file: ?[]const u8, link_exists: bool) ?[]const u8 {
     if (network_file) |c| if (isLegacyNetworkd(c))
-        return "warning: DNS config is from an older zlodev, run 'zlodev install --dns' again\n";
-    if (!link_exists) return "warning: DNS resolver not installed, run 'zlodev install --dns' first\n";
+        return "DNS config is from an older zlodev, run 'zlodev install --dns' again";
+    if (!link_exists) return "DNS resolver not installed, run 'zlodev install --dns' first";
     return null;
 }
 
@@ -838,15 +838,15 @@ test "isLegacyNetworkd detects the 0.6.0 port-5354 config" {
 test "linuxDnsWarning: legacy config, missing link, or nothing" {
     const legacy = "DNS=192.0.0.8:5354\n";
     try std.testing.expectEqualStrings(
-        "warning: DNS config is from an older zlodev, run 'zlodev install --dns' again\n",
+        "DNS config is from an older zlodev, run 'zlodev install --dns' again",
         linuxDnsWarning(legacy, true).?,
     );
     try std.testing.expectEqualStrings(
-        "warning: DNS config is from an older zlodev, run 'zlodev install --dns' again\n",
+        "DNS config is from an older zlodev, run 'zlodev install --dns' again",
         linuxDnsWarning(legacy, false).?,
     );
     try std.testing.expectEqualStrings(
-        "warning: DNS resolver not installed, run 'zlodev install --dns' first\n",
+        "DNS resolver not installed, run 'zlodev install --dns' first",
         linuxDnsWarning(null, false).?,
     );
     try std.testing.expectEqual(@as(?[]const u8, null), linuxDnsWarning(null, true));

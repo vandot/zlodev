@@ -370,14 +370,18 @@ fn doInstallCert(allocator: std.mem.Allocator, full_domain: []const u8, force: b
     try cert.installCA(allocator, full_domain);
 }
 
-/// Linux: warn when DNS was set up by an older zlodev or not at all.
-fn warnLinuxDnsSetup() void {
-    if (builtin.os.tag != .linux) return;
+/// Linux: why .lo may not resolve (DNS set up by an older zlodev or not at
+/// all), or null. Printed at start; the TUI also shows it, since its alt screen
+/// hides stderr.
+fn linuxDnsSetupWarning() ?[]const u8 {
+    if (builtin.os.tag != .linux) return null;
     const allocator = std.heap.page_allocator;
     const contents: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(rt.io(), "/etc/systemd/network/zlodev0.network", allocator, .limited(4096)) catch null;
     defer if (contents) |c| allocator.free(c);
     const link_exists = if (std.Io.Dir.accessAbsolute(rt.io(), "/sys/class/net/zlodev0", .{})) |_| true else |_| false;
-    if (dns.linuxDnsWarning(contents, link_exists)) |msg| std.debug.print("{s}", .{msg});
+    const msg = dns.linuxDnsWarning(contents, link_exists) orelse return null;
+    std.debug.print("warning: {s}\n", .{msg});
+    return msg;
 }
 
 fn doStartDns(tld: []const u8) !void {
@@ -390,7 +394,7 @@ fn doStartDns(tld: []const u8) !void {
                 std.debug.print("warning: DNS resolver not installed, run 'zlodev install --dns' first\n", .{});
             };
         },
-        .linux => warnLinuxDnsSetup(),
+        .linux => _ = linuxDnsSetupWarning(),
         .windows => {
             std.debug.print("note: ensure DNS is installed ('zlodev install --dns') and run in an elevated terminal\n", .{});
         },
@@ -500,7 +504,7 @@ fn doStart(
     const bind_owned = try allocator.dupe(u8, bind_addr);
     defer allocator.free(bind_owned);
 
-    if (!local) warnLinuxDnsSetup();
+    const dns_warning: ?[]const u8 = if (local) null else linuxDnsSetupWarning();
 
     // Bind every listener before the TUI takes over the terminal, so a port
     // conflict is reported on the normal screen and zlodev exits instead of
@@ -585,7 +589,7 @@ fn doStart(
         }
     } else {
         // Run TUI on main thread (blocks until user quits)
-        tui.run(allocator, full_domain, target_port, routes, command != null, cert_warning, version) catch |e| {
+        tui.run(allocator, full_domain, target_port, routes, command != null, cert_warning, dns_warning, version) catch |e| {
             log.unmute();
             log.err("component=tui op=start error={any}", .{e});
         };
