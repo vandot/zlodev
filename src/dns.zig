@@ -258,7 +258,7 @@ pub fn bind(ip: []const u8, port: u16) !compat.socket_t {
         log.err("component=dns op=addr_parse error={any}", .{e});
         return e;
     };
-    return compat.udpBind(addr) catch |e| {
+    return compat.udpBindFreebind(addr) catch |e| {
         log.err("component=dns op=bind ip={s} port={d} error={any}", .{ ip, port, e });
         return e;
     };

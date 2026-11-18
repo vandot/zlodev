@@ -289,6 +289,23 @@ pub fn udpBind(ip: Ip) SocketError!socket_t {
     return sock;
 }
 
+/// IP_FREEBIND from linux/in.h.
+const ip_freebind: u32 = 15;
+
+/// Bind a UDP socket that may use an address no interface has yet (Linux
+/// IP_FREEBIND): zlodev0 can come up after `start`, and datagrams arrive once
+/// it has the address. Same as `udpBind` on other systems.
+pub fn udpBindFreebind(ip: Ip) SocketError!socket_t {
+    const sock = try openSocket(family(ip), posix.SOCK.DGRAM);
+    errdefer closeSocket(sock);
+    if (builtin.os.tag == .linux) {
+        const one: c_int = 1;
+        posix.setsockopt(sock, posix.IPPROTO.IP, ip_freebind, std.mem.asBytes(&one)) catch {};
+    }
+    try bindTo(sock, &.from(ip));
+    return sock;
+}
+
 /// Bind and listen on a TCP socket with address reuse (as zlodev always has).
 pub fn tcpListen(ip: Ip) SocketError!socket_t {
     return listenTcp(ip, true);
@@ -547,6 +564,18 @@ test "udpBind reports AddressInUse when the port is taken" {
     const first = try udpBind(addr);
     defer closeSocket(first);
     try std.testing.expectError(error.AddressInUse, udpBind(addr));
+}
+
+test "udpBindFreebind binds an address no interface has yet (Linux)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // 192.0.0.9 (RFC 7600 range) is on no interface in CI or the test VMs.
+    const addr = try Ip.parseIp4("192.0.0.9", 18098);
+    if (udpBind(addr)) |s| {
+        closeSocket(s);
+        return error.TestUnexpectedResult; // address exists here, so the test proves nothing
+    } else |_| {}
+    const sock = try udpBindFreebind(addr);
+    closeSocket(sock);
 }
 
 test "tcpListen reports AddressInUse when another process holds the port" {
