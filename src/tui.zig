@@ -11,6 +11,7 @@ const har = @import("har.zig");
 const clipboard = @import("clipboard.zig");
 const search = @import("search.zig");
 const subprocess = @import("subprocess.zig");
+const shutdown = @import("shutdown.zig");
 
 pub const Event = union(enum) {
     key_press: vaxis.Key,
@@ -373,7 +374,7 @@ const EditState = struct {
     }
 };
 
-pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, routes: []const proxy.Route, has_command: bool, cert_warning: ?[]const u8, version: []const u8) !void {
+pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, routes: []const proxy.Route, has_command: bool, cert_warning: ?[]const u8, dns_warning: ?[]const u8, version: []const u8) !void {
     const proxy_text = try std.fmt.allocPrint(alloc, "https -> 127.0.0.1:{d}", .{target_port});
     defer alloc.free(proxy_text);
     const ca_text = try std.fmt.allocPrint(alloc, "http://{s}/ca", .{domain});
@@ -451,7 +452,8 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     const detail_entry = try std.heap.page_allocator.create(requests.Entry);
     defer std.heap.page_allocator.destroy(detail_entry);
 
-    while (true) {
+    // SIGINT/SIGTERM set the shutdown flag; quit like `q` does.
+    while (shutdown.isRunning()) {
         while (try loop.tryEvent()) |event| {
             switch (event) {
                 .key_press => |key| {
@@ -816,7 +818,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
         switch (view) {
             .list => {
                 const req_focused = !logs_visible or focus == .requests;
-                const header_rows = drawHeader(win, domain, proxy_text, ca_text, cert_warning, raw_count, req_autoscroll, routes, req_focused);
+                const header_rows = drawHeader(win, domain, proxy_text, ca_text, cert_warning, dns_warning, raw_count, req_autoscroll, routes, req_focused);
                 const footer_h: u16 = 2; // footer + search/intercept bar
                 const body_h = if (win.height > header_rows + footer_h) win.height - header_rows - footer_h else 1;
 
@@ -904,7 +906,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     }
 }
 
-fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_text: []const u8, cert_warning: ?[]const u8, req_count: usize, autoscroll: bool, routes: []const proxy.Route, req_focused: bool) u16 {
+fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_text: []const u8, cert_warning: ?[]const u8, dns_warning: ?[]const u8, req_count: usize, autoscroll: bool, routes: []const proxy.Route, req_focused: bool) u16 {
     const green: vaxis.Color = .{ .rgb = .{ 0x3f, 0xb9, 0x50 } };
     const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
     const white: vaxis.Color = .{ .rgb = .{ 0xe1, 0xe4, 0xe8 } };
@@ -949,6 +951,13 @@ fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_
     if (cert_warning) |warning| {
         const yellow: vaxis.Color = .{ .rgb = .{ 0xe3, 0xb3, 0x41 } };
         printAt(win, 2, row, "CERT", .{ .fg = dim });
+        writeAscii(win, 11, row, warning, .{ .fg = yellow, .bold = true });
+        row += 1;
+    }
+    // Checked once at start: rerunning install --dns while zlodev runs fixes it.
+    if (dns_warning) |warning| {
+        const yellow: vaxis.Color = .{ .rgb = .{ 0xe3, 0xb3, 0x41 } };
+        printAt(win, 2, row, "DNS", .{ .fg = dim });
         writeAscii(win, 11, row, warning, .{ .fg = yellow, .bold = true });
         row += 1;
     }

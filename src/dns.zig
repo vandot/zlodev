@@ -258,7 +258,7 @@ pub fn bind(ip: []const u8, port: u16) !compat.socket_t {
         log.err("component=dns op=addr_parse error={any}", .{e});
         return e;
     };
-    return compat.udpBind(addr) catch |e| {
+    return compat.udpBindFreebind(addr) catch |e| {
         log.err("component=dns op=bind ip={s} port={d} error={any}", .{ ip, port, e });
         return e;
     };
@@ -318,11 +318,100 @@ pub fn systemdResolvedReady(pid1_comm: []const u8, resolved_state: []const u8) b
         std.mem.eql(u8, std.mem.trim(u8, resolved_state, ws), "active");
 }
 
+/// Address of the zlodev0 link on Linux: the link's own address, its DNS
+/// server, and what zlodev listens on (port 53: NetworkManager can't set a
+/// DNS port). RFC 7600 dummy address.
+pub const linux_dns_ip = "192.0.0.8";
+
+/// NetworkManager connection that owns zlodev0 on NetworkManager systems.
+pub const nm_connection = "zlodev";
+
+pub const LinuxBackend = enum { networkd, network_manager };
+
+/// Pick who creates zlodev0. networkd wins when both run, so systems set up
+/// by earlier versions keep their files. Inputs are raw `systemctl
+/// is-active` output ("" when the command failed).
+pub fn chooseLinuxBackend(networkd_state: []const u8, nm_state: []const u8) ?LinuxBackend {
+    const ws = "\n\r ";
+    if (std.mem.eql(u8, std.mem.trim(u8, networkd_state, ws), "active")) return .networkd;
+    if (std.mem.eql(u8, std.mem.trim(u8, nm_state, ws), "active")) return .network_manager;
+    return null;
+}
+
+/// zlodev0.network for networkd. The address makes resolved use the link's
+/// DNS settings (a link without one stays `degraded`, scope none).
+pub fn networkdNetworkText(allocator: std.mem.Allocator, ip: []const u8, tld: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "[Match]\nName=zlodev0\n[Network]\nAddress={s}/32\nDomains=~{s}\nDNS={s}\n", .{ ip, tld, ip });
+}
+
+/// `sudo nmcli connection add|modify ...` argv for the zlodev0 dummy
+/// connection. `add` creates it; `modify` updates an existing one in place,
+/// so a failed reinstall leaves the old connection working. `argv()` borrows
+/// `ip`; `addr` and `search` are owned, freed by `deinit`.
+pub const NmcliCmd = struct {
+    addr: []u8,
+    search: []u8,
+    buf: [24][]const u8,
+    len: usize,
+
+    pub fn argv(self: *const NmcliCmd) []const []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    pub fn deinit(self: *const NmcliCmd, allocator: std.mem.Allocator) void {
+        allocator.free(self.addr);
+        allocator.free(self.search);
+    }
+};
+
+pub fn nmcliArgs(allocator: std.mem.Allocator, op: enum { add, modify }, ip: []const u8, tld: []const u8) !NmcliCmd {
+    const addr = try std.fmt.allocPrint(allocator, "{s}/32", .{ip});
+    errdefer allocator.free(addr);
+    const search = try std.fmt.allocPrint(allocator, "~{s}", .{tld});
+    var cmd: NmcliCmd = .{ .addr = addr, .search = search, .buf = undefined, .len = 0 };
+    const head: []const []const u8 = switch (op) {
+        .add => &.{ "sudo", "nmcli", "connection", "add", "type", "dummy", "con-name", nm_connection, "ifname", "zlodev0" },
+        .modify => &.{ "sudo", "nmcli", "connection", "modify", nm_connection },
+    };
+    const settings = [_][]const u8{
+        "ipv4.method",            "manual",
+        "ipv4.addresses",         addr,
+        "ipv4.never-default",     "yes",
+        "ipv4.dns",               ip,
+        "ipv4.dns-search",        search,
+        "ipv6.method",            "disabled",
+        "connection.autoconnect", "yes",
+    };
+    for (head) |a| {
+        cmd.buf[cmd.len] = a;
+        cmd.len += 1;
+    }
+    for (settings) |a| {
+        cmd.buf[cmd.len] = a;
+        cmd.len += 1;
+    }
+    return cmd;
+}
+
+/// zlodev 0.6.0 and earlier pointed resolved at port 5354.
+pub fn isLegacyNetworkd(contents: []const u8) bool {
+    return std.mem.indexOf(u8, contents, ":5354") != null;
+}
+
+/// Start-time warning for Linux DNS setup (no "warning:" prefix, no newline). `network_file` is the contents of
+/// /etc/systemd/network/zlodev0.network (null if absent); `link_exists` is
+/// whether /sys/class/net/zlodev0 exists (both backends create it).
+pub fn linuxDnsWarning(network_file: ?[]const u8, link_exists: bool) ?[]const u8 {
+    if (network_file) |c| if (isLegacyNetworkd(c))
+        return "DNS config is from an older zlodev, run 'zlodev install --dns' again";
+    if (!link_exists) return "DNS resolver not installed, run 'zlodev install --dns' first";
+    return null;
+}
+
 pub fn systemProbe() struct { ip: []const u8, port: u16 } {
     switch (builtin.os.tag) {
         .linux => {
-            // RFC7600 dummy address
-            return .{ .ip = "192.0.0.8", .port = 5354 };
+            return .{ .ip = linux_dns_ip, .port = 53 };
         },
         .windows => {
             return .{ .ip = "127.0.0.1", .port = 53 };
@@ -344,6 +433,73 @@ fn reloadNetworkd(allocator: std.mem.Allocator) !void {
     };
 }
 
+const networkd_network_path = "/etc/systemd/network/zlodev0.network";
+const networkd_netdev_path = "/etc/systemd/network/zlodev0.netdev";
+
+fn pathExists(path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(rt.io(), path, .{}) catch return false;
+    return true;
+}
+
+pub fn detectLinuxBackend(allocator: std.mem.Allocator) ?LinuxBackend {
+    const nd = sys.runCmdOutput(allocator, &.{ "systemctl", "is-active", "systemd-networkd.service" });
+    defer if (nd) |s| allocator.free(s);
+    const nm = sys.runCmdOutput(allocator, &.{ "systemctl", "is-active", "NetworkManager.service" });
+    defer if (nm) |s| allocator.free(s);
+    return chooseLinuxBackend(nd orelse "", nm orelse "");
+}
+
+fn nmConnectionExists() bool {
+    return sys.runUserCmd(&.{ "nmcli", "-g", "connection.id", "connection", "show", "id", nm_connection }) == .ok;
+}
+
+fn installNetworkd(allocator: std.mem.Allocator, ip: []const u8, tld: []const u8) !void {
+    // A connection from an earlier NetworkManager install would also claim zlodev0.
+    if (nmConnectionExists()) {
+        try sys.sudoCmd(allocator, &.{ "sudo", "nmcli", "connection", "delete", nm_connection });
+    }
+    const network_text = try networkdNetworkText(allocator, ip, tld);
+    defer allocator.free(network_text);
+    const tmp_network = try sys.writeTmpFile(allocator, "dns_network", network_text);
+    defer allocator.free(tmp_network);
+    defer sys.removeTmpFile(tmp_network);
+    try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_network, networkd_network_path });
+
+    const netdev_text = "[NetDev]\nName=zlodev0\nKind=dummy\n";
+    const tmp_netdev = try sys.writeTmpFile(allocator, "dns_netdev", netdev_text);
+    defer allocator.free(tmp_netdev);
+    defer sys.removeTmpFile(tmp_netdev);
+    try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_netdev, networkd_netdev_path });
+    const link_existed = pathExists("/sys/class/net/zlodev0");
+    // networkd creates the zlodev0 dummy interface; without it .lo never resolves.
+    reloadNetworkd(allocator) catch |e| {
+        std.debug.print("could not reload systemd-networkd (needed for the zlodev0 interface); is it installed and not masked?\n", .{});
+        return e;
+    };
+    // Reinstall: reload alone leaves an existing link on the old .network (systemd < 249).
+    if (link_existed) sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "reconfigure", "zlodev0" }) catch {};
+}
+
+fn installNetworkManager(allocator: std.mem.Allocator, ip: []const u8, tld: []const u8) !void {
+    // Files from an earlier networkd install would keep the old-config warning
+    // and make uninstall reload networkd; networkd isn't running, so no reload.
+    if (pathExists(networkd_network_path) or pathExists(networkd_netdev_path)) {
+        try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", networkd_network_path, networkd_netdev_path });
+        if (pathExists("/sys/class/net/zlodev0")) {
+            sys.sudoCmd(allocator, &.{ "sudo", "ip", "link", "delete", "zlodev0" }) catch {};
+        }
+    }
+    // Reinstall: update the existing connection in place and reapply it.
+    const exists = nmConnectionExists();
+    const cmd = try nmcliArgs(allocator, if (exists) .modify else .add, ip, tld);
+    defer cmd.deinit(allocator);
+    sys.sudoCmd(allocator, cmd.argv()) catch |e| {
+        std.debug.print("could not create the zlodev NetworkManager connection\n", .{});
+        return e;
+    };
+    if (exists) try sys.sudoCmd(allocator, &.{ "sudo", "nmcli", "connection", "up", nm_connection });
+}
+
 pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []const u8) !void {
     switch (builtin.os.tag) {
         .macos => {
@@ -359,29 +515,14 @@ pub fn install(allocator: std.mem.Allocator, ip: []const u8, port: u16, tld: []c
             try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_path, dest });
         },
         .linux => {
-            const network_text = if (port == 53)
-                try std.fmt.allocPrint(allocator, "[Match]\nName=zlodev0\n[Network]\nAddress={s}/32\nDomains=~{s}\nDNS={s}\n", .{ ip, tld, ip })
-            else
-                try std.fmt.allocPrint(allocator, "[Match]\nName=zlodev0\n[Network]\nAddress={s}/32\nDomains=~{s}\nDNS={s}:{d}\n", .{ ip, tld, ip, port });
-            defer allocator.free(network_text);
-            const tmp_network = try sys.writeTmpFile(allocator, "dns_network", network_text);
-            defer allocator.free(tmp_network);
-            defer sys.removeTmpFile(tmp_network);
-            try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_network, "/etc/systemd/network/zlodev0.network" });
-
-            const netdev_text = "[NetDev]\nName=zlodev0\nKind=dummy\n";
-            const tmp_netdev = try sys.writeTmpFile(allocator, "dns_netdev", netdev_text);
-            defer allocator.free(tmp_netdev);
-            defer sys.removeTmpFile(tmp_netdev);
-            try sys.sudoCmd(allocator, &.{ "sudo", "install", "-m", "644", tmp_netdev, "/etc/systemd/network/zlodev0.netdev" });
-            const link_existed = if (std.Io.Dir.accessAbsolute(rt.io(), "/sys/class/net/zlodev0", .{})) |_| true else |_| false;
-            // networkd creates the zlodev0 dummy interface; without it .lo never resolves.
-            reloadNetworkd(allocator) catch |e| {
-                std.debug.print("could not reload systemd-networkd (needed for the zlodev0 interface); is it installed and not masked?\n", .{});
-                return e;
+            const backend = detectLinuxBackend(allocator) orelse {
+                std.debug.print("linux DNS setup needs systemd-networkd or NetworkManager to be running\n", .{});
+                std.process.exit(1);
             };
-            // Reinstall: reload alone leaves an existing link on the old .network (systemd < 249).
-            if (link_existed) sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "reconfigure", "zlodev0" }) catch {};
+            switch (backend) {
+                .networkd => try installNetworkd(allocator, ip, tld),
+                .network_manager => try installNetworkManager(allocator, ip, tld),
+            }
             sys.sudoCmd(allocator, &.{ "sudo", "resolvectl", "flush-caches" }) catch {};
         },
         .windows => {
@@ -401,13 +542,23 @@ pub fn uninstall(allocator: std.mem.Allocator, tld: []const u8) !void {
             try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", path });
         },
         .linux => {
-            try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.network" });
-            try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", "/etc/systemd/network/zlodev0.netdev" });
-            // Only delete interface if it exists
-            if (std.Io.Dir.accessAbsolute(rt.io(), "/sys/class/net/zlodev0", .{})) |_| {
-                sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
-            } else |_| {}
-            reloadNetworkd(allocator) catch {};
+            if (nmConnectionExists()) {
+                sys.sudoCmd(allocator, &.{ "sudo", "nmcli", "connection", "delete", nm_connection }) catch {};
+            }
+            if (pathExists(networkd_network_path) or pathExists(networkd_netdev_path)) {
+                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", networkd_network_path });
+                try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", networkd_netdev_path });
+                // Reload only a running networkd: reloadNetworkd falls back to a
+                // restart, which would start it on a NetworkManager system.
+                if (detectLinuxBackend(allocator) == .networkd) {
+                    if (pathExists("/sys/class/net/zlodev0")) {
+                        sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
+                    }
+                    reloadNetworkd(allocator) catch {};
+                } else if (pathExists("/sys/class/net/zlodev0")) {
+                    sys.sudoCmd(allocator, &.{ "sudo", "ip", "link", "delete", "zlodev0" }) catch {};
+                }
+            }
             sys.sudoCmd(allocator, &.{ "sudo", "resolvectl", "flush-caches" }) catch {};
         },
         .windows => {
@@ -418,7 +569,6 @@ pub fn uninstall(allocator: std.mem.Allocator, tld: []const u8) !void {
         else => {},
     }
 }
-
 
 // --- Unit Tests ---
 
@@ -665,4 +815,82 @@ test "systemdResolvedReady rejects inactive resolved" {
 
 test "systemdResolvedReady rejects a non-systemd init" {
     try std.testing.expect(!systemdResolvedReady("init", "active"));
+}
+
+test "chooseLinuxBackend prefers networkd, falls back to NetworkManager" {
+    try std.testing.expectEqual(LinuxBackend.networkd, chooseLinuxBackend("active\n", "inactive\n").?);
+    try std.testing.expectEqual(LinuxBackend.networkd, chooseLinuxBackend("active\n", "active\n").?);
+    try std.testing.expectEqual(LinuxBackend.network_manager, chooseLinuxBackend("inactive\n", " active\r\n").?);
+    try std.testing.expectEqual(LinuxBackend.network_manager, chooseLinuxBackend("", "active").?);
+    try std.testing.expectEqual(@as(?LinuxBackend, null), chooseLinuxBackend("inactive", "failed"));
+    try std.testing.expectEqual(@as(?LinuxBackend, null), chooseLinuxBackend("", ""));
+}
+
+test "networkdNetworkText routes the tld to the link's own address on port 53" {
+    const text = try networkdNetworkText(std.testing.allocator, "192.0.0.8", "lo");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(
+        "[Match]\nName=zlodev0\n[Network]\nAddress=192.0.0.8/32\nDomains=~lo\nDNS=192.0.0.8\n",
+        text,
+    );
+}
+
+test "nmcliArgs add builds the dummy connection command" {
+    const add = try nmcliArgs(std.testing.allocator, .add, "192.0.0.8", "lo");
+    defer add.deinit(std.testing.allocator);
+    const want = [_][]const u8{
+        "sudo",           "nmcli",        "connection",             "add",
+        "type",           "dummy",        "con-name",               "zlodev",
+        "ifname",         "zlodev0",      "ipv4.method",            "manual",
+        "ipv4.addresses", "192.0.0.8/32", "ipv4.never-default",     "yes",
+        "ipv4.dns",       "192.0.0.8",    "ipv4.dns-search",        "~lo",
+        "ipv6.method",    "disabled",     "connection.autoconnect", "yes",
+    };
+    try std.testing.expectEqual(want.len, add.argv().len);
+    for (want, add.argv()) |w, got| try std.testing.expectEqualStrings(w, got);
+}
+
+test "nmcliArgs modify updates the existing connection in place" {
+    const cmd = try nmcliArgs(std.testing.allocator, .modify, "192.0.0.8", "lo");
+    defer cmd.deinit(std.testing.allocator);
+    const want = [_][]const u8{
+        "sudo",                   "nmcli",              "connection",     "modify",
+        "zlodev",                 "ipv4.method",        "manual",         "ipv4.addresses",
+        "192.0.0.8/32",           "ipv4.never-default", "yes",            "ipv4.dns",
+        "192.0.0.8",              "ipv4.dns-search",    "~lo",            "ipv6.method",
+        "disabled",               "connection.autoconnect", "yes",
+    };
+    try std.testing.expectEqual(want.len, cmd.argv().len);
+    for (want, cmd.argv()) |w, got| try std.testing.expectEqualStrings(w, got);
+}
+
+test "isLegacyNetworkd detects the 0.6.0 port-5354 config" {
+    try std.testing.expect(isLegacyNetworkd("[Match]\nName=zlodev0\n[Network]\nAddress=192.0.0.8/32\nDomains=~lo\nDNS=192.0.0.8:5354\n"));
+    try std.testing.expect(!isLegacyNetworkd("[Match]\nName=zlodev0\n[Network]\nAddress=192.0.0.8/32\nDomains=~lo\nDNS=192.0.0.8\n"));
+    try std.testing.expect(!isLegacyNetworkd(""));
+}
+
+test "linuxDnsWarning: legacy config, missing link, or nothing" {
+    const legacy = "DNS=192.0.0.8:5354\n";
+    try std.testing.expectEqualStrings(
+        "DNS config is from an older zlodev, run 'zlodev install --dns' again",
+        linuxDnsWarning(legacy, true).?,
+    );
+    try std.testing.expectEqualStrings(
+        "DNS config is from an older zlodev, run 'zlodev install --dns' again",
+        linuxDnsWarning(legacy, false).?,
+    );
+    try std.testing.expectEqualStrings(
+        "DNS resolver not installed, run 'zlodev install --dns' first",
+        linuxDnsWarning(null, false).?,
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), linuxDnsWarning(null, true));
+    try std.testing.expectEqual(@as(?[]const u8, null), linuxDnsWarning("DNS=192.0.0.8\n", true));
+}
+
+test "systemProbe on Linux is the zlodev0 address on port 53" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const p = systemProbe();
+    try std.testing.expectEqualStrings("192.0.0.8", p.ip);
+    try std.testing.expectEqual(@as(u16, 53), p.port);
 }

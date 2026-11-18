@@ -280,6 +280,12 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool, tld: []const u8, force: bool) !void {
+    // Refuse before touching anything, so -f doesn't remove a working install first.
+    if (builtin.os.tag == .linux) {
+        try requireSystemdResolved(allocator);
+        if (!local) requireLinuxBackend(allocator);
+    }
+
     // Check if certificates already exist
     if (cert.caExists(full_domain)) {
         if (!force) {
@@ -307,8 +313,6 @@ fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool,
             }
         },
         .linux => {
-            try requireSystemdResolved(allocator);
-
             // Check avahi for mDNS config
             const avahi_result = try runCmdOutput(allocator, &.{ "systemctl", "is-active", "avahi-daemon.service" });
             defer allocator.free(avahi_result);
@@ -339,9 +343,21 @@ fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool,
 }
 
 fn doInstallDns(allocator: std.mem.Allocator, tld: []const u8) !void {
-    if (builtin.os.tag == .linux) try requireSystemdResolved(allocator);
+    if (builtin.os.tag == .linux) {
+        try requireSystemdResolved(allocator);
+        requireLinuxBackend(allocator);
+    }
     const probe = dns.systemProbe();
     try dns.install(allocator, probe.ip, probe.port, tld);
+}
+
+/// Linux DNS setup needs networkd or NetworkManager to create zlodev0; refuse
+/// before anything is installed (the CA would otherwise be left trusted).
+fn requireLinuxBackend(allocator: std.mem.Allocator) void {
+    if (dns.detectLinuxBackend(allocator) == null) {
+        std.debug.print("linux DNS setup needs systemd-networkd or NetworkManager to be running\n", .{});
+        std.process.exit(1);
+    }
 }
 
 /// Linux DNS setup goes through systemd-resolved; refuse early otherwise
@@ -370,6 +386,20 @@ fn doInstallCert(allocator: std.mem.Allocator, full_domain: []const u8, force: b
     try cert.installCA(allocator, full_domain);
 }
 
+/// Linux: why .lo may not resolve (DNS set up by an older zlodev or not at
+/// all), or null. Printed at start; the TUI also shows it, since its alt screen
+/// hides stderr.
+fn linuxDnsSetupWarning() ?[]const u8 {
+    if (builtin.os.tag != .linux) return null;
+    const allocator = std.heap.page_allocator;
+    const contents: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(rt.io(), "/etc/systemd/network/zlodev0.network", allocator, .limited(4096)) catch null;
+    defer if (contents) |c| allocator.free(c);
+    const link_exists = if (std.Io.Dir.accessAbsolute(rt.io(), "/sys/class/net/zlodev0", .{})) |_| true else |_| false;
+    const msg = dns.linuxDnsWarning(contents, link_exists) orelse return null;
+    std.debug.print("warning: {s}\n", .{msg});
+    return msg;
+}
+
 fn doStartDns(tld: []const u8) !void {
     // Warn if DNS resolver is not installed
     switch (builtin.os.tag) {
@@ -380,11 +410,7 @@ fn doStartDns(tld: []const u8) !void {
                 std.debug.print("warning: DNS resolver not installed, run 'zlodev install --dns' first\n", .{});
             };
         },
-        .linux => {
-            std.Io.Dir.accessAbsolute(rt.io(), "/etc/systemd/network/zlodev0.network", .{}) catch {
-                std.debug.print("warning: DNS resolver not installed, run 'zlodev install --dns' first\n", .{});
-            };
-        },
+        .linux => _ = linuxDnsSetupWarning(),
         .windows => {
             std.debug.print("note: ensure DNS is installed ('zlodev install --dns') and run in an elevated terminal\n", .{});
         },
@@ -404,6 +430,13 @@ fn exitBindError(service: []const u8, ip: []const u8, port: u16, e: anyerror) no
             "cannot start: {s} port {s}:{d} is already in use by another process\n",
             .{ service, ip, port },
         ),
+        error.AddressNotAvailable => {
+            const hint: []const u8 = if (builtin.os.tag == .linux and std.mem.eql(u8, service, "DNS"))
+                "the zlodev0 interface is missing, run 'zlodev install --dns'"
+            else
+                "no network interface has this address";
+            std.debug.print("cannot start: {s} address {s}:{d} is not available ({s})\n", .{ service, ip, port, hint });
+        },
         error.AccessDenied, error.PermissionDenied => {
             const hint: []const u8 = switch (builtin.os.tag) {
                 .windows => "run in an elevated terminal",
@@ -494,6 +527,8 @@ fn doStart(
     const bind_owned = try allocator.dupe(u8, bind_addr);
     defer allocator.free(bind_owned);
 
+    const dns_warning: ?[]const u8 = if (local) null else linuxDnsSetupWarning();
+
     // Bind every listener before the TUI takes over the terminal, so a port
     // conflict is reported on the normal screen and zlodev exits instead of
     // running half-started.
@@ -577,7 +612,7 @@ fn doStart(
         }
     } else {
         // Run TUI on main thread (blocks until user quits)
-        tui.run(allocator, full_domain, target_port, routes, command != null, cert_warning, version) catch |e| {
+        tui.run(allocator, full_domain, target_port, routes, command != null, cert_warning, dns_warning, version) catch |e| {
             log.unmute();
             log.err("component=tui op=start error={any}", .{e});
         };

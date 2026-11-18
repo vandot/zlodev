@@ -142,6 +142,7 @@ pub const SocketStream = struct {
 
 pub const SocketError = error{
     AddressInUse,
+    AddressNotAvailable,
     AccessDenied,
     ConnectionRefused,
     ConnectionResetByPeer,
@@ -205,6 +206,7 @@ fn lastError() SocketError {
     if (builtin.os.tag == .windows) {
         return switch (win32.WSAGetLastError()) {
             10048 => error.AddressInUse, // WSAEADDRINUSE
+            10049 => error.AddressNotAvailable, // WSAEADDRNOTAVAIL
             10013 => error.AccessDenied, // WSAEACCES
             10061 => error.ConnectionRefused, // WSAECONNREFUSED
             10054 => error.ConnectionResetByPeer, // WSAECONNRESET
@@ -219,6 +221,7 @@ fn lastError() SocketError {
 fn posixError(e: posix.E) SocketError {
     return switch (e) {
         .ADDRINUSE => error.AddressInUse,
+        .ADDRNOTAVAIL => error.AddressNotAvailable,
         .ACCES, .PERM => error.AccessDenied,
         .CONNREFUSED => error.ConnectionRefused,
         .CONNRESET => error.ConnectionResetByPeer,
@@ -285,6 +288,23 @@ fn bindTo(sock: socket_t, sa: *const SockAddr) SocketError!void {
 pub fn udpBind(ip: Ip) SocketError!socket_t {
     const sock = try openSocket(family(ip), posix.SOCK.DGRAM);
     errdefer closeSocket(sock);
+    try bindTo(sock, &.from(ip));
+    return sock;
+}
+
+/// IP_FREEBIND from linux/in.h.
+const ip_freebind: u32 = 15;
+
+/// Bind a UDP socket that may use an address no interface has yet (Linux
+/// IP_FREEBIND): zlodev0 can come up after `start`, and datagrams arrive once
+/// it has the address. Same as `udpBind` on other systems.
+pub fn udpBindFreebind(ip: Ip) SocketError!socket_t {
+    const sock = try openSocket(family(ip), posix.SOCK.DGRAM);
+    errdefer closeSocket(sock);
+    if (builtin.os.tag == .linux) {
+        const one: c_int = 1;
+        posix.setsockopt(sock, posix.IPPROTO.IP, ip_freebind, std.mem.asBytes(&one)) catch {};
+    }
     try bindTo(sock, &.from(ip));
     return sock;
 }
@@ -547,6 +567,25 @@ test "udpBind reports AddressInUse when the port is taken" {
     const first = try udpBind(addr);
     defer closeSocket(first);
     try std.testing.expectError(error.AddressInUse, udpBind(addr));
+}
+
+test "udpBind reports AddressNotAvailable for an address no interface has" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // 192.0.0.9 (RFC 7600 range) is on no interface in CI or the test VMs.
+    const addr = try Ip.parseIp4("192.0.0.9", 18099);
+    try std.testing.expectError(error.AddressNotAvailable, udpBind(addr));
+}
+
+test "udpBindFreebind binds an address no interface has yet (Linux)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // 192.0.0.9 (RFC 7600 range) is on no interface in CI or the test VMs.
+    const addr = try Ip.parseIp4("192.0.0.9", 18098);
+    if (udpBind(addr)) |s| {
+        closeSocket(s);
+        return error.TestUnexpectedResult; // address exists here, so the test proves nothing
+    } else |_| {}
+    const sock = try udpBindFreebind(addr);
+    closeSocket(sock);
 }
 
 test "tcpListen reports AddressInUse when another process holds the port" {
