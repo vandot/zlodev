@@ -56,7 +56,7 @@ zig build -Doptimize=ReleaseSafe
 
 The binary is at `zig-out/bin/zlodev`.
 
-On Linux, grant the binary permission to bind to privileged ports (80, 443) without root:
+On Linux, grant the binary permission to bind to privileged ports (53, 80, 443) without root:
 
 ```sh
 sudo setcap cap_net_bind_service=+eip zig-out/bin/zlodev
@@ -378,7 +378,7 @@ intercept=resp:POST /api
 
 ## How it works
 
-1. **DNS** — A lightweight DNS server resolves `*.lo` queries to `127.0.0.1`. On macOS it registers via `/etc/resolver/`, on Linux via `systemd-resolved` (with a `systemd-networkd` dummy interface, so Linux needs systemd, systemd-resolved and systemd-networkd), on Windows via NRPT rules.
+1. **DNS** — A lightweight DNS server resolves `*.lo` queries to `127.0.0.1`. On macOS it registers via `/etc/resolver/`, on Linux via `systemd-resolved`, on Windows via NRPT rules. On Linux zlodev adds a dummy interface `zlodev0` (`192.0.0.8`) that sends `*.lo` lookups to its DNS server on `192.0.0.8:53`; other lookups are untouched. The interface is created by `systemd-networkd` when it is running, otherwise by NetworkManager (a connection named `zlodev`), so Linux needs systemd and systemd-resolved plus one of the two.
 
 2. **Certificates** — On `install`, zlodev generates a local CA and domain certificate, then adds the CA to your system trust store. The CA is unique to your machine. On Linux, browsers don't read the system bundle, so `install` also adds the CA to the NSS databases of Chromium-based browsers (Chrome, Chromium, Brave, Edge, Vivaldi, Opera, including snap installs) and Firefox (every profile in `~/.mozilla/firefox`, `~/.config/mozilla/firefox` and the snap install). This needs `certutil`: `libnss3-tools` on Debian/Ubuntu, `nss-tools` on Fedora, `nss` on Arch. Without it, `install` still succeeds and prints a warning. Restart Firefox if it was running. `install` and `install -l` keep separate trust entries, so either can be uninstalled without affecting the other. Private keys are written readable only by you (`0600`, in a `0700` directory). On every `start`, zlodev re-signs the domain certificate with the local CA when it has fewer than 30 days left. This needs no sudo, since the CA in your trust store doesn't change. CAs created by `install` are limited to your zlodev domain (`dev.lo`, or `<host>.local` with `-l`) by an X.509 name constraint, so the CA can't vouch for any other site. Installs from older versions can get the constraint with `zlodev install -f`.
 
@@ -402,7 +402,7 @@ sudo ss -tlnp | grep :443
 netstat -an | findstr ":443"
 ```
 
-### Permission denied on ports 80/443 (Linux)
+### Permission denied on ports 53/80/443 (Linux)
 
 On Linux, binding to ports below 1024 requires elevated privileges. Instead of running as root, zlodev uses Linux file capabilities. The install script sets this automatically, but if you built from source:
 
@@ -438,7 +438,9 @@ If missing, reinstall DNS:
 zlodev install --dns
 ```
 
-On Linux, `install` stops with an error unless systemd is PID 1 and `systemd-resolved` is active, and fails if `systemd-networkd` can't be reloaded (for example when it is masked). zlodev reloads networkd with `networkctl reload` rather than restarting it, so your other network interfaces are left alone. If the reload failed, run `zlodev uninstall --dns` to remove the half-written `zlodev0` interface files before trying again.
+On Linux, `install` stops with an error unless systemd is PID 1, `systemd-resolved` is active and either `systemd-networkd` or NetworkManager is running. With networkd, it fails if `systemd-networkd` can't be reloaded (for example when it is masked). zlodev reloads networkd with `networkctl reload` rather than restarting it, so your other network interfaces are left alone. If the reload failed, run `zlodev uninstall --dns` to remove the half-written `zlodev0` interface files before trying again.
+
+Upgrading from 0.6.0 or earlier on Linux: zlodev's DNS moved from port 5354 to 53, so run `zlodev install --dns` once. Until you do, `start` prints a warning and `.lo` names don't resolve.
 
 On Windows, make sure "Use secure DNS" is disabled in your browser — Chromium browsers bypass the system DNS resolver when this is enabled.
 
