@@ -24,6 +24,12 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
+fn fileContains(path: []const u8, needle: []const u8) bool {
+    const data = std.Io.Dir.cwd().readFileAlloc(testing.io, path, testing.allocator, .limited(64 * 1024)) catch return false;
+    defer testing.allocator.free(data);
+    return std.mem.indexOf(u8, data, needle) != null;
+}
+
 fn getEnvOwned(name: []const u8) ?[]const u8 {
     return testing.environ.getAlloc(testing.allocator, name) catch return null;
 }
@@ -159,6 +165,7 @@ test "install and verify" {
         .linux => {
             try testing.expect(fileExists("/etc/systemd/network/zlodev0.network"));
             try testing.expect(fileExists("/etc/systemd/network/zlodev0.netdev"));
+            try testing.expect(fileContains("/etc/systemd/network/zlodev0.network", "DNS=192.0.0.8\n"));
             try testing.expect(anchorExists("dev.lo"));
             try testing.expect(nssHas(".pki/nssdb", "dev.lo"));
             try testing.expect(nssHas(fake_firefox_profile, "dev.lo"));
