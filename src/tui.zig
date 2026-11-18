@@ -11,6 +11,7 @@ const har = @import("har.zig");
 const clipboard = @import("clipboard.zig");
 const search = @import("search.zig");
 const subprocess = @import("subprocess.zig");
+const shutdown = @import("shutdown.zig");
 
 pub const Event = union(enum) {
     key_press: vaxis.Key,
@@ -451,7 +452,8 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     const detail_entry = try std.heap.page_allocator.create(requests.Entry);
     defer std.heap.page_allocator.destroy(detail_entry);
 
-    while (true) {
+    // SIGINT/SIGTERM set the shutdown flag; quit like `q` does.
+    while (shutdown.isRunning()) {
         while (try loop.tryEvent()) |event| {
             switch (event) {
                 .key_press => |key| {
