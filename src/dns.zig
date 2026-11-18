@@ -441,7 +441,7 @@ fn pathExists(path: []const u8) bool {
     return true;
 }
 
-fn detectLinuxBackend(allocator: std.mem.Allocator) ?LinuxBackend {
+pub fn detectLinuxBackend(allocator: std.mem.Allocator) ?LinuxBackend {
     const nd = sys.runCmdOutput(allocator, &.{ "systemctl", "is-active", "systemd-networkd.service" });
     defer if (nd) |s| allocator.free(s);
     const nm = sys.runCmdOutput(allocator, &.{ "systemctl", "is-active", "NetworkManager.service" });

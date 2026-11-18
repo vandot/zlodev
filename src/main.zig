@@ -280,6 +280,12 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool, tld: []const u8, force: bool) !void {
+    // Refuse before touching anything, so -f doesn't remove a working install first.
+    if (builtin.os.tag == .linux) {
+        try requireSystemdResolved(allocator);
+        if (!local) requireLinuxBackend(allocator);
+    }
+
     // Check if certificates already exist
     if (cert.caExists(full_domain)) {
         if (!force) {
@@ -307,8 +313,6 @@ fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool,
             }
         },
         .linux => {
-            try requireSystemdResolved(allocator);
-
             // Check avahi for mDNS config
             const avahi_result = try runCmdOutput(allocator, &.{ "systemctl", "is-active", "avahi-daemon.service" });
             defer allocator.free(avahi_result);
@@ -339,9 +343,21 @@ fn doInstall(allocator: std.mem.Allocator, full_domain: []const u8, local: bool,
 }
 
 fn doInstallDns(allocator: std.mem.Allocator, tld: []const u8) !void {
-    if (builtin.os.tag == .linux) try requireSystemdResolved(allocator);
+    if (builtin.os.tag == .linux) {
+        try requireSystemdResolved(allocator);
+        requireLinuxBackend(allocator);
+    }
     const probe = dns.systemProbe();
     try dns.install(allocator, probe.ip, probe.port, tld);
+}
+
+/// Linux DNS setup needs networkd or NetworkManager to create zlodev0; refuse
+/// before anything is installed (the CA would otherwise be left trusted).
+fn requireLinuxBackend(allocator: std.mem.Allocator) void {
+    if (dns.detectLinuxBackend(allocator) == null) {
+        std.debug.print("linux DNS setup needs systemd-networkd or NetworkManager to be running\n", .{});
+        std.process.exit(1);
+    }
 }
 
 /// Linux DNS setup goes through systemd-resolved; refuse early otherwise
