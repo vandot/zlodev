@@ -428,7 +428,7 @@ fn detectLinuxBackend(allocator: std.mem.Allocator) ?LinuxBackend {
 }
 
 fn nmConnectionExists() bool {
-    return sys.runUserCmd(&.{ "nmcli", "-g", "NAME", "connection", "show", nm_connection }) == .ok;
+    return sys.runUserCmd(&.{ "nmcli", "-g", "connection.id", "connection", "show", "id", nm_connection }) == .ok;
 }
 
 fn installNetworkd(allocator: std.mem.Allocator, ip: []const u8, tld: []const u8) !void {
