@@ -432,6 +432,10 @@ fn nmConnectionExists() bool {
 }
 
 fn installNetworkd(allocator: std.mem.Allocator, ip: []const u8, tld: []const u8) !void {
+    // A connection from an earlier NetworkManager install would also claim zlodev0.
+    if (nmConnectionExists()) {
+        try sys.sudoCmd(allocator, &.{ "sudo", "nmcli", "connection", "delete", nm_connection });
+    }
     const network_text = try networkdNetworkText(allocator, ip, tld);
     defer allocator.free(network_text);
     const tmp_network = try sys.writeTmpFile(allocator, "dns_network", network_text);
@@ -458,6 +462,14 @@ fn installNetworkManager(allocator: std.mem.Allocator, ip: []const u8, tld: []co
     // Reinstall: replace the connection so it gets the current settings.
     if (nmConnectionExists()) {
         try sys.sudoCmd(allocator, &.{ "sudo", "nmcli", "connection", "delete", nm_connection });
+    }
+    // Files from an earlier networkd install would keep the old-config warning
+    // and make uninstall reload networkd; networkd isn't running, so no reload.
+    if (pathExists(networkd_network_path) or pathExists(networkd_netdev_path)) {
+        try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", networkd_network_path, networkd_netdev_path });
+        if (pathExists("/sys/class/net/zlodev0")) {
+            sys.sudoCmd(allocator, &.{ "sudo", "ip", "link", "delete", "zlodev0" }) catch {};
+        }
     }
     const add = try nmcliAddArgs(allocator, ip, tld);
     defer add.deinit(allocator);
@@ -512,16 +524,19 @@ pub fn uninstall(allocator: std.mem.Allocator, tld: []const u8) !void {
             if (nmConnectionExists()) {
                 sys.sudoCmd(allocator, &.{ "sudo", "nmcli", "connection", "delete", nm_connection }) catch {};
             }
-            // Touch networkd only if zlodev configured it: reloadNetworkd falls
-            // back to a restart, which would start networkd on a
-            // NetworkManager-only system.
             if (pathExists(networkd_network_path) or pathExists(networkd_netdev_path)) {
                 try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", networkd_network_path });
                 try sys.sudoCmd(allocator, &.{ "sudo", "rm", "-f", networkd_netdev_path });
-                if (pathExists("/sys/class/net/zlodev0")) {
-                    sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
+                // Reload only a running networkd: reloadNetworkd falls back to a
+                // restart, which would start it on a NetworkManager system.
+                if (detectLinuxBackend(allocator) == .networkd) {
+                    if (pathExists("/sys/class/net/zlodev0")) {
+                        sys.sudoCmd(allocator, &.{ "sudo", "networkctl", "delete", "zlodev0" }) catch {};
+                    }
+                    reloadNetworkd(allocator) catch {};
+                } else if (pathExists("/sys/class/net/zlodev0")) {
+                    sys.sudoCmd(allocator, &.{ "sudo", "ip", "link", "delete", "zlodev0" }) catch {};
                 }
-                reloadNetworkd(allocator) catch {};
             }
             sys.sudoCmd(allocator, &.{ "sudo", "resolvectl", "flush-caches" }) catch {};
         },
