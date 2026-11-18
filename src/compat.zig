@@ -142,6 +142,7 @@ pub const SocketStream = struct {
 
 pub const SocketError = error{
     AddressInUse,
+    AddressNotAvailable,
     AccessDenied,
     ConnectionRefused,
     ConnectionResetByPeer,
@@ -205,6 +206,7 @@ fn lastError() SocketError {
     if (builtin.os.tag == .windows) {
         return switch (win32.WSAGetLastError()) {
             10048 => error.AddressInUse, // WSAEADDRINUSE
+            10049 => error.AddressNotAvailable, // WSAEADDRNOTAVAIL
             10013 => error.AccessDenied, // WSAEACCES
             10061 => error.ConnectionRefused, // WSAECONNREFUSED
             10054 => error.ConnectionResetByPeer, // WSAECONNRESET
@@ -219,6 +221,7 @@ fn lastError() SocketError {
 fn posixError(e: posix.E) SocketError {
     return switch (e) {
         .ADDRINUSE => error.AddressInUse,
+        .ADDRNOTAVAIL => error.AddressNotAvailable,
         .ACCES, .PERM => error.AccessDenied,
         .CONNREFUSED => error.ConnectionRefused,
         .CONNRESET => error.ConnectionResetByPeer,
@@ -564,6 +567,13 @@ test "udpBind reports AddressInUse when the port is taken" {
     const first = try udpBind(addr);
     defer closeSocket(first);
     try std.testing.expectError(error.AddressInUse, udpBind(addr));
+}
+
+test "udpBind reports AddressNotAvailable for an address no interface has" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // 192.0.0.9 (RFC 7600 range) is on no interface in CI or the test VMs.
+    const addr = try Ip.parseIp4("192.0.0.9", 18099);
+    try std.testing.expectError(error.AddressNotAvailable, udpBind(addr));
 }
 
 test "udpBindFreebind binds an address no interface has yet (Linux)" {

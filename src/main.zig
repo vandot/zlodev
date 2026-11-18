@@ -414,6 +414,13 @@ fn exitBindError(service: []const u8, ip: []const u8, port: u16, e: anyerror) no
             "cannot start: {s} port {s}:{d} is already in use by another process\n",
             .{ service, ip, port },
         ),
+        error.AddressNotAvailable => {
+            const hint: []const u8 = if (builtin.os.tag == .linux and std.mem.eql(u8, service, "DNS"))
+                "the zlodev0 interface is missing, run 'zlodev install --dns'"
+            else
+                "no network interface has this address";
+            std.debug.print("cannot start: {s} address {s}:{d} is not available ({s})\n", .{ service, ip, port, hint });
+        },
         error.AccessDenied, error.PermissionDenied => {
             const hint: []const u8 = switch (builtin.os.tag) {
                 .windows => "run in an elevated terminal",
