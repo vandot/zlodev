@@ -650,9 +650,9 @@ test "parseQuestion rejects compression pointers" {
 }
 
 test "bind reports AddressInUse when the port is taken" {
-    const first = try bind("127.0.0.1", 53535);
+    const first = try bind("127.0.0.1", 18095);
     defer compat.closeSocket(first);
-    try std.testing.expectError(error.AddressInUse, bind("127.0.0.1", 53535));
+    try std.testing.expectError(error.AddressInUse, bind("127.0.0.1", 18095));
 }
 
 test "systemdResolvedReady accepts systemd with active resolved" {

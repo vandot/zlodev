@@ -523,7 +523,7 @@ pub fn getenv(comptime name: [:0]const u8) ?[]const u8 {
 const Ip = std.Io.net.IpAddress;
 
 test "udpBind, sendTo, poll and recvFrom round-trip a datagram" {
-    const addr = try Ip.parseIp4("127.0.0.1", 53536);
+    const addr = try Ip.parseIp4("127.0.0.1", 18096);
     const sock = try udpBind(addr);
     defer closeSocket(sock);
 
@@ -539,11 +539,11 @@ test "udpBind, sendTo, poll and recvFrom round-trip a datagram" {
     const msg = try recvFrom(sock, &buf);
     try std.testing.expectEqualStrings("ping", msg.data);
     try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, msg.from.ip4.bytes);
-    try std.testing.expectEqual(@as(u16, 53536), msg.from.ip4.port);
+    try std.testing.expectEqual(@as(u16, 18096), msg.from.ip4.port);
 }
 
 test "udpBind reports AddressInUse when the port is taken" {
-    const addr = try Ip.parseIp4("127.0.0.1", 53537);
+    const addr = try Ip.parseIp4("127.0.0.1", 18097);
     const first = try udpBind(addr);
     defer closeSocket(first);
     try std.testing.expectError(error.AddressInUse, udpBind(addr));

@@ -20,6 +20,14 @@ pub fn entryMatchesSearch(entry: *const requests.Summary, term: []const u8) bool
     return false;
 }
 
+/// The logical index under the list cursor, or null when the cursor is past the
+/// filtered list. Key handlers run before the frame clamps the cursor, so `G`
+/// (or `j` at the end) can leave it out of range for keys in the same batch.
+pub fn selectedIndex(filter_map: []const usize, filtered_count: usize, cursor: usize) ?usize {
+    if (cursor >= filtered_count or cursor >= filter_map.len) return null;
+    return filter_map[cursor];
+}
+
 // --- Unit Tests ---
 
 const testing = std.testing;
@@ -89,4 +97,17 @@ test "HOLD does not match normal entries" {
 test "DROP does not match normal entries" {
     var e = makeTestEntry("GET", "/api", 200, .normal);
     try testing.expect(!entryMatchesSearch(&e, "DROP"));
+}
+
+test "selectedIndex maps the cursor through the filter map" {
+    const map = [_]usize{ 4, 7, 9 };
+    try testing.expectEqual(@as(?usize, 7), selectedIndex(&map, 3, 1));
+    try testing.expectEqual(@as(?usize, 9), selectedIndex(&map, 3, 2));
+}
+
+test "selectedIndex is null past the list, so a stale or end-of-list cursor selects nothing" {
+    const map = [_]usize{ 4, 7, 9, 123 };
+    try testing.expectEqual(@as(?usize, null), selectedIndex(&map, 3, 3));
+    try testing.expectEqual(@as(?usize, null), selectedIndex(&map, 3, std.math.maxInt(usize)));
+    try testing.expectEqual(@as(?usize, null), selectedIndex(&map, 0, 0));
 }
