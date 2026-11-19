@@ -16,3 +16,4 @@ zig-pkg/
 .zlodev
 
 build/
+.claude/settings.local.json
