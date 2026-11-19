@@ -305,7 +305,22 @@
       color: var(--text);
     }
     .install-snippet .prompt { color: var(--accent); user-select: none; margin-right: 8px; }
-    .install-note { margin: 12px 0 0; font-size: 0.85rem; color: var(--dim); }
+    .install-note { margin: 12px 0 0; font-size: 0.85rem; color: var(--text-muted); }
+    .install-tabs { display: flex; gap: 4px; margin-bottom: 8px; justify-content: center; flex-wrap: wrap; }
+    .install-tab {
+      background: none;
+      border: 1px solid transparent;
+      color: var(--text-muted);
+      padding: 4px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      font-family: var(--font-mono);
+    }
+    .install-tab:hover { color: var(--text); }
+    .install-tab.active { color: var(--text); border-color: var(--border); background: var(--surface); }
+    .install-snippet pre[hidden] { display: none; }
+    .install-snippet pre .line { display: block; }
     .install-note a { color: var(--accent); text-decoration: none; }
     .install-note a:hover { text-decoration: underline; }
     .copy-btn {
@@ -760,8 +775,15 @@
       <a href="https://github.com/vandot/zlodev" class="btn btn-secondary">View on GitHub</a>
     </div>
     <div class="install-snippet reveal">
-      <pre><button class="copy-btn" onclick="copyInstall(this)">copy</button><span class="prompt">$</span>curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh</pre>
-      <p class="install-note">On Windows, download the binary from <a href="https://github.com/vandot/zlodev/releases">GitHub Releases</a> and run in an elevated terminal.</p>
+      <div class="install-tabs" role="tablist">
+        <button class="install-tab active" type="button" role="tab" aria-selected="true" data-tab="brew">Homebrew</button>
+        <button class="install-tab" type="button" role="tab" aria-selected="false" data-tab="script">Script</button>
+        <button class="install-tab" type="button" role="tab" aria-selected="false" data-tab="scoop">Windows</button>
+      </div>
+      <pre data-tab="brew"><button class="copy-btn" onclick="copyInstall(this)">copy</button><span class="line"><span class="prompt">$</span>brew install vandot/tap/zlodev</span></pre>
+      <pre data-tab="script" hidden><button class="copy-btn" onclick="copyInstall(this)">copy</button><span class="line"><span class="prompt">$</span>curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh</span></pre>
+      <pre data-tab="scoop" hidden><button class="copy-btn" onclick="copyInstall(this)">copy</button><span class="line"><span class="prompt">&gt;</span>scoop bucket add vandot https://github.com/vandot/scoop-bucket</span><span class="line"><span class="prompt">&gt;</span>scoop install zlodev</span></pre>
+      <p class="install-note">Also as <code>.deb</code>, <code>.rpm</code> and Arch packages on <a href="https://github.com/vandot/zlodev/releases/latest">GitHub Releases</a>. On Windows, run zlodev in an elevated terminal.</p>
     </div>
 
     <div class="terminal reveal">
@@ -890,7 +912,7 @@
       <div class="feature reveal">
         <div class="feature-icon">{ }</div>
         <h3>HAR export</h3>
-        <p>Export captured traffic as HTTP Archive files for sharing, analysis, or import into other tools.</p>
+        <p>Export captured traffic as HTTP Archive files for sharing, analysis, or import into other tools. Cookies and auth headers are redacted by default.</p>
       </div>
       <div class="feature reveal">
         <div class="feature-icon">curl</div>
@@ -901,6 +923,16 @@
         <div class="feature-icon">ws</div>
         <h3>WebSocket passthrough</h3>
         <p><code>wss://dev.lo</code> upgrades are proxied to your dev server and follow your routes, so HMR and live reload just work over HTTPS. Upgrades show up in the TUI with status 101.</p>
+      </div>
+      <div class="feature reveal">
+        <div class="feature-icon">502!</div>
+        <h3>Failures explained</h3>
+        <p>When your dev server is down, slow, or a body is too large, the request still shows up, marked <code>502!</code>, <code>504!</code> or <code>413!</code>, with the reason. The browser gets the same text.</p>
+      </div>
+      <div class="feature reveal">
+        <div class="feature-icon">/ *</div>
+        <h3>Search &amp; star</h3>
+        <p>Filter requests by path, method, or status. Star the ones that matter so they survive when the request log fills up.</p>
       </div>
       <div class="feature reveal">
         <div class="feature-icon">:0</div>
@@ -966,7 +998,8 @@
         <div class="step-num">1</div>
         <div class="step-content">
           <h3>Install</h3>
-          <pre><span class="prompt">$</span>curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh</pre>
+          <pre><span class="prompt">$</span>brew install vandot/tap/zlodev</pre>
+          <p style="font-size: 13px; color: var(--text-muted); margin-top: 12px;">Or use the <a href="https://github.com/vandot/zlodev#install-script" style="color: var(--accent);">install script</a>, <a href="https://github.com/vandot/zlodev#scoop-windows" style="color: var(--accent);">Scoop</a> on Windows, or the <code>.deb</code>, <code>.rpm</code> and Arch packages from <a href="https://github.com/vandot/zlodev/releases/latest" style="color: var(--accent);">GitHub Releases</a>. On Linux with Homebrew, run the <code>setcap</code> command it prints.</p>
         </div>
       </div>
       <div class="step reveal">
@@ -1019,11 +1052,11 @@
     <div class="details-grid">
       <div class="detail-card reveal">
         <h3>DNS resolver</h3>
-        <p>A lightweight UDP server resolves <code>*.lo</code> queries to <code>127.0.0.1</code>. Registers via <code>/etc/resolver/</code> on macOS, <code>systemd-resolved</code> on Linux (requires systemd-resolved and systemd-networkd), and NRPT rules on Windows.</p>
+        <p>A lightweight UDP server resolves <code>*.lo</code> queries to <code>127.0.0.1</code>. Registers via <code>/etc/resolver/</code> on macOS, <code>systemd-resolved</code> on Linux (through a <code>zlodev0</code> dummy interface set up by systemd-networkd or NetworkManager), and NRPT rules on Windows. Other lookups are untouched.</p>
       </div>
       <div class="detail-card reveal">
         <h3>Certificate authority</h3>
-        <p>On install, zlodev generates a local CA and domain certificate. The CA is added to your system trust store, unique to your machine. Private keys are readable only by you.</p>
+        <p>On install, zlodev generates a local CA and domain certificate and adds the CA to your system trust store (and Firefox and Chromium on Linux). The CA is unique to your machine and limited to <code>dev.lo</code> by a name constraint, so it can't vouch for any other site. Private keys are readable only by you, and the domain certificate renews itself on start.</p>
       </div>
       <div class="detail-card reveal">
         <h3>TLS proxy</h3>
@@ -1090,11 +1123,11 @@
       </div>
       <div class="detail-card reveal">
         <h3>Max body control</h3>
-        <p>Set <code>--max-body=50M</code> to control how large a request body the proxy will accept. Supports K, M, G suffixes.</p>
+        <p>Request bodies are forwarded in full up to <code>--max-body</code> (default 10M, supports K, M, G suffixes); larger ones get <code>413</code>. Responses stream through at any size. The TUI shows the first 32 KB of each body.</p>
       </div>
       <div class="detail-card reveal">
         <h3>Cross-platform</h3>
-        <p>Works on macOS, Linux, and Windows. Written in Zig with BoringSSL for TLS. Single binary, no runtime dependencies.</p>
+        <p>Works on macOS (Apple Silicon and Intel), Linux, and Windows. Written in Zig with BoringSSL for TLS. Single binary, installed with Homebrew, Scoop, Linux packages, or a script.</p>
       </div>
     </div>
   </div>
@@ -1119,11 +1152,11 @@
         <tbody>
           <tr><td>Local HTTPS with auto-certs</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td></tr>
           <tr><td>Custom local DNS (*.lo)</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td></tr>
-          <tr><td>Terminal UI for traffic</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td><td class="cmp-yes">&#10003;</td></tr>
+          <tr><td>Traffic inspector</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td><td class="cmp-yes">&#10003;</td></tr>
           <tr><td>Request interception &amp; editing</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td></tr>
           <tr><td>Launch &amp; monitor dev server</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td></tr>
           <tr><td>Multi-app routing</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td></tr>
-          <tr><td>Single binary, no dependencies</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td></tr>
+          <tr><td>Single binary</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td></tr>
           <tr><td>Free &amp; open source</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td></tr>
           <tr><td>No account required</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td></tr>
           <tr><td>Publicly accessible over internet</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td><td class="cmp-yes">&#10003;</td></tr>
@@ -1146,12 +1179,30 @@
 
 <script>
 function copyInstall(btn) {
-  var text = 'curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh';
+  var lines = btn.parentElement.querySelectorAll('.line');
+  var text = Array.prototype.map.call(lines, function(line) {
+    return line.textContent.replace(/^[$>]/, '');
+  }).join('\n');
   navigator.clipboard.writeText(text).then(function() {
     btn.textContent = 'copied!';
     setTimeout(function() { btn.textContent = 'copy'; }, 2000);
   });
 }
+
+// Install tabs
+document.querySelectorAll('.install-tab').forEach(function(tab) {
+  tab.addEventListener('click', function() {
+    var name = tab.getAttribute('data-tab');
+    document.querySelectorAll('.install-tab').forEach(function(t) {
+      var on = t === tab;
+      t.classList.toggle('active', on);
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    document.querySelectorAll('.install-snippet pre').forEach(function(pre) {
+      pre.hidden = pre.getAttribute('data-tab') !== name;
+    });
+  });
+});
 
 // Mobile nav menu
 var menuToggle = document.querySelector('nav .menu-toggle');
