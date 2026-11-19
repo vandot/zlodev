@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 ## Project overview
 
@@ -115,6 +115,7 @@ win32.zig         Win32/Winsock bindings Zig 0.17 std no longer exposes (console
 - After `sslSendError`, always `return` (never `continue` in keep-alive loop) — TLS state may be corrupted.
 - Proxy-made errors go through `failRequest` (reason as body, entry w/ `error_msg`, or `finishFailed` for held entries; TUI shows `502!`). `--timeout` (`upstream_timeout_s`) = connect (`compat.tcpConnectTimeout`) + response-head deadline → 504; upstream reads go through `UpstreamReader` (poll + shutdown check; TLS upstream sockets non-blocking after handshake, `WouldBlock` → re-poll), body relay has no deadline (SSE/long poll safe).
 - Proxy-owned headers (`proxy_owned_headers`): client `Accept-Encoding`, `Cache-Control`, `X-Forwarded-*`, `X-Real-IP` dropped; `writeProxyHeaders` emits its own (XFF appends `client_xff`, `Accept-Encoding: identity`). Port-80 redirect host via `http_wire.sameSiteHost`.
+- Release (`release.yml`, on `v*` tag): matrix builds 5 targets in parallel (linux amd64/arm64, macos arm64/amd64, windows amd64) → `zlodev-<os>-<arch>` archives; release job builds deb/rpm/Arch from the Linux tarballs with `nfpm` (`packaging/nfpm.yaml`, binary at `build/zlodev`, `postinstall.sh` runs `setcap`), `SHA256SUMS` + attestation over `zlodev*`; `publish` job renders `packaging/zlodev.rb.in` → `vandot/homebrew-tap` and `zlodev.json.in` → `vandot/scoop-bucket` via `packaging/render.sh` (needs `TAP_GITHUB_TOKEN` secret). Asset names are relied on by `install.sh`.
 - Temp files for sudo: `sys.writeTmpFile` (random name, exclusive, 0600) + `sudo install -m 644` + `sys.removeTmpFile`. Log: `<sys.dataDir>/zlodev.log`, rotated at 1 MB on open. CLI value flags take `--flag=value` or `--flag value` (`cli.matchFlag`); unknown args exit 1.
 - `forwardResponseFromEntry` emits recomputed `Content-Length`, even for zero-length bodies, except for bodiless responses (HEAD/1xx/204/304).
 - Responses to HEAD and 1xx/204/304 never carry body (`http_wire.responseHasBody`): proxy reads no body, keeps connection alive, forwards upstream headers unchanged (HEAD keeps `Content-Length`). `readResponseHead` skips interim 1xx heads (100 Continue, 103 Early Hints), returns 101 as final. Proxy tests needing full `handleConnection` path use `ProxyHarness` + `FakeUpstream`.
