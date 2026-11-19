@@ -1,0 +1,22 @@
+{
+    "version": "@VERSION@",
+    "description": "Local HTTPS reverse proxy with custom DNS and a terminal UI",
+    "homepage": "https://github.com/vandot/zlodev",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/vandot/zlodev/releases/download/v@VERSION@/zlodev-windows-amd64.zip",
+            "hash": "@SHA_WINDOWS_AMD64@"
+        }
+    },
+    "bin": "zlodev.exe",
+    "notes": "Run 'zlodev install' once (as Administrator) to set up the CA and DNS.",
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/vandot/zlodev/releases/download/v$version/zlodev-windows-amd64.zip"
+            }
+        }
+    }
+}

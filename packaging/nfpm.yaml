@@ -1,0 +1,36 @@
+# Linux packages (deb, rpm, Arch). Built in the release workflow:
+#   VERSION=0.7.0 ARCH=amd64 nfpm package -f packaging/nfpm.yaml -p deb
+# with the Linux binary for ARCH at build/zlodev.
+name: zlodev
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: vandot
+description: |
+  Local HTTPS reverse proxy for development, with custom DNS and a terminal UI
+  for inspecting, intercepting and replaying HTTP traffic at https://dev.lo.
+homepage: https://github.com/vandot/zlodev
+license: MIT
+
+contents:
+  - src: build/zlodev
+    dst: /usr/bin/zlodev
+    file_info:
+      mode: 0755
+
+scripts:
+  postinstall: packaging/postinstall.sh
+
+# setcap comes from these packages.
+overrides:
+  deb:
+    depends:
+      - libcap2-bin
+  rpm:
+    depends:
+      - libcap
+  archlinux:
+    depends:
+      - libcap

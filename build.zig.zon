@@ -1,6 +1,8 @@
 .{
     .name = .zlodev,
-    .version = "0.7.0",
+    // Not the release version: releases pass the git tag to `zig build
+    // -Dversion`, so this never needs bumping.
+    .version = "0.0.0",
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .vaxis = .{

@@ -28,7 +28,32 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 
 ## Install
 
-### Pre-built binary
+### Homebrew (macOS, Linux)
+
+```sh
+brew install vandot/tap/zlodev
+```
+
+On Linux, run the `setcap` command Homebrew prints after install, so zlodev can bind ports 53, 80 and 443 without root.
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add vandot https://github.com/vandot/scoop-bucket
+scoop install zlodev
+```
+
+### Linux packages
+
+Each release has `.deb`, `.rpm` and Arch (`.pkg.tar.zst`) packages for amd64 and arm64. They install `/usr/bin/zlodev` and run `setcap` for you:
+
+```sh
+sudo apt install ./zlodev_0.7.0_amd64.deb      # Debian, Ubuntu
+sudo dnf install ./zlodev-0.7.0-1.x86_64.rpm   # Fedora, RHEL
+sudo pacman -U zlodev-0.7.0-1-x86_64.pkg.tar.zst  # Arch
+```
+
+### Install script
 
 Pre-built binaries have no external dependencies — single binary, nothing to install.
 
@@ -36,7 +61,7 @@ Pre-built binaries have no external dependencies — single binary, nothing to i
 curl -fsSL https://raw.githubusercontent.com/vandot/zlodev/main/install.sh | sh
 ```
 
-The script checks the download against the release's `SHA256SUMS`. Release archives also carry a signed [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), which you can check with the GitHub CLI after downloading an archive by hand:
+The script checks the download against the release's `SHA256SUMS`. Release archives and packages also carry a signed [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), which you can check with the GitHub CLI after downloading an archive by hand:
 
 ```sh
 gh attestation verify zlodev-linux-amd64.tar.gz --repo vandot/zlodev
