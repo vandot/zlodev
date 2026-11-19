@@ -20,6 +20,8 @@ jobs:
             artifact: zlodev-linux-arm64
           - target: aarch64-macos
             artifact: zlodev-darwin-arm64
+          - target: x86_64-macos
+            artifact: zlodev-darwin-amd64
           - target: x86_64-windows
             artifact: zlodev-windows-amd64
 
@@ -64,25 +66,91 @@ jobs:
       id-token: write      # sign the build provenance attestation
       attestations: write  # store the attestation
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Download all artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
 
+      - name: Install nfpm
+        env:
+          NFPM_VERSION: 2.48.0
+          NFPM_SHA256: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
+        run: |
+          curl -fsSL -o nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "${NFPM_SHA256}  nfpm.tar.gz" | sha256sum -c -
+          tar -xzf nfpm.tar.gz nfpm
+          rm nfpm.tar.gz
+
+      - name: Build Linux packages
+        run: |
+          export VERSION="${GITHUB_REF#refs/tags/v}"
+          for ARCH in amd64 arm64; do
+            export ARCH
+            rm -rf build && mkdir build
+            tar -xzf "artifacts/zlodev-linux-${ARCH}.tar.gz" -C build
+            for format in deb rpm archlinux; do
+              ./nfpm package -f packaging/nfpm.yaml -p "$format" -t artifacts/
+            done
+          done
+          rm -rf build
+
       - name: Generate checksums
         working-directory: artifacts
         run: |
-          sha256sum zlodev-* > SHA256SUMS
+          sha256sum zlodev* > SHA256SUMS
           cat SHA256SUMS
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: artifacts/zlodev-*
+          subject-path: artifacts/zlodev*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           generate_release_notes: true
           files: artifacts/*
+
+  # Update the Homebrew tap and Scoop bucket. Separate from the release so a
+  # failure here leaves the release in place; rerun this job to retry.
+  publish:
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" -p SHA256SUMS
+
+      - name: Update Homebrew tap and Scoop bucket
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::error::TAP_GITHUB_TOKEN secret is not set"
+            exit 1
+          fi
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          publish() { # REPO TEMPLATE FILE
+            rm -rf repo
+            git clone -q "https://x-access-token:${TAP_TOKEN}@github.com/vandot/$1.git" repo
+            packaging/render.sh "$VERSION" SHA256SUMS "$2" > "repo/$3"
+            cd repo
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$3"
+            if git diff --cached --quiet; then
+              echo "$1: $3 already up to date"
+            else
+              git commit -q -m "zlodev ${VERSION}"
+              git push -q
+            fi
+            cd ..
+          }
+          publish homebrew-tap packaging/zlodev.rb.in zlodev.rb
+          publish scoop-bucket packaging/zlodev.json.in zlodev.json

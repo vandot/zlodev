@@ -89,10 +89,10 @@ fi
 
 chmod +x "${INSTALL_DIR}/zlodev"
 
-# On Linux, grant the binary permission to bind to privileged ports (80, 443)
-# without requiring root. This uses file capabilities instead of running as root.
+# On Linux, grant the binary permission to bind to privileged ports (53, 80,
+# 443) without requiring root. This uses file capabilities instead of running as root.
 if [ "$os" = "linux" ]; then
-    echo "Setting network capabilities (allows binding to ports 80/443 without root)..."
+    echo "Setting network capabilities (allows binding to ports 53/80/443 without root)..."
     if command -v setcap >/dev/null 2>&1; then
         sudo setcap cap_net_bind_service=+eip "${INSTALL_DIR}/zlodev"
     else
