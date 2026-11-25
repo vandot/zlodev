@@ -33,6 +33,7 @@ class Zlodev < Formula
 
   def caveats
     s = "Run `zlodev install` once to set up the CA and DNS.\n"
+    s += "zlodev start --share needs cloudflared: brew install cloudflared\n"
     on_linux do
       s += <<~EOS
         To bind ports 53, 80 and 443 without root, run:

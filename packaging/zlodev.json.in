@@ -10,6 +10,9 @@
         }
     },
     "bin": "zlodev.exe",
+    "suggest": {
+        "cloudflared": "cloudflared"
+    },
     "notes": "Run 'zlodev install' once (as Administrator) to set up the CA and DNS.",
     "checkver": "github",
     "autoupdate": {

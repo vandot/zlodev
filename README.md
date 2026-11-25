@@ -24,6 +24,7 @@ zlodev sits between your browser and your local dev server, providing HTTPS with
 - **Request starring** — star important requests so they survive ring buffer overflow
 - **Search/filter** — filter requests by path, method, or status code
 - **WebSocket passthrough** — `wss://dev.lo` upgrades are proxied to your dev server, so HMR and live reload work over HTTPS (see [WebSockets](#websockets))
+- **Public URL** — `--share` publishes your dev server through a Cloudflare quick tunnel (see [Sharing](#sharing))
 - **Cross-platform** — macOS, Linux, and Windows
 
 ## Install
@@ -167,6 +168,7 @@ zlodev start --dns          start DNS server only (log mode)
 --timeout=SECONDS          upstream connect/response timeout [default 30, 0 = none]
 --no-tui                   disable TUI, log to stderr
 --insecure-upstream        don't verify external route certificates
+--share                    public URL via Cloudflare quick tunnel (needs cloudflared)
 -l, --local                use .local domain (mDNS)
 --dns                      DNS only (install/uninstall/start)
 --cert                     certificates only (install/uninstall)
@@ -301,6 +303,33 @@ zlodev answers `/.zlodev/health` itself on ports 443 and 80 with `ok`, which is 
 until curl -sf https://dev.lo/.zlodev/health; do sleep 0.2; done
 ```
 
+### Sharing
+
+```sh
+zlodev start --share
+```
+
+Runs `cloudflared tunnel --no-autoupdate --url https://127.0.0.1:443 --no-tls-verify` and gives you a public `https://….trycloudflare.com` URL for your dev server. The TUI shows it in a `SHARE` row (press `u` to copy it) and marks requests that came through the tunnel with `^`. With `--no-tui` the URL is printed to stdout as `share: https://…`. Or put `share` in `.zlodev`. `--share` can't be combined with `--dns`.
+
+It needs [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) on your `PATH` (`brew install cloudflared` on macOS, `winget install --id Cloudflare.cloudflared` on Windows). zlodev refuses to start the tunnel if a cloudflared config file exists in its default directories (`~/.cloudflared/config.yml` and friends), because cloudflared would then ignore `--url`; move it aside.
+
+Anyone with the URL can reach your dev server. Limits of quick tunnels:
+
+- The URL changes on every run.
+- No server-sent events, at most 200 requests in flight, no uptime guarantee.
+- Not suited to webhooks or OAuth callbacks, which need a stable URL.
+- If zlodev is killed hard (`SIGKILL`) on macOS or Linux, cloudflared may keep running.
+- If no URL appears within 30 seconds the SHARE row shows a failure (the tunnel keeps running). If cloudflared exits, that is shown too; it is not restarted.
+
+Requests on the public host reach your app with `Host: dev.lo`, the public host in `X-Forwarded-Host`, `X-Forwarded-Proto: https`, and `X-Real-IP` taken from `CF-Connecting-IP`. In responses, `Location` and `Content-Location` pointing at `dev.lo` are rewritten to the public host, and `Set-Cookie` `Domain=dev.lo` is dropped. Absolute URLs your app builds itself come from its base URL setting, so set that to the public URL if you need it.
+
+Path routes and the default port are reachable through the tunnel; subdomain routes are not, since the tunnel has a single host. External routes are reachable by visitors, so anyone with the URL can use them.
+
+Frameworks that check the host may need to allow it:
+
+- Rails: `config.hosts << ".trycloudflare.com"`
+- Django: `CSRF_TRUSTED_ORIGINS = ["https://*.trycloudflare.com"]`
+
 ### Intercept
 
 Press `i` in the TUI to enable intercept mode. You'll be prompted for a pattern — matching requests are held for inspection while all others pass through normally.
@@ -351,6 +380,7 @@ intercept=resp:POST /api
 | `A` | Accept all held requests |
 | `d` | Drop held request / delete completed request |
 | `c` | Copy request as curl command |
+| `u` | Copy share URL (with `--share`) |
 | `e` | Edit request / response |
 | `r` | Edit & replay request |
 | `R` | Quick replay (no edit) or restart dev server (when focused on logs) |
@@ -383,6 +413,7 @@ intercept=resp:POST /api
 | `d` | Drop held request / delete completed request |
 | `*` | Star / unstar request |
 | `c` | Copy request as curl command |
+| `u` | Copy share URL (with `--share`) |
 | `e` | Edit request / response |
 | `r` | Edit & replay request |
 | `R` | Quick replay (no edit) |
@@ -412,6 +443,8 @@ intercept=resp:POST /api
 4. **HTTP server** — A plain HTTP server on port 80 serves the CA certificate download page (for mobile devices) and redirects other requests to HTTPS, keeping the `dev.lo` subdomain.
 
 5. **Dev server integration** — When `--command` is provided, zlodev spawns a shell process running your dev server command. stdout and stderr are captured into a bounded ring buffer and displayed in a split-pane logs view. Its stdin is `/dev/null`, since the TUI owns the terminal. The dev server restarts when you press `R` in the logs pane, or shuts down cleanly when you quit zlodev.
+
+6. **Sharing** — With `--share`, zlodev starts `cloudflared` pointed at its own HTTPS port and scrapes the public URL from its output. Tunnel traffic goes through the same proxy path, so it is captured, intercepted and replayed like any other request, with the host handling described in [Sharing](#sharing).
 
 ## Troubleshooting
 
