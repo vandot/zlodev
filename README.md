@@ -323,7 +323,7 @@ Anyone with the URL can reach your dev server. Limits of quick tunnels:
 
 Requests on the public host reach your app with `Host: dev.lo`, the public host in `X-Forwarded-Host`, `X-Forwarded-Proto: https`, and `X-Real-IP` taken from `CF-Connecting-IP`. In responses, `Location` and `Content-Location` pointing at `dev.lo` are rewritten to the public host, and `Set-Cookie` `Domain=dev.lo` is dropped. Absolute URLs your app builds itself come from its base URL setting, so set that to the public URL if you need it.
 
-Path routes and the default port are reachable through the tunnel; subdomain routes are not, since the tunnel has a single host. External routes are reachable by visitors, so anyone with the URL can use them.
+Path routes and the default port are reachable through the tunnel; subdomain routes are not, since the tunnel has a single host. External path routes are reachable by visitors, so anyone with the URL can use them.
 
 Frameworks that check the host may need to allow it:
 

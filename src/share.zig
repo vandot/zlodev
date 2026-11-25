@@ -36,7 +36,7 @@ var state: Snapshot = .{
 };
 var start_ms: i64 = 0;
 // Set (release) once host bytes are final; they are never written again until
-// resetForTest, so readers that acquire-load it may read them without the mutex.
+// begin/resetForTest, so readers that acquire-load it may read them without the mutex.
 var host_published = std.atomic.Value(bool).init(false);
 
 fn setReason(msg: []const u8) void {
@@ -55,17 +55,19 @@ pub fn begin(now_ms: i64) void {
     host_published.store(false, .release);
 }
 
-pub fn publishHost(host: []const u8) void {
-    if (host.len == 0 or host.len > max_host_len) return;
+/// Returns true when the host took effect (first host wins).
+pub fn publishHost(host: []const u8) bool {
+    if (host.len == 0 or host.len > max_host_len) return false;
     mutex.lockUncancelable(rt.io());
     defer mutex.unlock(rt.io());
-    if (host_published.load(.monotonic)) return;
-    if (state.status != .starting and state.status != .failed) return;
+    if (host_published.load(.monotonic)) return false;
+    if (state.status != .starting and state.status != .failed) return false;
     @memcpy(state.host[0..host.len], host);
     state.host_len = @intCast(host.len);
     state.reason_len = 0;
     state.status = .ready;
     host_published.store(true, .release);
+    return true;
 }
 
 pub fn fail(reason: []const u8) void {
@@ -130,25 +132,30 @@ fn isHostChar(c: u8) bool {
 }
 
 /// Finds `https://<label>.trycloudflare.com` in a cloudflared log line and
-/// returns the host. Rejects look-alike domains and extra labels.
+/// returns the host. Rejects look-alike domains, extra labels, the `api` label
+/// (error lines mention api.trycloudflare.com) and hosts followed by a path.
 pub fn extractQuickTunnelHost(line: []const u8) ?[]const u8 {
     const scheme = "https://";
-    const at = std.mem.indexOf(u8, line, scheme) orelse return null;
-    const start = at + scheme.len;
-    var end = start;
-    while (end < line.len and isHostChar(line[end])) end += 1;
-    if (end < line.len) {
-        const c = line[end];
-        if (c != '/' and c != '|' and !std.ascii.isWhitespace(c)) return null;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, line, from, scheme)) |at| {
+        const start = at + scheme.len;
+        from = start;
+        var end = start;
+        while (end < line.len and isHostChar(line[end])) end += 1;
+        if (end < line.len) {
+            const c = line[end];
+            if (c != '|' and !std.ascii.isWhitespace(c)) continue;
+        }
+        const host = line[start..end];
+        if (host.len <= tunnel_suffix.len or host.len > max_host_len) continue;
+        const label_len = host.len - tunnel_suffix.len;
+        if (!std.ascii.eqlIgnoreCase(host[label_len..], tunnel_suffix)) continue;
+        const label = host[0..label_len];
+        if (std.mem.indexOfScalar(u8, label, '.') != null) continue;
+        if (std.ascii.eqlIgnoreCase(label, "api")) continue;
+        return host;
     }
-    const host = line[start..end];
-    if (host.len <= tunnel_suffix.len or host.len > max_host_len) return null;
-    const label_len = host.len - tunnel_suffix.len;
-    if (!std.ascii.eqlIgnoreCase(host[label_len..], tunnel_suffix)) return null;
-    for (host[0..label_len]) |c| {
-        if (c == '.') return null;
-    }
-    return host;
+    return null;
 }
 
 test "extractQuickTunnelHost finds the URL in cloudflared's banner" {
@@ -164,6 +171,13 @@ test "extractQuickTunnelHost rejects look-alikes" {
     try testing.expect(extractQuickTunnelHost("https://trycloudflare.com") == null);
     try testing.expect(extractQuickTunnelHost("https://a_b.trycloudflare.com") == null);
 }
+test "extractQuickTunnelHost rejects api host from error lines" {
+    const err_line = "2026-11-25T10:00:00Z ERR failed to request quick Tunnel: Post \"https://api.trycloudflare.com/tunnel\": dial tcp: lookup api.trycloudflare.com: no such host";
+    try testing.expect(extractQuickTunnelHost(err_line) == null);
+    try testing.expect(extractQuickTunnelHost("https://api.trycloudflare.com") == null);
+    try testing.expect(extractQuickTunnelHost("https://x.trycloudflare.com/path") == null);
+    try testing.expectEqualStrings("real-one.trycloudflare.com", extractQuickTunnelHost("see https://api.trycloudflare.com/x then https://real-one.trycloudflare.com ok").?);
+}
 test "hostMatches strips port and ignores case" {
     try testing.expect(hostMatches("Quiet-River-Fox.TryCloudflare.com:443", "quiet-river-fox.trycloudflare.com"));
     try testing.expect(!hostMatches("dev.lo", "quiet-river-fox.trycloudflare.com"));
@@ -174,8 +188,8 @@ test "state: begin, publish, first host wins" {
     begin(0);
     try testing.expectEqual(Status.starting, snapshot().status);
     try testing.expect(!isPublicHost("a.trycloudflare.com"));
-    publishHost("a.trycloudflare.com");
-    publishHost("b.trycloudflare.com");
+    try testing.expect(publishHost("a.trycloudflare.com"));
+    try testing.expect(!publishHost("b.trycloudflare.com"));
     try testing.expectEqualStrings("a.trycloudflare.com", snapshot().getHost());
     try testing.expect(isPublicHost("A.trycloudflare.com:443"));
 }
@@ -186,7 +200,7 @@ test "state: timeout fails, late URL recovers" {
     try testing.expectEqual(Status.starting, snapshot().status);
     checkTimeout(31_000);
     try testing.expectEqual(Status.failed, snapshot().status);
-    publishHost("a.trycloudflare.com");
+    try testing.expect(publishHost("a.trycloudflare.com"));
     try testing.expectEqual(Status.ready, snapshot().status);
 }
 test "state: exit reports code" {

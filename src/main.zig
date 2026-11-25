@@ -634,9 +634,7 @@ fn doStart(
         std.debug.print("warning: --share makes your dev server reachable by anyone with the URL\n", .{});
         for (routes) |route| {
             if (route.hostname) |h| {
-                if (route.kind == .subdomain) {
-                    std.debug.print("  public visitors can reach: {s}.{s} -> {s}:{d}\n", .{ route.pattern, full_domain, h, route.port });
-                } else {
+                if (route.kind == .path) {
                     std.debug.print("  public visitors can reach: {s} -> {s}:{d}\n", .{ route.pattern, h, route.port });
                 }
             }
@@ -646,7 +644,7 @@ fn doStart(
             tunnel_started = true;
         } else |e| {
             log.err("component=tunnel op=start error={any}", .{e});
-            std.debug.print("cloudflared failed to start: {s}\n", .{@errorName(e)});
+            if (!no_tui) std.debug.print("cloudflared failed to start: {s}\n", .{@errorName(e)});
             var rbuf: [96]u8 = undefined;
             share.fail(std.fmt.bufPrint(&rbuf, "cloudflared failed to start: {s}", .{@errorName(e)}) catch "cloudflared failed to start");
         }
@@ -658,25 +656,24 @@ fn doStart(
             const kind_str: []const u8 = if (route.kind == .subdomain) "subdomain" else "path";
             log.info("component=main route kind={s} pattern={s} port={d}", .{ kind_str, route.pattern, route.port });
         }
-        var share_reported = false;
+        var last_status: share.Status = .off;
         while (shutdown.isRunning()) {
             rt.sleepMs(100);
-            if (share_on and !share_reported) {
+            if (share_on) {
                 share.checkTimeout(rt.milliTimestamp());
                 const snap = share.snapshot();
-                switch (snap.status) {
-                    .ready => {
-                        share_reported = true;
-                        var out_buf: [share.max_host_len + 32]u8 = undefined;
-                        if (std.fmt.bufPrint(&out_buf, "share: https://{s}\n", .{snap.getHost()})) |line| {
-                            std.Io.File.stdout().writeStreamingAll(rt.io(), line) catch {};
-                        } else |_| {}
-                    },
-                    .failed, .exited => {
-                        share_reported = true;
-                        std.debug.print("share: {s}\n", .{snap.getReason()});
-                    },
-                    else => {},
+                if (snap.status != last_status) {
+                    last_status = snap.status;
+                    switch (snap.status) {
+                        .ready => {
+                            var out_buf: [share.max_host_len + 32]u8 = undefined;
+                            if (std.fmt.bufPrint(&out_buf, "share: https://{s}\n", .{snap.getHost()})) |line| {
+                                std.Io.File.stdout().writeStreamingAll(rt.io(), line) catch {};
+                            } else |_| {}
+                        },
+                        .failed, .exited => std.debug.print("share: {s}\n", .{snap.getReason()}),
+                        else => {},
+                    }
                 }
             }
         }
@@ -758,6 +755,7 @@ fn printHelp() void {
         \\  --no-tui                   disable TUI, log to stderr
         \\  --insecure-upstream        don't verify external route certificates
         \\  --share                    public URL via Cloudflare quick tunnel (needs cloudflared)
+        \\                             (URL changes each run; no SSE; anyone with the URL can reach your app)
         \\  -l, --local                use .local domain (mDNS)
         \\  --dns                      DNS only (install/uninstall/start)
         \\  --cert                     certificates only (install/uninstall)

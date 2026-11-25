@@ -564,26 +564,24 @@ pub fn writeLocationRewritten(sink: anytype, header: []const u8, domain: []const
 /// domain or `.<domain>` (case-insensitive). Only attributes after the first `;`
 /// are searched. No trailing CRLF.
 pub fn writeCookieWithoutDomain(sink: anytype, header: []const u8, only_if_domain: ?[]const u8) void {
-    var semi = std.mem.indexOfScalar(u8, header, ';') orelse {
+    const first = std.mem.indexOfScalar(u8, header, ';') orelse {
         sink.write(header);
         return;
     };
-    while (true) {
+    sink.write(header[0..first]);
+    var semi = first;
+    while (semi < header.len) {
         const end = std.mem.indexOfScalarPos(u8, header, semi + 1, ';') orelse header.len;
         const attr = std.mem.trim(u8, header[semi + 1 .. end], " \t");
+        var drop = false;
         if (std.ascii.startsWithIgnoreCase(attr, "domain=")) {
             var value = std.mem.trim(u8, attr["domain=".len..], " \t");
             if (std.mem.startsWith(u8, value, ".")) value = value[1..];
-            if (only_if_domain == null or std.ascii.eqlIgnoreCase(value, only_if_domain.?)) {
-                sink.write(std.mem.trimEnd(u8, header[0..semi], " \t"));
-                sink.write(header[end..]);
-                return;
-            }
+            drop = only_if_domain == null or std.ascii.eqlIgnoreCase(value, only_if_domain.?);
         }
-        if (end >= header.len) break;
+        if (!drop) sink.write(header[semi..end]);
         semi = end;
     }
-    sink.write(header);
 }
 
 // --- Unit Tests ---
@@ -1176,6 +1174,19 @@ test "rewriteLocation maps the local domain to the public host" {
     try testing.expectEqualStrings("Content-Location: https://x.trycloudflare.com/a\r\n", forwardInto(&out, "Content-Location: https://dev.lo/a\r\n", p, "dev.lo"));
 }
 
+test "rewriteLocation maps explicit port 80" {
+    var out: [256]u8 = undefined;
+    const p: ForwardPolicy = .{ .public_host = "x.trycloudflare.com" };
+    try testing.expectEqualStrings("Location: https://x.trycloudflare.com/x\r\n", forwardInto(&out, "Location: http://dev.lo:80/x\r\n", p, "dev.lo"));
+}
+
+test "share cookie drops every matching Domain attribute" {
+    var out: [256]u8 = undefined;
+    const p: ForwardPolicy = .{ .public_host = "x.trycloudflare.com" };
+    try testing.expectEqualStrings("Set-Cookie: s=1; Path=/\r\n", forwardInto(&out, "Set-Cookie: s=1; Domain=dev.lo; Path=/; Domain=.dev.lo\r\n", p, "dev.lo"));
+    try testing.expectEqualStrings("Set-Cookie: s=1; Domain=other.com\r\n", forwardInto(&out, "Set-Cookie: s=1; Domain=dev.lo; Domain=other.com\r\n", p, "dev.lo"));
+}
+
 test "rewriteLocation leaves look-alike and subdomain hosts" {
     var out: [256]u8 = undefined;
     const p: ForwardPolicy = .{ .public_host = "x.trycloudflare.com" };
@@ -1185,6 +1196,7 @@ test "rewriteLocation leaves look-alike and subdomain hosts" {
         "Location: /relative\r\n",
         "Location: https://other.com/\r\n",
         "Location: https://dev.lo:8443/x\r\n",
+        "Location: https://dev.lo:8080/x\r\n",
     }) |h| {
         try testing.expectEqualStrings(h, forwardInto(&out, h, p, "dev.lo"));
     }

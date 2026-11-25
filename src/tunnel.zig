@@ -119,8 +119,7 @@ fn startArgv(argv: []const []const u8) !void {
 fn onLine(_: void, line: []const u8) void {
     log.info("component=tunnel op=output line={s}", .{line});
     if (share.extractQuickTunnelHost(line)) |host| {
-        share.publishHost(host);
-        log.info("component=tunnel op=ready url=https://{s}", .{host});
+        if (share.publishHost(host)) log.info("component=tunnel op=ready url=https://{s}", .{host});
     }
 }
 
@@ -148,7 +147,10 @@ fn readerThread(pipe: std.Io.File) void {
             };
             log.info("component=tunnel op=exit code={d}", .{code});
             if (!stopping.load(.acquire) and shutdown.isRunning()) share.markExited(code);
-        } else |_| {}
+        } else |err| {
+            log.info("component=tunnel op=wait error={s}", .{@errorName(err)});
+            if (!stopping.load(.acquire) and shutdown.isRunning()) share.markExited(-1);
+        }
     }
     running.store(false, .release);
 }

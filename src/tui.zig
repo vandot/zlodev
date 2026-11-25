@@ -617,9 +617,11 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                             }
                             if (key.matches('u', .{})) {
                                 const msg = shareCopyFlash();
-                                @memcpy(flash_buf[0..msg.len], msg);
-                                flash_len = msg.len;
-                                if (msg.len > 0) flash_time = rt.milliTimestamp();
+                                if (msg.len > 0) {
+                                    @memcpy(flash_buf[0..msg.len], msg);
+                                    flash_len = msg.len;
+                                    flash_time = rt.milliTimestamp();
+                                }
                             }
                             if (key.matches('E', .{}) or key.matches('e', .{ .ctrl = true })) {
                                 const redact = key.matches('E', .{});
@@ -707,9 +709,11 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 flash_time = rt.milliTimestamp();
                             } else if (key.matches('u', .{})) {
                                 const msg = shareCopyFlash();
-                                @memcpy(flash_buf[0..msg.len], msg);
-                                flash_len = msg.len;
-                                if (msg.len > 0) flash_time = rt.milliTimestamp();
+                                if (msg.len > 0) {
+                                    @memcpy(flash_buf[0..msg.len], msg);
+                                    flash_len = msg.len;
+                                    flash_time = rt.milliTimestamp();
+                                }
                             } else if (key.matches('r', .{})) {
                                 if (edit_state.openForReplay(alloc, detail_index)) {
                                     view = .edit;
@@ -928,13 +932,13 @@ fn shareCopyFlash() []const u8 {
         .ready => {
             var url_buf: [share.max_host_len + 8]u8 = undefined;
             const url = std.fmt.bufPrint(&url_buf, "https://{s}", .{snap.getHost()}) catch return "Share not ready";
-            return if (clipboard.copyText(url)) "Copied share URL!" else "Share not ready";
+            return if (clipboard.copyText(url)) "Copied share URL!" else "Clipboard unavailable";
         },
         else => return "Share not ready",
     }
 }
 
-fn drawShareRows(win: vaxis.Window, start_row: u16, domain: []const u8, routes: []const proxy.Route) u16 {
+fn drawShareRows(win: vaxis.Window, start_row: u16, routes: []const proxy.Route) u16 {
     const snap = share.snapshot();
     if (snap.status == .off) return start_row;
     const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
@@ -958,11 +962,9 @@ fn drawShareRows(win: vaxis.Window, start_row: u16, domain: []const u8, routes: 
     if (snap.status == .starting or snap.status == .ready) {
         for (routes) |route| {
             const h = route.hostname orelse continue;
+            if (route.kind != .path) continue;
             var buf: [192]u8 = undefined;
-            const text = switch (route.kind) {
-                .subdomain => std.fmt.bufPrint(&buf, "public visitors can reach: {s}.{s} -> {s}:{d}", .{ route.pattern, domain, h, route.port }),
-                .path => std.fmt.bufPrint(&buf, "public visitors can reach: {s} -> {s}:{d}", .{ route.pattern, h, route.port }),
-            } catch continue;
+            const text = std.fmt.bufPrint(&buf, "public visitors can reach: {s} -> {s}:{d}", .{ route.pattern, h, route.port }) catch continue;
             writeAscii(win, 11, row, text, .{ .fg = yellow });
             row += 1;
         }
@@ -1025,7 +1027,7 @@ fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_
         writeAscii(win, 11, row, warning, .{ .fg = yellow, .bold = true });
         row += 1;
     }
-    row = drawShareRows(win, row, domain, routes);
+    row = drawShareRows(win, row, routes);
     row += 1;
 
     // Requests header

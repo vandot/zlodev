@@ -3503,7 +3503,7 @@ test "WebSocket upgrade with no response within --timeout answers 504" {
 fn startShareForTest() void {
     share.resetForTest();
     share.begin(0);
-    share.publishHost("x.trycloudflare.com");
+    _ = share.publishHost("x.trycloudflare.com");
 }
 
 test "forwardRequest writes the local Host for shared requests" {
