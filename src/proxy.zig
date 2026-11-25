@@ -9,6 +9,7 @@ const http_wire = @import("http_wire.zig");
 const shutdown = @import("shutdown.zig");
 const compat = @import("compat.zig");
 const rt = @import("rt.zig");
+const share = @import("share.zig");
 const win32 = @import("win32.zig");
 
 const ssl_c = @import("ssl_c");
@@ -636,6 +637,11 @@ fn handleConnection(
         // Extract Host header for route resolution
         const host = http_wire.getHeaderValue(req_hdr_section, "host:") orelse "";
         const route_result = resolveRoute(config, host, uri);
+        // Arrived through the share tunnel: the app sees its local domain, the
+        // public host goes in X-Forwarded-Host, and responses are rewritten back.
+        const shared = share.isPublicHost(host);
+        const real_ip = if (shared) shareRealIp(client_addr, req_hdr_section) else "";
+        const public_host: ?[]const u8 = if (shared) share.publicHost() else null;
         const upstream_port = route_result.port;
 
         // Capture for display only: what goes upstream comes from req_buf, which
@@ -650,6 +656,7 @@ fn handleConnection(
         @memcpy(entry.req_headers[0..rh_len], req_hdr_section[0..rh_len]);
         entry.req_headers_len = @intCast(rh_len);
         entry.req_headers_truncated = req_hdr_section.len > requests.max_header_len;
+        entry.shared = shared;
 
         // Check for WebSocket upgrade
         if (http_wire.isWebSocketUpgrade(req_hdr_section)) {
@@ -666,6 +673,8 @@ fn handleConnection(
                 .client_ip = formatAddress(client_addr, &ws_ip_buf),
                 .client_xff = http_wire.getHeaderValue(req_hdr_section, "x-forwarded-for:") orelse "",
                 .domain = config.domain,
+                .shared = shared,
+                .real_ip = real_ip,
             }, client_ctx, conn_id, &entry);
             return;
         }
@@ -799,6 +808,8 @@ fn handleConnection(
             .client_ip = formatAddress(client_addr, &ip_buf),
             .client_xff = http_wire.getHeaderValue(req_hdr_section, "x-forwarded-for:") orelse "",
             .domain = config.domain,
+            .shared = shared,
+            .real_ip = real_ip,
         };
         var upstream_failed = false;
         const up_sink = UpstreamSink{ .upstream = upstream, .failed = &upstream_failed };
@@ -903,6 +914,7 @@ fn handleConnection(
             .is_chunked = is_chunked,
             .content_length = resp_content_length,
             .has_body = has_body,
+            .public_host = public_host,
         };
         var resp_dec = http_wire.ChunkedDecoder{};
         var prefetched: []const u8 = "";
@@ -991,7 +1003,7 @@ fn handleConnection(
                         };
                         defer std.heap.page_allocator.destroy(resp_snap);
                         requests.snapshotByBackingIndex(h.index(), resp_snap);
-                        forwardResponseFromEntry(ssl, resp_snap, is_external, config.domain, must_close, has_body);
+                        forwardResponseFromEntry(ssl, resp_snap, is_external, config.domain, must_close, has_body, public_host);
 
                         // Duration = hold time only
                         const hold_elapsed = rt.milliTimestamp() - resp_received_time;
@@ -1010,7 +1022,7 @@ fn handleConnection(
             }
 
             // Fell through: intercept skipped, forward buffered response normally.
-            forwardResponseFromEntry(ssl, &entry, is_external, config.domain, must_close, has_body);
+            forwardResponseFromEntry(ssl, &entry, is_external, config.domain, must_close, has_body, public_host);
 
             if (must_close) return;
             setSocketTimeout(client_sock, .recv, 15);
@@ -1041,6 +1053,20 @@ fn handleConnection(
     }
 }
 
+/// The visitor's address for X-Real-IP on a shared request: `CF-Connecting-IP`,
+/// trusted only from a loopback peer (cloudflared runs locally) and only when it is
+/// a bare IPv4/IPv6 literal. Empty means use the peer address.
+fn shareRealIp(peer: std.Io.net.IpAddress, headers: []const u8) []const u8 {
+    if (!compat.isLoopback(peer)) return "";
+    const v = http_wire.getHeaderValue(headers, "cf-connecting-ip:") orelse return "";
+    if (v.len == 0) return "";
+    for (v) |c| {
+        if (!std.ascii.isHex(c) and c != '.' and c != ':') return "";
+    }
+    _ = std.Io.net.IpAddress.parse(v, 0) catch return "";
+    return v;
+}
+
 /// Everything forwardRequest needs beyond the entry itself: routing target and the
 /// client identity to stamp into X-Forwarded-* / X-Real-IP headers.
 const RequestForward = struct {
@@ -1050,6 +1076,10 @@ const RequestForward = struct {
     client_ip: []const u8,
     client_xff: []const u8 = "", // client's own X-Forwarded-For, extended with client_ip
     domain: []const u8,
+    /// Arrived through the share tunnel: a local upstream gets `Host: <domain>`.
+    shared: bool = false,
+    /// X-Real-IP override (a validated CF-Connecting-IP); empty uses client_ip.
+    real_ip: []const u8 = "",
 };
 
 /// Headers zlodev writes itself (client copies dropped so they aren't doubled or
@@ -1057,13 +1087,18 @@ const RequestForward = struct {
 /// shows readable bodies.
 const proxy_owned_headers = [_][]const u8{ "cache-control:", "accept-encoding:", "x-forwarded-host:", "x-forwarded-for:", "x-forwarded-proto:", "x-real-ip:" };
 
-/// The proxy's own headers after the forwarded block: the external Host rewrite,
-/// X-Forwarded-Host (original Host), X-Forwarded-For, X-Real-IP, X-Forwarded-Proto,
+/// The proxy's own headers after the forwarded block: the Host rewrite (external
+/// upstream host, or the local domain for shared requests), X-Forwarded-Host
+/// (original Host), X-Forwarded-For, X-Real-IP, X-Forwarded-Proto,
 /// Accept-Encoding: identity, no-cache.
 fn writeProxyHeaders(sink: anytype, ctx: RequestForward) void {
     if (ctx.is_external) {
         sink.write("Host: ");
         sink.write(ctx.upstream_host);
+        sink.write("\r\n");
+    } else if (ctx.shared) {
+        sink.write("Host: ");
+        sink.write(ctx.domain);
         sink.write("\r\n");
     }
     if (ctx.client_host.len > 0) {
@@ -1079,7 +1114,7 @@ fn writeProxyHeaders(sink: anytype, ctx: RequestForward) void {
     sink.write(ctx.client_ip);
     sink.write("\r\n");
     sink.write("X-Real-IP: ");
-    sink.write(ctx.client_ip);
+    sink.write(if (ctx.real_ip.len > 0) ctx.real_ip else ctx.client_ip);
     sink.write("\r\n");
     sink.write("X-Forwarded-Proto: https\r\n");
     // Explicit: a request without Accept-Encoding accepts any coding (RFC 9110 12.5.3).
@@ -1104,7 +1139,7 @@ fn forwardRequestHead(sink: anytype, method: []const u8, uri: []const u8, header
         skip_buf[n] = "content-length:";
         n += 1;
     }
-    if (ctx.is_external) {
+    if (ctx.is_external or ctx.shared) {
         skip_buf[n] = "host:";
         n += 1;
     }
@@ -1129,7 +1164,7 @@ fn forwardRequest(sink: anytype, e: *const requests.Entry, ctx: RequestForward) 
         @memcpy(skip_buf[0..proxy_owned_headers.len], &proxy_owned_headers);
         @memcpy(skip_buf[proxy_owned_headers.len..][0..framing.len], &framing);
         var n: usize = proxy_owned_headers.len + framing.len;
-        if (ctx.is_external) {
+        if (ctx.is_external or ctx.shared) {
             skip_buf[n] = "host:";
             n += 1;
         }
@@ -1148,7 +1183,7 @@ fn forwardRequest(sink: anytype, e: *const requests.Entry, ctx: RequestForward) 
 /// Used after response intercept (accept) to send the (possibly edited) response.
 /// `has_body` false (HEAD, 1xx, 204, 304): the upstream's Content-Length is kept
 /// as-is (for HEAD it describes the GET body) and no body is sent.
-fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_external: bool, domain: []const u8, must_close: bool, has_body: bool) void {
+fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_external: bool, domain: []const u8, must_close: bool, has_body: bool, public_host: ?[]const u8) void {
     // Build and send status line
     var status_buf: [64]u8 = undefined;
     const status_line = std.fmt.bufPrint(&status_buf, "HTTP/1.1 {d} {s}\r\n", .{ e.status, http_wire.reasonPhrase(e.status) }) catch return;
@@ -1159,6 +1194,7 @@ fn forwardResponseFromEntry(ssl: *ssl_c.SSL, e: *const requests.Entry, is_extern
     http_wire.forwardHeaders(e.getRespHeaders(), SslSink{ .ssl = ssl }, .{
         .skip = if (has_body) &.{ "connection:", "content-length:", "transfer-encoding:" } else &.{"connection:"},
         .rewrite_set_cookie = is_external,
+        .public_host = public_host,
     }, domain);
 
     // Set Content-Length to match actual body (may have been edited)
@@ -1189,6 +1225,8 @@ const RelayCtx = struct {
     is_chunked: bool,
     content_length: ?usize,
     has_body: bool,
+    /// Shared request: Location and Set-Cookie Domain rewritten for the public host.
+    public_host: ?[]const u8 = null,
 };
 
 /// Stream an upstream response to the client as received: status line, headers
@@ -1202,6 +1240,7 @@ fn relayResponse(ssl: *ssl_c.SSL, head: http_wire.ResponseHead, upstream: Upstre
     http_wire.forwardHeaders(head.headers, sink, .{
         .skip = &.{"connection:"},
         .rewrite_set_cookie = ctx.is_external,
+        .public_host = ctx.public_host,
     }, ctx.domain);
     sslWriteAll(ssl, if (ctx.must_close) "Connection: close\r\n" else "Connection: keep-alive\r\n");
     sslWriteAll(ssl, "\r\n");
@@ -3459,4 +3498,194 @@ test "WebSocket upgrade with no response within --timeout answers 504" {
     var e: requests.Entry = undefined;
     try waitNewestEntry(before, &e);
     try testing.expectEqual(@as(u16, 504), e.status);
+}
+
+fn startShareForTest() void {
+    share.resetForTest();
+    share.begin(0);
+    share.publishHost("x.trycloudflare.com");
+}
+
+test "forwardRequest writes the local Host for shared requests" {
+    const e = buildEntry("GET", "/a", "Host: x.trycloudflare.com\r\nAccept: */*\r\n", "");
+    var out: [512]u8 = undefined;
+    var len: usize = 0;
+    forwardRequest(TestSink{ .buf = &out, .len = &len }, &e, .{
+        .is_external = false,
+        .upstream_host = "127.0.0.1",
+        .client_host = "x.trycloudflare.com",
+        .client_ip = "127.0.0.1",
+        .domain = "dev.lo",
+        .shared = true,
+        .real_ip = "203.0.113.7",
+    });
+    try testing.expectEqualStrings(
+        "GET /a HTTP/1.1\r\n" ++
+            "Accept: */*\r\n" ++
+            "Host: dev.lo\r\nX-Forwarded-Host: x.trycloudflare.com\r\nX-Forwarded-For: 127.0.0.1\r\n" ++
+            "X-Real-IP: 203.0.113.7\r\nX-Forwarded-Proto: https\r\nAccept-Encoding: identity\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n" ++
+            "Content-Length: 0\r\n\r\n",
+        out[0..len],
+    );
+}
+
+test "shared request goes upstream as the local domain with the public host forwarded" {
+    startShareForTest();
+    defer share.resetForTest();
+    var up = RecordingUpstream{};
+    try up.start(18901);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18900, 18901);
+    defer px.stop();
+    const e = try testing.allocator.create(requests.Entry);
+    defer testing.allocator.destroy(e);
+    const before = freshRing();
+    var buf: [4096]u8 = undefined;
+    _ = try px.roundTrip("GET /s HTTP/1.1\r\nHost: x.trycloudflare.com\r\nCF-Connecting-IP: 203.0.113.7\r\nX-Forwarded-For: 203.0.113.7\r\n\r\n", "ok", &buf);
+    const got = up.received();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\r\nHost: dev.lo\r\n"));
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nHost: x.trycloudflare.com\r\n") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-Host: x.trycloudflare.com\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Real-IP: 203.0.113.7\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-For: 203.0.113.7, 127.0.0.1\r\n") != null);
+    try waitNewestEntry(before, e);
+    try testing.expect(e.shared);
+}
+
+test "non-shared request unchanged while share ready" {
+    share.resetForTest();
+    defer share.resetForTest();
+    const req = "GET /n HTTP/1.1\r\nHost: dev.lo\r\nAccept: */*\r\n\r\n";
+    var off_bytes: [2048]u8 = undefined;
+    var off_len: usize = 0;
+    const e = try testing.allocator.create(requests.Entry);
+    defer testing.allocator.destroy(e);
+    var buf: [4096]u8 = undefined;
+    {
+        var up = RecordingUpstream{};
+        try up.start(18903);
+        defer up.stop();
+        var px: ProxyHarness = undefined;
+        try px.start(18902, 18903);
+        defer px.stop();
+        _ = try px.roundTrip(req, "ok", &buf);
+        const got = up.received();
+        @memcpy(off_bytes[0..got.len], got);
+        off_len = got.len;
+    }
+    startShareForTest();
+    {
+        var up = RecordingUpstream{};
+        try up.start(18905);
+        defer up.stop();
+        var px: ProxyHarness = undefined;
+        try px.start(18904, 18905);
+        defer px.stop();
+        const before = freshRing();
+        _ = try px.roundTrip(req, "ok", &buf);
+        try testing.expectEqualStrings(off_bytes[0..off_len], up.received());
+        try waitNewestEntry(before, e);
+        try testing.expect(!e.shared);
+    }
+}
+
+test "bad CF-Connecting-IP falls back to the peer" {
+    startShareForTest();
+    defer share.resetForTest();
+    var up = RecordingUpstream{};
+    try up.start(18907);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18906, 18907);
+    defer px.stop();
+    var buf: [4096]u8 = undefined;
+    _ = try px.roundTrip("GET /b HTTP/1.1\r\nHost: x.trycloudflare.com\r\nCF-Connecting-IP: nope\r\n\r\n", "ok", &buf);
+    try testing.expect(std.mem.indexOf(u8, up.received(), "\r\nX-Real-IP: 127.0.0.1\r\n") != null);
+    _ = try px.roundTrip("GET /b HTTP/1.1\r\nHost: x.trycloudflare.com\r\nCF-Connecting-IP: 1.2.3.4, 5.6.7.8\r\n\r\n", "ok", &buf);
+    try testing.expect(std.mem.indexOf(u8, up.received(), "\r\nX-Real-IP: 127.0.0.1\r\n") != null);
+    _ = try px.roundTrip("GET /b HTTP/1.1\r\nHost: x.trycloudflare.com\r\nCF-Connecting-IP: 2001:db8::1\r\n\r\n", "ok", &buf);
+    try testing.expect(std.mem.indexOf(u8, up.received(), "\r\nX-Real-IP: 2001:db8::1\r\n") != null);
+}
+
+const share_redirect_response = "HTTP/1.1 302 Found\r\nLocation: https://dev.lo/home\r\nSet-Cookie: s=1; Domain=dev.lo; Path=/\r\nContent-Length: 2\r\n\r\nok";
+
+test "shared response rewrites Location and drops local cookie Domain" {
+    startShareForTest();
+    defer share.resetForTest();
+    var up = RecordingUpstream{ .response = share_redirect_response };
+    try up.start(18909);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18908, 18909);
+    defer px.stop();
+    var buf: [4096]u8 = undefined;
+    const resp = try px.roundTrip("GET / HTTP/1.1\r\nHost: x.trycloudflare.com\r\n\r\n", "ok", &buf);
+    try testing.expect(std.mem.indexOf(u8, resp, "\r\nLocation: https://x.trycloudflare.com/home\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "\r\nSet-Cookie: s=1; Path=/\r\n") != null);
+}
+
+test "held shared response is rewritten too" {
+    startShareForTest();
+    defer share.resetForTest();
+    intercept.enableWithPattern("resp:");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+    var up = RecordingUpstream{ .response = share_redirect_response };
+    try up.start(18911);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18910, 18911);
+    defer px.stop();
+    const e = try testing.allocator.create(requests.Entry);
+    defer testing.allocator.destroy(e);
+    const before = freshRing();
+    var buf: [4096]u8 = undefined;
+    const resp = try px.roundTrip("GET / HTTP/1.1\r\nHost: x.trycloudflare.com\r\n\r\n", "ok", &buf);
+    try testing.expect(std.mem.indexOf(u8, resp, "\r\nLocation: https://x.trycloudflare.com/home\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "\r\nSet-Cookie: s=1; Path=/\r\n") != null);
+    try waitNewestEntry(before, e);
+    try testing.expect(e.resp_intercepted);
+}
+
+test "held shared request goes upstream as the local domain" {
+    startShareForTest();
+    defer share.resetForTest();
+    intercept.enableWithPattern("req:");
+    defer intercept.toggle();
+    var acc = AutoAccept{};
+    try acc.start();
+    defer acc.stop();
+    var up = RecordingUpstream{};
+    try up.start(18913);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18912, 18913);
+    defer px.stop();
+    var buf: [4096]u8 = undefined;
+    _ = try px.roundTrip("GET /h HTTP/1.1\r\nHost: x.trycloudflare.com\r\n\r\n", "ok", &buf);
+    const got = up.received();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\r\nHost: dev.lo\r\n"));
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nHost: x.trycloudflare.com\r\n") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-Host: x.trycloudflare.com\r\n") != null);
+}
+
+test "shared WebSocket upgrade gets Host of the local domain" {
+    startShareForTest();
+    defer share.resetForTest();
+    var up = RecordingUpstream{ .response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" };
+    try up.start(18915);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18914, 18915);
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /hmr HTTP/1.1\r\nHost: x.trycloudflare.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", "\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 101"));
+    const got = up.received();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\r\nHost: dev.lo\r\n"));
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nHost: x.trycloudflare.com\r\n") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-Host: x.trycloudflare.com\r\n") != null);
 }
