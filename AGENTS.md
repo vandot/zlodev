@@ -20,6 +20,7 @@ zig test src/http_wire.zig           # run HTTP wire parsing tests
 zig test src/hold.zig                # run hold coordinator tests
 zig test src/jsonfmt.zig             # run JSON formatting tests
 zig test src/subprocess.zig          # run subprocess/log ring tests
+zig test src/child.zig               # run child process group (spawn/terminate) tests
 zig test src/search.zig              # run search tests
 zig test src/clipboard.zig           # run clipboard tests
 zig test src/share.zig               # run share (tunnel state, URL parse) tests
@@ -46,6 +47,7 @@ hold.zig          Hold coordinator for one intercepted entry (owns ring pin + in
 jsonfmt.zig       JSON pretty/compact reserialization for TUI body views and edited bodies
 tui.zig           Terminal UI (vaxis-based, list/detail/edit views, split-pane logs, route colors)
 subprocess.zig    Dev server launcher & log capture (process spawn, pipe reading, ANSI strip, log ring buffer)
+child.zig         Child process group (own pgid / Windows kill-on-close job; spawn, terminate with grace, release)
 dns.zig           UDP DNS server (resolves *.lo → 127.0.0.1)
 http_server.zig   HTTP server on port 80 (CA cert download page, HTTPS redirect)
 cert.zig          Certificate generation and system trust store management (BoringSSL)
