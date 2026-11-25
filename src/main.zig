@@ -26,6 +26,8 @@ pub const panic = tui.panic;
 
 const compat = @import("compat.zig");
 const rt = @import("rt.zig");
+const tunnel = @import("tunnel.zig");
+const share = @import("share.zig");
 
 pub fn main(init: std.process.Init) !void {
     compat.initNetworking();
@@ -59,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
     var no_tui: bool = false;
     var no_tui_set = false;
     var insecure_upstream = false;
+    var share_on = false;
     var dns_only: bool = false;
     var cert_only: bool = false;
     var max_body: usize = proxy.default_max_request_body;
@@ -119,6 +122,8 @@ pub fn main(init: std.process.Init) !void {
             no_tui_set = true;
         } else if (std.mem.eql(u8, arg, "--insecure-upstream")) {
             insecure_upstream = true;
+        } else if (std.mem.eql(u8, arg, "--share")) {
+            share_on = true;
         } else if (std.mem.eql(u8, arg, "--dns")) {
             dns_only = true;
         } else if (std.mem.eql(u8, arg, "--cert")) {
@@ -162,6 +167,7 @@ pub fn main(init: std.process.Init) !void {
             }
             if (!no_tui_set and cfg.no_tui) no_tui = true;
             if (cfg.insecure_upstream) insecure_upstream = true;
+            if (cfg.share) share_on = true;
             if (!max_body_set) if (cfg.max_body) |mb| {
                 max_body = mb;
             };
@@ -184,6 +190,10 @@ pub fn main(init: std.process.Init) !void {
 
     // When using --dns with start, no other options apply
     if (command == .start and dns_only) {
+        if (share_on) {
+            std.debug.print("--share cannot be combined with --dns\n", .{});
+            std.process.exit(1);
+        }
         if (port_set or bind_set or no_tui_set or max_body_set or timeout_set or route_count > 0 or insecure_upstream) {
             std.debug.print("--dns cannot be combined with other start options\n", .{});
             std.process.exit(1);
@@ -257,7 +267,7 @@ pub fn main(init: std.process.Init) !void {
             if (dns_only) {
                 try doStartDns(tld);
             } else {
-                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, !local and !bind_explicit, no_tui, max_body, routes[0..route_count], command_str, insecure_upstream, timeout_s);
+                try doStart(allocator, full_domain, local, tld, target_port, bind_addr, !local and !bind_explicit, no_tui, max_body, routes[0..route_count], command_str, insecure_upstream, timeout_s, share_on);
             }
         },
         .uninstall => {
@@ -464,7 +474,24 @@ fn doStart(
     command: ?[]const u8,
     insecure_upstream: bool,
     upstream_timeout_s: u32,
+    share_on: bool,
 ) !void {
+    var cf_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var cloudflared_path: []const u8 = "";
+    if (share_on) {
+        cloudflared_path = tunnel.preflight(&cf_buf) catch |e| {
+            switch (e) {
+                error.CloudflaredNotFound => std.debug.print("--share needs cloudflared, which was not found on PATH. Install: {s}\n", .{tunnel.installHint()}),
+                error.CloudflaredConfigPresent => {
+                    const home = if (rt.env_map) |env| (env.get(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME") orelse "") else "";
+                    var cfg_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                    const cfg = tunnel.findConfigFile(home, &cfg_buf) orelse "its config file";
+                    std.debug.print("--share runs a Cloudflare quick tunnel, which cloudflared refuses while {s} exists. Move it aside and retry.\n", .{cfg});
+                },
+            }
+            std.process.exit(1);
+        };
+    }
     // Check if another instance is already running
     if (isPortListening(bind_addr, 443)) {
         std.debug.print("port 443 is already in use — is another zlodev instance running?\n", .{});
@@ -601,14 +628,57 @@ fn doStart(
         };
     }
 
+    var tunnel_started = false;
+    defer if (tunnel_started) tunnel.stop();
+    if (share_on) {
+        std.debug.print("warning: --share makes your dev server reachable by anyone with the URL\n", .{});
+        for (routes) |route| {
+            if (route.hostname) |h| {
+                if (route.kind == .subdomain) {
+                    std.debug.print("  public visitors can reach: {s}.{s} -> {s}:{d}\n", .{ route.pattern, full_domain, h, route.port });
+                } else {
+                    std.debug.print("  public visitors can reach: {s} -> {s}:{d}\n", .{ route.pattern, h, route.port });
+                }
+            }
+        }
+        var target_buf: [128]u8 = undefined;
+        if (tunnel.start(cloudflared_path, tunnel.targetAddr(bind_owned, &target_buf))) |_| {
+            tunnel_started = true;
+        } else |e| {
+            log.err("component=tunnel op=start error={any}", .{e});
+            std.debug.print("cloudflared failed to start: {s}\n", .{@errorName(e)});
+            var rbuf: [96]u8 = undefined;
+            share.fail(std.fmt.bufPrint(&rbuf, "cloudflared failed to start: {s}", .{@errorName(e)}) catch "cloudflared failed to start");
+        }
+    }
+
     if (no_tui) {
         log.info("component=main op=running domain={s} target=127.0.0.1:{d} routes={d}", .{ full_domain, target_port, routes.len });
         for (routes) |route| {
             const kind_str: []const u8 = if (route.kind == .subdomain) "subdomain" else "path";
             log.info("component=main route kind={s} pattern={s} port={d}", .{ kind_str, route.pattern, route.port });
         }
+        var share_reported = false;
         while (shutdown.isRunning()) {
             rt.sleepMs(100);
+            if (share_on and !share_reported) {
+                share.checkTimeout(rt.milliTimestamp());
+                const snap = share.snapshot();
+                switch (snap.status) {
+                    .ready => {
+                        share_reported = true;
+                        var out_buf: [share.max_host_len + 32]u8 = undefined;
+                        if (std.fmt.bufPrint(&out_buf, "share: https://{s}\n", .{snap.getHost()})) |line| {
+                            std.Io.File.stdout().writeStreamingAll(rt.io(), line) catch {};
+                        } else |_| {}
+                    },
+                    .failed, .exited => {
+                        share_reported = true;
+                        std.debug.print("share: {s}\n", .{snap.getReason()});
+                    },
+                    else => {},
+                }
+            }
         }
     } else {
         // Run TUI on main thread (blocks until user quits)
@@ -622,6 +692,7 @@ fn doStart(
 
     // Signal all server loops to stop and wait for them
     shutdown.requestShutdown();
+    if (share_on) tunnel.stop();
     if (command != null) subprocess.stop();
     proxy_thread.join();
     http_thread.join();
@@ -686,6 +757,7 @@ fn printHelp() void {
         \\  --command=CMD              run CMD as subprocess (stopped on exit)
         \\  --no-tui                   disable TUI, log to stderr
         \\  --insecure-upstream        don't verify external route certificates
+        \\  --share                    public URL via Cloudflare quick tunnel (needs cloudflared)
         \\  -l, --local                use .local domain (mDNS)
         \\  --dns                      DNS only (install/uninstall/start)
         \\  --cert                     certificates only (install/uninstall)
@@ -703,6 +775,7 @@ fn printHelp() void {
         \\    command=npm run dev
         \\    no-tui
         \\    insecure-upstream
+        \\    share
         \\    timeout=60
         \\  CLI arguments override config file values.
         \\
@@ -878,6 +951,7 @@ const ConfigResult = struct {
     bind: ?[]const u8 = null,
     no_tui: bool = false,
     insecure_upstream: bool = false,
+    share: bool = false,
     max_body: ?usize = null,
     timeout: ?u32 = null,
     local: bool = false,
@@ -926,6 +1000,8 @@ fn readConfigFile(
             result.no_tui = true;
         } else if (std.mem.eql(u8, line, "insecure-upstream")) {
             result.insecure_upstream = true;
+        } else if (std.mem.eql(u8, line, "share")) {
+            result.share = true;
         } else if (std.mem.eql(u8, line, "local") or std.mem.eql(u8, line, "l")) {
             result.local = true;
         } else if (std.mem.eql(u8, line, "dns")) {
