@@ -61,6 +61,7 @@ pub const Entry = struct {
     state: EntryState = .normal,
     pinned: bool = false,
     starred: bool = false,
+    shared: bool = false, // true when the request arrived through the public share tunnel
     route_index: u8 = 0xff, // 0xff = no route match, otherwise index into routes
     resp_intercepted: bool = false, // true when intercepted at response phase (vs request phase)
 
@@ -117,6 +118,7 @@ pub const Summary = struct {
     timestamp: i64 = 0,
     state: EntryState = .normal,
     starred: bool = false,
+    shared: bool = false,
     resp_intercepted: bool = false,
     too_large_to_intercept: bool = false,
     error_len: u8 = 0,
@@ -144,6 +146,7 @@ pub const Summary = struct {
             .timestamp = e.timestamp,
             .state = e.state,
             .starred = e.starred,
+            .shared = e.shared,
             .resp_intercepted = e.resp_intercepted,
             .too_large_to_intercept = e.too_large_to_intercept,
             .error_len = e.error_len,
@@ -652,6 +655,17 @@ test "getSummaries basic" {
     try testing.expectEqualStrings("/a", buf[0].getPath());
     try testing.expectEqualStrings("/b", buf[1].getPath());
     try testing.expectEqualStrings("/c", buf[2].getPath());
+}
+
+test "summary carries shared flag" {
+    clearAll();
+    var e = makeEntry("GET", "/shared", 200);
+    e.shared = true;
+    push(e);
+
+    var buf: [1]Summary = undefined;
+    try testing.expectEqual(@as(usize, 1), getSummaries(&buf));
+    try testing.expect(buf[0].shared);
 }
 
 test "remove marks entry as deleted" {
