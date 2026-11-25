@@ -28,6 +28,7 @@ zig test src/rt.zig                  # run runtime (Io, timestamps, worker slots
 zig test src/compat.zig              # run socket layer tests
 zig test src/http_server.zig         # run HTTP server tests
 zig test src/shutdown.zig            # run shutdown/signal tests
+zig test src/tunnel.zig              # run cloudflared preflight/process tests
 zig test src/cli.zig                 # run CLI flag/size parsing tests
 zig test src/sys.zig -lc             # run temp file / data dir tests
 zig test src/log.zig -lc             # run log file tests
@@ -63,6 +64,7 @@ cli.zig           Pure CLI helpers (flag matching, size parsing)
 compat.zig        Cross-platform socket layer (Winsock on Windows, BSD sockets on POSIX: bind/listen/accept/connect/UDP, poll, SocketStream)
 rt.zig            Process-wide std.Io handle, timestamps, sleep, worker spawn + slot caps
 win32.zig         Win32/Winsock bindings Zig 0.17 std no longer exposes (console, sockets, job objects)
+tunnel.zig        cloudflared quick-tunnel for `start --share` (preflight, spawn via ChildGroup, stderr URL scrape → share.zig)
 ```
 
 ## Key design decisions

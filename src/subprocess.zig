@@ -6,10 +6,10 @@ const builtin = @import("builtin");
 const rt = @import("rt.zig");
 const child = @import("child.zig");
 
-const AnsiStripper = struct {
+pub const AnsiStripper = struct {
     state: enum { normal, esc, csi, osc, osc_esc } = .normal,
 
-    fn feed(self: *AnsiStripper, byte: u8, out: []u8, out_len: *usize) void {
+    pub fn feed(self: *AnsiStripper, byte: u8, out: []u8, out_len: *usize) void {
         switch (self.state) {
             .normal => {
                 if (byte == 0x1b) {
@@ -106,7 +106,7 @@ test "ansi strip - bare ESC two-byte sequence removed" {
 
 pub const max_line_len: usize = 4096;
 
-const LineSplitter = struct {
+pub const LineSplitter = struct {
     pending: [max_line_len]u8 = undefined,
     pending_len: usize = 0,
 
@@ -115,7 +115,7 @@ const LineSplitter = struct {
     };
 
     /// Process a chunk of bytes. Calls `callback` for each complete line.
-    fn feed(self: *LineSplitter, chunk: []const u8, context: anytype, callback: fn (@TypeOf(context), []const u8) void) void {
+    pub fn feed(self: *LineSplitter, chunk: []const u8, context: anytype, callback: fn (@TypeOf(context), []const u8) void) void {
         for (chunk) |byte| {
             if (byte == '\n') {
                 // Emit the pending line, stripping trailing \r
@@ -138,7 +138,7 @@ const LineSplitter = struct {
     }
 
     /// Flush any remaining pending bytes as a line.
-    fn flush(self: *LineSplitter, context: anytype, callback: fn (@TypeOf(context), []const u8) void) void {
+    pub fn flush(self: *LineSplitter, context: anytype, callback: fn (@TypeOf(context), []const u8) void) void {
         if (self.pending_len > 0) {
             callback(context, self.pending[0..self.pending_len]);
             self.pending_len = 0;
