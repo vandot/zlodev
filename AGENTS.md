@@ -22,6 +22,7 @@ zig test src/jsonfmt.zig             # run JSON formatting tests
 zig test src/subprocess.zig          # run subprocess/log ring tests
 zig test src/search.zig              # run search tests
 zig test src/clipboard.zig           # run clipboard tests
+zig test src/share.zig               # run share (tunnel state, URL parse) tests
 zig test src/rt.zig                  # run runtime (Io, timestamps, worker slots) tests
 zig test src/compat.zig              # run socket layer tests
 zig test src/http_server.zig         # run HTTP server tests
