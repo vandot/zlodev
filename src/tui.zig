@@ -2150,6 +2150,8 @@ test "tui: SHARE lists external path routes only" {
     try std.testing.expectEqual(@as(u16, 2), end);
     try std.testing.expectEqual(@as(usize, 1), ts.countText("public visitors can reach"));
     try std.testing.expect(ts.hasText("/api"));
+    try std.testing.expect(!ts.hasText("/x"));
+    try std.testing.expect(!ts.hasText("api."));
 }
 
 test "tui: request line markers" {
@@ -2175,6 +2177,10 @@ test "tui: shared marker at column 35" {
     sum.shared = true;
     drawRequestLine(ts.window(), 0, &sum, false);
     try std.testing.expectEqualStrings("^", ts.cellText(35, 0));
+
+    const plain = testSummary("GET", "/b", 200);
+    drawRequestLine(ts.window(), 2, &plain, false);
+    try std.testing.expect(!std.mem.eql(u8, "^", ts.cellText(35, 2)));
 
     var held = testSummary("OPTIONS", "/a", 0);
     held.shared = true;
@@ -2272,6 +2278,7 @@ fn testState(summaries: []requests.Summary) TuiState {
         .has_command = false,
         .logs_visible = false,
         .summaries = summaries,
+        .accepting_input = true,
         .effects = .{
             .copyText = KeyRec.copyText,
             .copyAsCurl = KeyRec.copyAsCurl,
@@ -2337,6 +2344,7 @@ test "tui: search typing, backspace, escape and enter" {
     try std.testing.expectEqualStrings("ab", st.search_buf[0..st.search_len]);
     _ = handleKey(&st, nk(vaxis.Key.backspace));
     try std.testing.expectEqual(@as(usize, 1), st.search_len);
+    st.cursor = 1;
     _ = handleKey(&st, nk(vaxis.Key.enter));
     try std.testing.expect(!st.search_mode);
     try std.testing.expectEqual(@as(usize, 1), st.search_len);
@@ -2362,7 +2370,10 @@ test "tui: intercept prompt enables the pattern on Enter" {
     const sums = try testSummaries();
     defer std.testing.allocator.free(sums);
     var st = testState(sums);
-    defer if (intercept.isEnabled()) intercept.toggle();
+    defer {
+        if (intercept.isEnabled()) intercept.toggle();
+        intercept.setPattern("");
+    }
 
     _ = handleKey(&st, pk('i'));
     try std.testing.expect(st.intercept_mode);
