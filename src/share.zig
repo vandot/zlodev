@@ -2,12 +2,13 @@ const std = @import("std");
 const rt = @import("rt.zig");
 const testing = std.testing;
 
-pub const Status = enum(u8) { off, starting, ready, failed, exited };
+pub const Status = enum(u8) { off, starting, verifying, ready, failed, exited };
 
 pub const max_host_len = 128;
 pub const max_reason_len = 192;
 
 const start_timeout_ms: i64 = 30_000;
+const verify_timeout_ms: i64 = 60_000;
 const tunnel_suffix = ".trycloudflare.com";
 
 pub const Snapshot = struct {
@@ -35,6 +36,9 @@ var state: Snapshot = .{
     .reason_len = 0,
 };
 var start_ms: i64 = 0;
+var verify_start_ms: i64 = 0;
+// cloudflared reported a registered tunnel connection.
+var connected = std.atomic.Value(bool).init(false);
 // Set (release) once host bytes are final; they are never written again until
 // begin/resetForTest, so readers that acquire-load it may read them without the mutex.
 var host_published = std.atomic.Value(bool).init(false);
@@ -53,10 +57,16 @@ pub fn begin(now_ms: i64) void {
     state.reason_len = 0;
     start_ms = now_ms;
     host_published.store(false, .release);
+    connected.store(false, .release);
 }
 
-/// Returns true when the host took effect (first host wins).
+/// Returns true when the host took effect (first host wins). Moves to `verifying`;
+/// the URL is shown only after `markVerified`.
 pub fn publishHost(host: []const u8) bool {
+    return publishHostAt(host, rt.milliTimestamp());
+}
+
+fn publishHostAt(host: []const u8, now_ms: i64) bool {
     if (host.len == 0 or host.len > max_host_len) return false;
     mutex.lockUncancelable(rt.io());
     defer mutex.unlock(rt.io());
@@ -65,9 +75,29 @@ pub fn publishHost(host: []const u8) bool {
     @memcpy(state.host[0..host.len], host);
     state.host_len = @intCast(host.len);
     state.reason_len = 0;
-    state.status = .ready;
+    state.status = .verifying;
+    verify_start_ms = now_ms;
     host_published.store(true, .release);
     return true;
+}
+
+/// The URL passed the end-to-end check. True when this moved the state to ready.
+pub fn markVerified() bool {
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
+    if (state.status != .verifying and state.status != .failed) return false;
+    if (!host_published.load(.monotonic)) return false;
+    state.status = .ready;
+    state.reason_len = 0;
+    return true;
+}
+
+pub fn markConnected() void {
+    connected.store(true, .release);
+}
+
+pub fn isConnected() bool {
+    return connected.load(.acquire);
 }
 
 pub fn fail(reason: []const u8) void {
@@ -90,8 +120,17 @@ pub fn markExited(code: i64) void {
 pub fn checkTimeout(now_ms: i64) void {
     mutex.lockUncancelable(rt.io());
     const timed_out = state.status == .starting and now_ms - start_ms >= start_timeout_ms;
+    const verify_timed_out = state.status == .verifying and now_ms - verify_start_ms >= verify_timeout_ms;
+    var host_buf: [max_host_len]u8 = undefined;
+    const host_len = state.host_len;
+    @memcpy(host_buf[0..host_len], state.host[0..host_len]);
     mutex.unlock(rt.io());
     if (timed_out) fail("no URL from cloudflared after 30s \u{2014} see zlodev.log");
+    if (verify_timed_out) {
+        var buf: [max_reason_len]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Cloudflare hasn't routed https://{s} yet after 60s \u{2014} see zlodev.log", .{host_buf[0..host_len]}) catch "Cloudflare hasn't routed the URL yet after 60s \u{2014} see zlodev.log";
+        fail(msg);
+    }
 }
 
 pub fn snapshot() Snapshot {
@@ -117,7 +156,9 @@ pub fn resetForTest() void {
     state.host_len = 0;
     state.reason_len = 0;
     start_ms = 0;
+    verify_start_ms = 0;
     host_published.store(false, .release);
+    connected.store(false, .release);
 }
 
 /// Strips an optional `:port` from `header_host` and compares case-insensitively.
@@ -201,7 +242,63 @@ test "state: timeout fails, late URL recovers" {
     checkTimeout(31_000);
     try testing.expectEqual(Status.failed, snapshot().status);
     try testing.expect(publishHost("a.trycloudflare.com"));
+    try testing.expectEqual(Status.verifying, snapshot().status);
+    try testing.expect(markVerified());
     try testing.expectEqual(Status.ready, snapshot().status);
+}
+test "state: publish moves to verifying" {
+    resetForTest();
+    begin(0);
+    try testing.expect(publishHost("a.trycloudflare.com"));
+    const s = snapshot();
+    try testing.expectEqual(Status.verifying, s.status);
+    try testing.expectEqualStrings("a.trycloudflare.com", s.getHost());
+}
+test "state: markVerified moves to ready" {
+    resetForTest();
+    begin(0);
+    try testing.expect(!markVerified());
+    try testing.expect(publishHost("a.trycloudflare.com"));
+    try testing.expect(isPublicHost("a.trycloudflare.com"));
+    try testing.expect(markVerified());
+    try testing.expectEqual(Status.ready, snapshot().status);
+    try testing.expect(isPublicHost("a.trycloudflare.com"));
+    try testing.expect(!markVerified());
+}
+test "state: verify timeout fails with the URL in the reason" {
+    resetForTest();
+    begin(0);
+    try testing.expect(publishHostAt("a.trycloudflare.com", 5000));
+    checkTimeout(64_999);
+    try testing.expectEqual(Status.verifying, snapshot().status);
+    checkTimeout(65_000);
+    const s = snapshot();
+    try testing.expectEqual(Status.failed, s.status);
+    try testing.expectEqualStrings("Cloudflare hasn't routed https://a.trycloudflare.com yet after 60s \u{2014} see zlodev.log", s.getReason());
+    try testing.expectEqualStrings("a.trycloudflare.com", s.getHost());
+    try testing.expect(isPublicHost("a.trycloudflare.com"));
+}
+test "state: late verify recovers" {
+    resetForTest();
+    begin(0);
+    try testing.expect(publishHostAt("a.trycloudflare.com", 0));
+    checkTimeout(60_000);
+    try testing.expectEqual(Status.failed, snapshot().status);
+    try testing.expect(markVerified());
+    const s = snapshot();
+    try testing.expectEqual(Status.ready, s.status);
+    try testing.expectEqual(@as(usize, 0), s.getReason().len);
+}
+test "state: connected flag" {
+    resetForTest();
+    try testing.expect(!isConnected());
+    markConnected();
+    try testing.expect(isConnected());
+    begin(0);
+    try testing.expect(!isConnected());
+    markConnected();
+    resetForTest();
+    try testing.expect(!isConnected());
 }
 test "state: exit reports code" {
     resetForTest();

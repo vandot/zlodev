@@ -992,6 +992,7 @@ fn drawShareRows(win: vaxis.Window, start_row: u16, routes: []const proxy.Route)
     printAt(win, 2, row, "SHARE", .{ .fg = dim });
     switch (snap.status) {
         .starting => printAt(win, 11, row, "starting…", .{ .fg = dim }),
+        .verifying => printAt(win, 11, row, "starting… waiting for Cloudflare", .{ .fg = dim }),
         .ready => {
             var url_buf: [share.max_host_len + 8]u8 = undefined;
             const url = std.fmt.bufPrint(&url_buf, "https://{s}", .{snap.getHost()}) catch "";
@@ -1002,7 +1003,7 @@ fn drawShareRows(win: vaxis.Window, start_row: u16, routes: []const proxy.Route)
     }
     row += 1;
 
-    if (snap.status == .starting or snap.status == .ready) {
+    if (snap.status == .starting or snap.status == .verifying or snap.status == .ready) {
         for (routes) |route| {
             const h = route.hostname orelse continue;
             if (route.kind != .path) continue;
@@ -2101,11 +2102,24 @@ test "tui: SHARE row shows starting" {
     try std.testing.expect(ts.hasText("starting"));
 }
 
+test "tui: SHARE row shows waiting for Cloudflare" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    var ts = try TestScreen.init(160, 24);
+    defer ts.deinit();
+    _ = testHeader(ts.window(), null, null, &.{});
+    try std.testing.expect(ts.hasText("starting… waiting for Cloudflare"));
+    try std.testing.expect(!ts.hasText("a-b.trycloudflare.com"));
+}
+
 test "tui: SHARE row shows the URL when ready" {
     share.resetForTest();
     defer share.resetForTest();
     share.begin(0);
     _ = share.publishHost("a-b.trycloudflare.com");
+    _ = share.markVerified();
     var ts = try TestScreen.init(160, 24);
     defer ts.deinit();
     _ = testHeader(ts.window(), null, null, &.{});
@@ -2421,6 +2435,19 @@ test "tui: u before the URL says not ready" {
     try std.testing.expectEqual(@as(usize, 0), KeyRec.copy_calls);
 }
 
+test "tui: u while verifying says not ready" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("Share not ready", st.flash_buf[0..st.flash_len]);
+    try std.testing.expectEqual(@as(usize, 0), KeyRec.copy_calls);
+}
+
 test "tui: u copies the share URL" {
     const sums = try testSummaries();
     defer std.testing.allocator.free(sums);
@@ -2429,6 +2456,7 @@ test "tui: u copies the share URL" {
     defer share.resetForTest();
     share.begin(0);
     _ = share.publishHost("a-b.trycloudflare.com");
+    _ = share.markVerified();
     _ = handleKey(&st, pk('u'));
     try std.testing.expectEqualStrings("https://a-b.trycloudflare.com", KeyRec.copied());
     try std.testing.expectEqualStrings("Copied share URL!", st.flash_buf[0..st.flash_len]);
@@ -2443,6 +2471,7 @@ test "tui: u reports a missing clipboard tool" {
     defer share.resetForTest();
     share.begin(0);
     _ = share.publishHost("a-b.trycloudflare.com");
+    _ = share.markVerified();
     KeyRec.copy_result = false;
     _ = handleKey(&st, pk('u'));
     try std.testing.expectEqualStrings("Clipboard unavailable", st.flash_buf[0..st.flash_len]);
@@ -2456,6 +2485,7 @@ test "tui: u in detail view copies the share URL" {
     defer share.resetForTest();
     share.begin(0);
     _ = share.publishHost("a-b.trycloudflare.com");
+    _ = share.markVerified();
     st.view = .detail;
     _ = handleKey(&st, pk('u'));
     try std.testing.expectEqualStrings("https://a-b.trycloudflare.com", KeyRec.copied());

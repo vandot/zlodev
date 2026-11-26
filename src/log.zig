@@ -59,20 +59,34 @@ pub fn info(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("[{s}] INFO " ++ fmt ++ "\n", .{ts} ++ args);
 }
 
-pub fn err(comptime fmt: []const u8, args: anytype) void {
+/// INFO that must survive TUI mode: written to the log file when muted, stderr otherwise.
+pub fn note(comptime fmt: []const u8, args: anytype) void {
+    if (muted.load(.acquire)) {
+        writeFileLine("INFO", fmt, args);
+    } else {
+        info(fmt, args);
+    }
+}
+
+fn writeFileLine(comptime level: []const u8, comptime fmt: []const u8, args: anytype) void {
     var buf: [21]u8 = undefined;
     const ts = timestamp(&buf);
+    const f = log_file orelse return;
+    var line_buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "[{s}] " ++ level ++ " " ++ fmt ++ "\n", .{ts} ++ args) catch return;
+    log_mutex.lockUncancelable(rt.io());
+    defer log_mutex.unlock(rt.io());
+    f.writePositionalAll(rt.io(), line, log_offset) catch return;
+    log_offset += line.len;
+}
+
+pub fn err(comptime fmt: []const u8, args: anytype) void {
     if (muted.load(.acquire)) {
         // Write to log file when TUI is active
-        if (log_file) |f| {
-            var line_buf: [4096]u8 = undefined;
-            const line = std.fmt.bufPrint(&line_buf, "[{s}] ERROR " ++ fmt ++ "\n", .{ts} ++ args) catch return;
-            log_mutex.lockUncancelable(rt.io());
-            defer log_mutex.unlock(rt.io());
-            f.writePositionalAll(rt.io(), line, log_offset) catch return;
-            log_offset += line.len;
-        }
+        writeFileLine("ERROR", fmt, args);
     } else {
+        var buf: [21]u8 = undefined;
+        const ts = timestamp(&buf);
         std.debug.print("[{s}] ERROR " ++ fmt ++ "\n", .{ts} ++ args);
     }
 }
@@ -139,4 +153,18 @@ test "timestamp ends in Z" {
     const ts = timestamp(&buf);
     try testing.expectEqual(@as(usize, 20), ts.len);
     try testing.expectEqual(@as(u8, 'Z'), ts[ts.len - 1]);
+}
+
+test "note writes an INFO line to the log file when muted" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    log_file = openLogIn(try tmpPath(&buf, &tmp, ""), 1024 * 1024) orelse return error.TestUnexpectedResult;
+    defer deinitLogFile();
+    mute();
+    defer unmute();
+    note("component=x op=y n={d}", .{7});
+    const data = try tmp.dir.readFileAlloc(rt.io(), "zlodev.log", testing.allocator, .limited(1024));
+    defer testing.allocator.free(data);
+    try testing.expect(std.mem.indexOf(u8, data, "] INFO component=x op=y n=7\n") != null);
 }
