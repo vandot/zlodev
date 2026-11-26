@@ -2213,3 +2213,368 @@ test "tui: help lists share and curl keys" {
         try std.testing.expect(ts.hasText("copy as curl"));
     }
 }
+
+// ---------------------------------------------------------------- key tests
+
+const KeyRec = struct {
+    var copy_calls: usize = 0;
+    var copied_buf: [256]u8 = undefined;
+    var copied_len: usize = 0;
+    var copy_result: bool = true;
+    var curl_calls: usize = 0;
+    var curl_index: usize = 0;
+
+    fn reset() void {
+        copy_calls = 0;
+        copied_len = 0;
+        copy_result = true;
+        curl_calls = 0;
+        curl_index = 0;
+    }
+
+    fn copyText(text: []const u8) bool {
+        copy_calls += 1;
+        copied_len = @min(text.len, copied_buf.len);
+        @memcpy(copied_buf[0..copied_len], text[0..copied_len]);
+        return copy_result;
+    }
+
+    fn copied() []const u8 {
+        return copied_buf[0..copied_len];
+    }
+
+    fn copyAsCurl(_: std.mem.Allocator, logical: usize, _: []const u8) clipboard.CopyResult {
+        curl_calls += 1;
+        curl_index = logical;
+        return .copied;
+    }
+
+    fn exportHar(_: []const u8, _: []const u8, _: bool, _: *[64]u8) ?usize {
+        return null;
+    }
+
+    fn replay(_: usize) bool {
+        return true;
+    }
+
+    fn restart() void {}
+};
+
+/// State wired to the recorder effects. Caller owns `summaries`
+/// (`requests.max_entries` long, heap: ~300 KB).
+fn testState(summaries: []requests.Summary) TuiState {
+    KeyRec.reset();
+    return .{
+        .alloc = std.testing.allocator,
+        .domain = "dev.lo",
+        .version = "test",
+        .routes = &.{},
+        .has_command = false,
+        .logs_visible = false,
+        .summaries = summaries,
+        .effects = .{
+            .copyText = KeyRec.copyText,
+            .copyAsCurl = KeyRec.copyAsCurl,
+            .exportHar = KeyRec.exportHar,
+            .replay = KeyRec.replay,
+            .restartSubprocess = KeyRec.restart,
+        },
+    };
+}
+
+/// A printable key as vaxis builds it: codepoint plus text.
+fn pk(comptime cp: u8) vaxis.Key {
+    return .{ .codepoint = cp, .text = &[_]u8{cp} };
+}
+
+fn nk(cp: u21) vaxis.Key {
+    return .{ .codepoint = cp };
+}
+
+fn testSummaries() ![]requests.Summary {
+    return std.testing.allocator.alloc(requests.Summary, requests.max_entries);
+}
+
+fn pushPath(path: []const u8) void {
+    var e: requests.Entry = .{};
+    @memcpy(e.method[0..3], "GET");
+    e.method_len = 3;
+    @memcpy(e.path[0..path.len], path);
+    e.path_len = @intCast(path.len);
+    e.status = 200;
+    requests.push(e);
+}
+
+test "tui: q quits from the list" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    try std.testing.expectEqual(KeyResult.quit, handleKey(&st, pk('q')));
+    try std.testing.expectEqual(KeyResult.none, handleKey(&st, pk('x')));
+}
+
+test "tui: help toggles with ? and closes with Escape" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    _ = handleKey(&st, pk('?'));
+    try std.testing.expect(st.show_help);
+    _ = handleKey(&st, pk('?'));
+    try std.testing.expect(!st.show_help);
+    _ = handleKey(&st, pk('?'));
+    _ = handleKey(&st, nk(vaxis.Key.escape));
+    try std.testing.expect(!st.show_help);
+}
+
+test "tui: search typing, backspace, escape and enter" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    _ = handleKey(&st, pk('/'));
+    try std.testing.expect(st.search_mode);
+    _ = handleKey(&st, pk('a'));
+    _ = handleKey(&st, pk('b'));
+    try std.testing.expectEqualStrings("ab", st.search_buf[0..st.search_len]);
+    _ = handleKey(&st, nk(vaxis.Key.backspace));
+    try std.testing.expectEqual(@as(usize, 1), st.search_len);
+    _ = handleKey(&st, nk(vaxis.Key.enter));
+    try std.testing.expect(!st.search_mode);
+    try std.testing.expectEqual(@as(usize, 1), st.search_len);
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+
+    _ = handleKey(&st, pk('/'));
+    _ = handleKey(&st, pk('x'));
+    _ = handleKey(&st, nk(vaxis.Key.escape));
+    try std.testing.expect(!st.search_mode);
+    try std.testing.expectEqual(@as(usize, 0), st.search_len);
+}
+
+test "tui: search input stops at buffer size" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    _ = handleKey(&st, pk('/'));
+    for (0..130) |_| _ = handleKey(&st, pk('a'));
+    try std.testing.expectEqual(@as(usize, 128), st.search_len);
+}
+
+test "tui: intercept prompt enables the pattern on Enter" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    defer if (intercept.isEnabled()) intercept.toggle();
+
+    _ = handleKey(&st, pk('i'));
+    try std.testing.expect(st.intercept_mode);
+    _ = handleKey(&st, pk('/'));
+    _ = handleKey(&st, pk('a'));
+    _ = handleKey(&st, pk('p'));
+    _ = handleKey(&st, pk('i'));
+    _ = handleKey(&st, nk(vaxis.Key.enter));
+    try std.testing.expect(!st.intercept_mode);
+    try std.testing.expect(intercept.isEnabled());
+    var pbuf: [intercept.max_pattern_len]u8 = undefined;
+    try std.testing.expectEqualStrings("/api", intercept.getPattern(&pbuf));
+    intercept.toggle();
+
+    _ = handleKey(&st, pk('i'));
+    _ = handleKey(&st, pk('x'));
+    _ = handleKey(&st, nk(vaxis.Key.escape));
+    try std.testing.expect(!st.intercept_mode);
+    try std.testing.expect(!intercept.isEnabled());
+}
+
+test "tui: u with share off leaves the flash alone" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    @memcpy(st.flash_buf[0..5], "hello");
+    st.flash_len = 5;
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("hello", st.flash_buf[0..st.flash_len]);
+    try std.testing.expectEqual(@as(usize, 0), KeyRec.copy_calls);
+}
+
+test "tui: u before the URL says not ready" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("Share not ready", st.flash_buf[0..st.flash_len]);
+    try std.testing.expect(st.flash_time != 0);
+    try std.testing.expectEqual(@as(usize, 0), KeyRec.copy_calls);
+}
+
+test "tui: u copies the share URL" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("https://a-b.trycloudflare.com", KeyRec.copied());
+    try std.testing.expectEqualStrings("Copied share URL!", st.flash_buf[0..st.flash_len]);
+    try std.testing.expect(st.flash_time != 0);
+}
+
+test "tui: u reports a missing clipboard tool" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    KeyRec.copy_result = false;
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("Clipboard unavailable", st.flash_buf[0..st.flash_len]);
+}
+
+test "tui: u in detail view copies the share URL" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    st.view = .detail;
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("https://a-b.trycloudflare.com", KeyRec.copied());
+    try std.testing.expectEqualStrings("Copied share URL!", st.flash_buf[0..st.flash_len]);
+}
+
+test "tui: c copies the selected entry as curl" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    requests.clearAll();
+    defer requests.clearAll();
+    pushPath("/one");
+    pushPath("/two");
+    refreshFrame(&st);
+    st.cursor = 1;
+    _ = handleKey(&st, pk('c'));
+    try std.testing.expectEqual(@as(usize, 1), KeyRec.curl_calls);
+    try std.testing.expectEqual(search.selectedIndex(&st.filter_map, st.filtered_count, 1).?, KeyRec.curl_index);
+    try std.testing.expectEqualStrings("Copied as curl!", st.flash_buf[0..st.flash_len]);
+}
+
+test "tui: star toggles on the selected entry" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    requests.clearAll();
+    defer requests.clearAll();
+    pushPath("/one");
+    refreshFrame(&st);
+    _ = handleKey(&st, pk('*'));
+    refreshFrame(&st);
+    try std.testing.expect(st.summaries[0].starred);
+    _ = handleKey(&st, pk('*'));
+    refreshFrame(&st);
+    try std.testing.expect(!st.summaries[0].starred);
+}
+
+test "tui: l and Tab only act with a dev server" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    _ = handleKey(&st, pk('l'));
+    try std.testing.expect(!st.logs_visible);
+
+    st.has_command = true;
+    _ = handleKey(&st, pk('l'));
+    try std.testing.expect(st.logs_visible);
+    _ = handleKey(&st, nk(vaxis.Key.tab));
+    try std.testing.expectEqual(Focus.logs, st.focus);
+    _ = handleKey(&st, nk(vaxis.Key.tab));
+    try std.testing.expectEqual(Focus.requests, st.focus);
+
+    st.view = .edit;
+    _ = handleKey(&st, nk(vaxis.Key.tab));
+    try std.testing.expectEqual(Focus.requests, st.focus);
+
+    st.view = .list;
+    st.focus = .logs;
+    _ = handleKey(&st, pk('l'));
+    try std.testing.expect(!st.logs_visible);
+    try std.testing.expectEqual(Focus.requests, st.focus);
+    _ = handleKey(&st, nk(vaxis.Key.tab));
+    try std.testing.expectEqual(Focus.requests, st.focus);
+}
+
+test "tui: j k g G move within the list" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    requests.clearAll();
+    defer requests.clearAll();
+    pushPath("/1");
+    pushPath("/2");
+    pushPath("/3");
+    refreshFrame(&st);
+    for (0..5) |_| _ = handleKey(&st, pk('j'));
+    refreshFrame(&st);
+    try std.testing.expectEqual(@as(usize, 2), st.cursor);
+    _ = handleKey(&st, pk('k'));
+    try std.testing.expectEqual(@as(usize, 1), st.cursor);
+    _ = handleKey(&st, pk('g'));
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+    _ = handleKey(&st, pk('G'));
+    try std.testing.expectEqual(@as(usize, 2), st.cursor);
+}
+
+test "tui: list keys on an empty list are harmless" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    requests.clearAll();
+    defer requests.clearAll();
+    refreshFrame(&st);
+    _ = handleKey(&st, pk('G'));
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+    _ = handleKey(&st, nk(vaxis.Key.enter));
+    try std.testing.expectEqual(View.list, st.view);
+    try std.testing.expectEqual(KeyResult.none, handleKey(&st, pk('a')));
+}
+
+test "tui: refreshFrame clamps cursor to the filtered list" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    requests.clearAll();
+    defer requests.clearAll();
+    pushPath("/1");
+    pushPath("/2");
+    pushPath("/3");
+    refreshFrame(&st);
+    st.cursor = 2;
+    requests.clearAll();
+    pushPath("/1");
+    refreshFrame(&st);
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+
+    @memcpy(st.search_buf[0..3], "zzz");
+    st.search_len = 3;
+    refreshFrame(&st);
+    try std.testing.expectEqual(@as(usize, 0), st.filtered_count);
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+}
+
+test "tui: keys ignored until accepting input" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    st.accepting_input = false;
+    try std.testing.expectEqual(KeyResult.none, handleKey(&st, pk('q')));
+    _ = handleKey(&st, pk('?'));
+    try std.testing.expect(!st.show_help);
+}
