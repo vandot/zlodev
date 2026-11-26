@@ -906,8 +906,8 @@
       </div>
       <div class="feature reveal">
         <div class="feature-icon">&lt;r&gt;</div>
-        <h3>Replay &amp; edit</h3>
-        <p>Re-send any captured request. Edit method, path, headers, and body before replaying.</p>
+        <h3>Replay, edit &amp; curl</h3>
+        <p>Re-send any captured request. Edit method, path, headers, and body before replaying, or copy it as a ready-to-run curl command with a single keystroke.</p>
       </div>
       <div class="feature reveal">
         <div class="feature-icon">{ }</div>
@@ -915,14 +915,14 @@
         <p>Export captured traffic as HTTP Archive files for sharing, analysis, or import into other tools. Cookies and auth headers are redacted by default.</p>
       </div>
       <div class="feature reveal">
-        <div class="feature-icon">curl</div>
-        <h3>Copy as curl</h3>
-        <p>Copy any request as a ready-to-run curl command with a single keystroke.</p>
-      </div>
-      <div class="feature reveal">
         <div class="feature-icon">ws</div>
         <h3>WebSocket passthrough</h3>
         <p><code>wss://dev.lo</code> upgrades are proxied to your dev server and follow your routes, so HMR and live reload just work over HTTPS. Upgrades show up in the TUI with status 101.</p>
+      </div>
+      <div class="feature reveal">
+        <div class="feature-icon">^</div>
+        <h3>Public share</h3>
+        <p><code>zlodev start --share</code> gives you a temporary public <code>https://&hellip;.trycloudflare.com</code> URL through a Cloudflare quick tunnel. No account needed, just <code>cloudflared</code> installed. Outside requests go through zlodev, so they show up in the TUI marked <code>^</code>, and redirects and login cookies keep working for the visitor. The URL changes on every run.</p>
       </div>
       <div class="feature reveal">
         <div class="feature-icon">502!</div>
@@ -1120,8 +1120,7 @@
       <div class="detail-card reveal">
         <h3>Headless mode</h3>
         <p>Run with <code>--no-tui</code> for script and CI usage. Logs go to stderr instead of the terminal UI.</p>
-      </div>
-      <div class="detail-card reveal">
+      </div>      <div class="detail-card reveal">
         <h3>Max body control</h3>
         <p>Request bodies are forwarded in full up to <code>--max-body</code> (default 10M, supports K, M, G suffixes); larger ones get <code>413</code>. Responses stream through at any size. The TUI shows the first 32 KB of each body.</p>
       </div>
@@ -1159,7 +1158,7 @@
           <tr><td>Single binary</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td></tr>
           <tr><td>Free &amp; open source</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td></tr>
           <tr><td>No account required</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td></tr>
-          <tr><td>Publicly accessible over internet</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td><td class="cmp-yes">&#10003;</td></tr>
+          <tr><td>Publicly accessible over internet</td><td class="cmp-yes">&#10003;</td><td class="cmp-no">&#10007;</td><td class="cmp-no">&#10007;</td><td class="cmp-yes">&#10003;</td></tr>
         </tbody>
       </table>
     </div>
