@@ -319,7 +319,8 @@ Anyone with the URL can reach your dev server. Limits of quick tunnels:
 - No server-sent events, at most 200 requests in flight, no uptime guarantee.
 - Not suited to webhooks or OAuth callbacks, which need a stable URL.
 - If zlodev is killed hard (`SIGKILL`) on macOS or Linux, cloudflared may keep running.
-- If no URL appears within 30 seconds the SHARE row shows a failure (the tunnel keeps running). If cloudflared exits, that is shown too; it is not restarted.
+- The URL is shown only once it works: zlodev waits for cloudflared to connect, then checks `https://<url>/.zlodev/health` through Cloudflare (looking the name up at 1.1.1.1, so an early miss never lands in your system's DNS cache). Until then the SHARE row says `starting… waiting for Cloudflare`. This usually takes a few seconds.
+- If no URL appears within 30 seconds, or the URL isn't reachable within 60 seconds of appearing, the SHARE row shows a failure; zlodev keeps the tunnel and keeps checking, and shows the URL if it starts working. If cloudflared exits, that is shown too; it is not restarted. cloudflared's output and the check results are in `zlodev.log`.
 
 Requests on the public host reach your app with `Host: dev.lo`, the public host in `X-Forwarded-Host`, `X-Forwarded-Proto: https`, and `X-Real-IP` taken from `CF-Connecting-IP`. In responses, `Location` and `Content-Location` pointing at `dev.lo` are rewritten to the public host, and `Set-Cookie` `Domain=dev.lo` is dropped. Absolute URLs your app builds itself come from its base URL setting, so set that to the public URL if you need it.
 
