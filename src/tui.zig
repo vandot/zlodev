@@ -23,6 +23,8 @@ pub const panic = vaxis.panic_handler;
 
 const View = enum { list, detail, edit };
 
+const Focus = enum { requests, logs };
+
 const EditField = enum(u8) { method = 0, path = 1, headers = 2, body = 3 };
 
 const CommitOutcome = enum { accepted, replayed, failed };
@@ -375,6 +377,426 @@ const EditState = struct {
     }
 };
 
+/// Side effects reached from key handling that leave the process
+/// (clipboard, files, network, child process). Tests swap them for fakes.
+const Effects = struct {
+    copyText: *const fn ([]const u8) bool = clipboard.copyText,
+    copyAsCurl: *const fn (std.mem.Allocator, usize, []const u8) clipboard.CopyResult = clipboard.copyAsCurl,
+    exportHar: *const fn ([]const u8, []const u8, bool, *[64]u8) ?usize = har.exportHar,
+    replay: *const fn (usize) bool = replayEntry,
+    restartSubprocess: *const fn () void = subprocess.restart,
+};
+
+/// Everything key handling and the per-frame refresh read or write.
+/// Large (filter_map, edit_state): lives on run()'s stack, always passed by pointer.
+const TuiState = struct {
+    alloc: std.mem.Allocator,
+    domain: []const u8,
+    version: []const u8,
+    routes: []const proxy.Route,
+    has_command: bool,
+    effects: Effects = .{},
+
+    cursor: usize = 0,
+    scroll_offset: usize = 0,
+    req_autoscroll: bool = true,
+    logs_visible: bool,
+    focus: Focus = .requests,
+    logs_scroll: usize = 0,
+    logs_autoscroll: bool = true,
+    view: View = .list,
+    detail_scroll: usize = 0,
+    detail_index: usize = 0,
+    show_help: bool = false,
+    show_body: bool = false,
+    edit_state: EditState = .{},
+    search_mode: bool = false,
+    search_buf: [128]u8 = @splat(0),
+    search_len: usize = 0,
+    intercept_mode: bool = false,
+    intercept_buf: [intercept.max_pattern_len]u8 = @splat(0),
+    intercept_len: usize = 0,
+    flash_buf: [128]u8 = undefined,
+    flash_len: usize = 0,
+    flash_time: i64 = 0, // timestamp when flash message was set
+    har_fname_buf: [64]u8 = undefined,
+    // On Windows, discard key events until after the first render — terminal
+    // init can produce spurious events from escape sequence responses.
+    accepting_input: bool = (builtin.os.tag != .windows),
+
+    summaries: []requests.Summary,
+    summary_count: usize = 0,
+    // Maps filtered index -> index in summaries (= logical index)
+    filter_map: [requests.max_entries]usize = undefined,
+    filtered_count: usize = 0,
+};
+
+const KeyResult = enum { none, quit };
+
+/// Applies one key press to the TUI state. `.quit` means leave the TUI.
+fn handleKey(st: *TuiState, key: vaxis.Key) KeyResult {
+    if (!st.accepting_input) return .none;
+
+    // Search mode input handling
+    if (st.search_mode) {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            // Cancel search, clear filter
+            st.search_mode = false;
+            st.search_len = 0;
+            st.cursor = 0;
+            st.scroll_offset = 0;
+        } else if (key.matches(vaxis.Key.enter, .{})) {
+            // Confirm search, keep filter
+            st.search_mode = false;
+            st.cursor = 0;
+            st.scroll_offset = 0;
+        } else if (key.matches(vaxis.Key.backspace, .{})) {
+            st.search_len -|= 1;
+            st.cursor = 0;
+            st.scroll_offset = 0;
+        } else if (key.text) |text| {
+            if (st.search_len + text.len <= st.search_buf.len) {
+                @memcpy(st.search_buf[st.search_len .. st.search_len + text.len], text);
+                st.search_len += text.len;
+                st.cursor = 0;
+                st.scroll_offset = 0;
+            }
+        }
+        return .none;
+    }
+
+    // Intercept pattern input mode
+    if (st.intercept_mode) {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            st.intercept_mode = false;
+            st.intercept_len = 0;
+        } else if (key.matches(vaxis.Key.enter, .{})) {
+            st.intercept_mode = false;
+            intercept.enableWithPattern(st.intercept_buf[0..st.intercept_len]);
+        } else if (key.matches(vaxis.Key.backspace, .{})) {
+            st.intercept_len -|= 1;
+        } else if (key.text) |text| {
+            if (st.intercept_len + text.len <= st.intercept_buf.len) {
+                @memcpy(st.intercept_buf[st.intercept_len .. st.intercept_len + text.len], text);
+                st.intercept_len += text.len;
+            }
+        }
+        return .none;
+    }
+
+    if (key.matches('?', .{})) {
+        st.show_help = !st.show_help;
+        return .none;
+    }
+    if (st.show_help and key.matches(vaxis.Key.escape, .{})) {
+        st.show_help = false;
+        return .none;
+    }
+    if (key.matches('l', .{}) and st.has_command) {
+        st.logs_visible = !st.logs_visible;
+        if (!st.logs_visible) st.focus = .requests;
+        return .none;
+    }
+    if (key.matches(vaxis.Key.tab, .{}) and st.logs_visible and st.view != .edit) {
+        st.focus = if (st.focus == .requests) .logs else .requests;
+        return .none;
+    }
+
+    switch (st.view) {
+        .list => {
+            if (key.matches('q', .{})) return .quit;
+            if (key.matches('/', .{})) {
+                st.search_mode = true;
+                st.search_len = 0;
+                return .none;
+            }
+            if (key.matches('s', .{})) {
+                if (st.focus == .logs and st.logs_visible) {
+                    st.logs_autoscroll = !st.logs_autoscroll;
+                } else {
+                    st.req_autoscroll = !st.req_autoscroll;
+                }
+            }
+            if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+                if (st.focus == .logs and st.logs_visible) {
+                    st.logs_scroll +|= 1;
+                    st.logs_autoscroll = false;
+                } else {
+                    st.cursor +|= 1;
+                }
+            }
+            if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+                if (st.focus == .logs and st.logs_visible) {
+                    st.logs_scroll -|= 1;
+                    st.logs_autoscroll = false;
+                } else {
+                    st.cursor -|= 1;
+                }
+            }
+            if (key.matches('G', .{})) {
+                if (st.focus == .logs and st.logs_visible) {
+                    const total = subprocess.getLineCount();
+                    st.logs_scroll = total;
+                } else {
+                    st.cursor = st.filtered_count -| 1;
+                }
+            }
+            if (key.matches('g', .{})) {
+                if (st.focus == .logs and st.logs_visible) {
+                    st.logs_scroll = 0;
+                } else {
+                    st.cursor = 0;
+                }
+            }
+            if (key.matches(vaxis.Key.escape, .{})) {
+                // Clear filter
+                st.search_len = 0;
+                st.cursor = 0;
+                st.scroll_offset = 0;
+            }
+            if (key.matches(vaxis.Key.enter, .{})) {
+                // Map filtered cursor to real logical index
+                st.detail_index = search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none;
+                st.detail_scroll = 0;
+                st.view = .detail;
+            }
+            if (key.matches('i', .{})) {
+                if (intercept.isEnabled()) {
+                    intercept.toggle();
+                } else {
+                    st.intercept_mode = true;
+                    st.intercept_len = 0;
+                }
+            }
+            if (key.matches('a', .{}))
+                acceptEntry(search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none);
+            if (key.matches('A', .{}))
+                intercept.acceptAll();
+            if (key.matches('C', .{}))
+                requests.clearAll();
+            if (key.matches('*', .{})) {
+                const bi = requests.logicalToBackingIndex(search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none) orelse return .none;
+                requests.toggleStar(bi);
+            }
+            if (key.matches('d', .{}))
+                dropOrDeleteEntry(search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none);
+            if (key.matches('c', .{})) {
+                const sel = search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none;
+                const msg: []const u8 = switch (st.effects.copyAsCurl(st.alloc, sel, st.domain)) {
+                    .copied => "Copied as curl!",
+                    .truncated => "Request too large to copy: captured copy is truncated",
+                    .missing => "",
+                };
+                @memcpy(st.flash_buf[0..msg.len], msg);
+                st.flash_len = msg.len;
+                st.flash_time = rt.milliTimestamp();
+            }
+            if (key.matches('u', .{})) {
+                const msg = shareCopyFlash(&st.effects);
+                if (msg.len > 0) {
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+            }
+            if (key.matches('E', .{}) or key.matches('e', .{ .ctrl = true })) {
+                const redact = key.matches('E', .{});
+                if (st.effects.exportHar(st.version, st.domain, redact, &st.har_fname_buf)) |fname_len| {
+                    const note = if (redact) " (cookies and auth redacted; Ctrl+E for full)" else " (full, includes cookies and auth)";
+                    const flash = std.fmt.bufPrint(&st.flash_buf, "Exported {s}{s}", .{ st.har_fname_buf[0..fname_len], note }) catch st.flash_buf[0..0];
+                    st.flash_len = flash.len;
+                } else {
+                    const msg = "Export failed";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                }
+                st.flash_time = rt.milliTimestamp();
+            }
+            if (key.matches('r', .{})) {
+                const sel = search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none;
+                if (st.edit_state.openForReplay(st.alloc, sel)) {
+                    st.view = .edit;
+                } else if (sel < st.summary_count and st.summaries[sel].request_truncated) {
+                    const msg = "Request too large to replay: captured copy is truncated";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+            }
+            if (key.matches('R', .{})) {
+                if (st.focus == .logs and st.logs_visible and st.has_command) {
+                    st.effects.restartSubprocess();
+                    const msg = "Restarting...";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                } else if (search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor)) |sel| {
+                    const msg: []const u8 = if (st.effects.replay(sel)) "Replayed!" else "Request too large to replay: captured copy is truncated";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+            }
+            if (key.matches('e', .{})) {
+                if (st.edit_state.open(st.alloc, search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none)) st.view = .edit;
+            }
+        },
+        .detail => {
+            if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
+                st.view = .list;
+            } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+                st.detail_scroll +|= 1;
+            } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+                st.detail_scroll -|= 1;
+            } else if (key.matches('n', .{}) or key.matches(vaxis.Key.right, .{})) {
+                st.cursor +|= 1;
+                st.detail_scroll = 0;
+            } else if (key.matches('p', .{}) or key.matches(vaxis.Key.left, .{})) {
+                st.cursor -|= 1;
+                st.detail_scroll = 0;
+            } else if (key.matches('G', .{})) {
+                st.detail_scroll = std.math.maxInt(usize);
+            } else if (key.matches('g', .{})) {
+                st.detail_scroll = 0;
+            } else if (key.matches('s', .{})) {
+                st.req_autoscroll = !st.req_autoscroll;
+            } else if (key.matches('i', .{})) {
+                if (intercept.isEnabled()) {
+                    intercept.toggle();
+                } else {
+                    st.intercept_mode = true;
+                    st.intercept_len = 0;
+                }
+            } else if (key.matches('*', .{})) {
+                const bi = requests.logicalToBackingIndex(st.detail_index) orelse return .none;
+                requests.toggleStar(bi);
+            } else if (key.matches('a', .{})) {
+                acceptEntry(st.detail_index);
+            } else if (key.matches('d', .{})) {
+                dropOrDeleteEntry(st.detail_index);
+            } else if (key.matches('c', .{})) {
+                const msg: []const u8 = switch (st.effects.copyAsCurl(st.alloc, st.detail_index, st.domain)) {
+                    .copied => "Copied as curl!",
+                    .truncated => "Request too large to copy: captured copy is truncated",
+                    .missing => "",
+                };
+                @memcpy(st.flash_buf[0..msg.len], msg);
+                st.flash_len = msg.len;
+                st.flash_time = rt.milliTimestamp();
+            } else if (key.matches('u', .{})) {
+                const msg = shareCopyFlash(&st.effects);
+                if (msg.len > 0) {
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+            } else if (key.matches('r', .{})) {
+                if (st.edit_state.openForReplay(st.alloc, st.detail_index)) {
+                    st.view = .edit;
+                } else if (st.detail_index < st.summary_count and st.summaries[st.detail_index].request_truncated) {
+                    const msg = "Request too large to replay: captured copy is truncated";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+            } else if (key.matches('R', .{})) {
+                const msg: []const u8 = if (st.effects.replay(st.detail_index)) "Replayed!" else "Request too large to replay: captured copy is truncated";
+                @memcpy(st.flash_buf[0..msg.len], msg);
+                st.flash_len = msg.len;
+                st.flash_time = rt.milliTimestamp();
+            } else if (key.matches('b', .{})) {
+                st.show_body = !st.show_body;
+                st.detail_scroll = 0;
+            } else if (key.matches('e', .{})) {
+                if (st.edit_state.open(st.alloc, st.detail_index)) st.view = .edit;
+            }
+        },
+        .edit => {
+            if (key.matches(vaxis.Key.escape, .{})) {
+                // Cancel edit
+                st.edit_state.active = false;
+                st.view = .list;
+            } else if (key.matches('s', .{ .ctrl = true })) {
+                if (st.edit_state.commit(st.alloc) == .replayed) {
+                    const msg = "Replayed!";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+                st.edit_state.active = false;
+                st.view = .list;
+            } else if (key.matches(vaxis.Key.tab, .{})) {
+                st.edit_state.nextField();
+            } else if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
+                st.edit_state.prevField();
+            } else if (key.matches(vaxis.Key.left, .{})) {
+                st.edit_state.cursor -|= 1;
+            } else if (key.matches(vaxis.Key.right, .{})) {
+                if (st.edit_state.cursor < st.edit_state.activeLen())
+                    st.edit_state.cursor += 1;
+            } else if (key.matches(vaxis.Key.home, .{})) {
+                st.edit_state.cursor = 0;
+            } else if (key.matches(vaxis.Key.end, .{})) {
+                st.edit_state.cursor = st.edit_state.activeLen();
+            } else if (key.matches(vaxis.Key.up, .{})) {
+                if (st.edit_state.isMultiline()) {
+                    st.edit_state.moveUp();
+                }
+            } else if (key.matches(vaxis.Key.down, .{})) {
+                if (st.edit_state.isMultiline()) {
+                    st.edit_state.moveDown();
+                }
+            } else if (key.matches(vaxis.Key.backspace, .{})) {
+                st.edit_state.deleteBack();
+            } else if (key.matches(vaxis.Key.delete, .{})) {
+                st.edit_state.deleteForward();
+            } else if (key.matches(vaxis.Key.enter, .{})) {
+                if (st.edit_state.isMultiline()) {
+                    st.edit_state.insertNewline();
+                } else {
+                    st.edit_state.nextField();
+                }
+            } else if (key.text) |text| {
+                for (text) |ch| {
+                    if (ch >= 32 and ch < 127) {
+                        st.edit_state.insertChar(ch);
+                    }
+                }
+            }
+        },
+    }
+    return .none;
+}
+
+/// Per-frame refresh: copies summaries from the ring, applies the search
+/// filter into filter_map, clamps the cursor to the filtered list.
+fn refreshFrame(st: *TuiState) void {
+    st.summary_count = requests.getSummaries(st.summaries);
+    const raw_count = st.summary_count;
+    const search_term = st.search_buf[0..st.search_len];
+    st.filtered_count = 0;
+    if (st.search_len > 0) {
+        for (0..raw_count) |i| {
+            if (search.entryMatchesSearch(&st.summaries[i], search_term)) {
+                st.filter_map[st.filtered_count] = i;
+                st.filtered_count += 1;
+            }
+        }
+    } else {
+        for (0..raw_count) |i| {
+            st.filter_map[i] = i;
+        }
+        st.filtered_count = raw_count;
+    }
+
+    // Clamp cursor to filtered list (key handlers read it through search.selectedIndex)
+    if (st.filtered_count > 0) {
+        if (st.cursor >= st.filtered_count) st.cursor = st.filtered_count - 1;
+    } else {
+        st.cursor = 0;
+    }
+}
+
 pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, routes: []const proxy.Route, has_command: bool, cert_warning: ?[]const u8, dns_warning: ?[]const u8, version: []const u8) !void {
     const proxy_text = try std.fmt.allocPrint(alloc, "https -> 127.0.0.1:{d}", .{target_port});
     defer alloc.free(proxy_text);
@@ -410,46 +832,18 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
         try vx.queryTerminal(tty.writer(), .fromSeconds(1));
     }
 
-    var cursor: usize = 0;
-    var scroll_offset: usize = 0;
-    var req_autoscroll: bool = true;
-    var logs_visible: bool = has_command;
-    _ = &logs_visible;
-    const Focus = enum { requests, logs };
-    var focus: Focus = .requests;
-    _ = &focus;
-    var logs_scroll: usize = 0;
-    _ = &logs_scroll;
-    var logs_autoscroll: bool = true;
-    _ = &logs_autoscroll;
+    var st: TuiState = .{
+        .alloc = alloc,
+        .domain = domain,
+        .version = version,
+        .routes = routes,
+        .has_command = has_command,
+        .logs_visible = has_command,
+        // Heap: [max_entries]Summary is ~300 KB, too big for a 1 MB main-thread stack.
+        .summaries = try std.heap.page_allocator.alloc(requests.Summary, requests.max_entries),
+    };
+    defer std.heap.page_allocator.free(st.summaries);
     var last_count: usize = 0;
-    var view: View = .list;
-    var detail_scroll: usize = 0;
-    var detail_index: usize = 0;
-    var show_help: bool = false;
-    // On Windows, discard key events until after the first render — terminal
-    // init can produce spurious events from escape sequence responses.
-    var accepting_input: bool = (builtin.os.tag != .windows);
-    var show_body: bool = false;
-    var edit_state: EditState = .{};
-    var search_mode: bool = false;
-    var search_buf: [128]u8 = @splat(0);
-    var search_len: usize = 0;
-    var intercept_mode: bool = false;
-    var intercept_buf: [intercept.max_pattern_len]u8 = @splat(0);
-    var intercept_len: usize = 0;
-    var filtered_count: usize = 0;
-    // Maps filtered index -> index in summaries (= logical index)
-    var filter_map: [requests.max_entries]usize = undefined;
-    var flash_time: i64 = 0; // timestamp when flash message was set
-    var flash_buf: [128]u8 = undefined;
-    var flash_len: usize = 0;
-    var har_fname_buf: [64]u8 = undefined;
-
-    // Heap: [max_entries]Summary is ~300 KB, too big for a 1 MB main-thread stack.
-    const summaries = try std.heap.page_allocator.alloc(requests.Summary, requests.max_entries);
-    defer std.heap.page_allocator.free(summaries);
-    var summary_count: usize = 0;
     const detail_entry = try std.heap.page_allocator.create(requests.Entry);
     defer std.heap.page_allocator.destroy(detail_entry);
 
@@ -459,336 +853,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
             switch (event) {
                 .key_press => |key| {
                     if (key.matches('c', .{ .ctrl = true })) return;
-                    if (!accepting_input) continue;
-
-                    // Search mode input handling
-                    if (search_mode) {
-                        if (key.matches(vaxis.Key.escape, .{})) {
-                            // Cancel search, clear filter
-                            search_mode = false;
-                            search_len = 0;
-                            cursor = 0;
-                            scroll_offset = 0;
-                        } else if (key.matches(vaxis.Key.enter, .{})) {
-                            // Confirm search, keep filter
-                            search_mode = false;
-                            cursor = 0;
-                            scroll_offset = 0;
-                        } else if (key.matches(vaxis.Key.backspace, .{})) {
-                            search_len -|= 1;
-                            cursor = 0;
-                            scroll_offset = 0;
-                        } else if (key.text) |text| {
-                            if (search_len + text.len <= search_buf.len) {
-                                @memcpy(search_buf[search_len .. search_len + text.len], text);
-                                search_len += text.len;
-                                cursor = 0;
-                                scroll_offset = 0;
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Intercept pattern input mode
-                    if (intercept_mode) {
-                        if (key.matches(vaxis.Key.escape, .{})) {
-                            intercept_mode = false;
-                            intercept_len = 0;
-                        } else if (key.matches(vaxis.Key.enter, .{})) {
-                            intercept_mode = false;
-                            intercept.enableWithPattern(intercept_buf[0..intercept_len]);
-                        } else if (key.matches(vaxis.Key.backspace, .{})) {
-                            intercept_len -|= 1;
-                        } else if (key.text) |text| {
-                            if (intercept_len + text.len <= intercept_buf.len) {
-                                @memcpy(intercept_buf[intercept_len .. intercept_len + text.len], text);
-                                intercept_len += text.len;
-                            }
-                        }
-                        continue;
-                    }
-
-                    if (key.matches('?', .{})) {
-                        show_help = !show_help;
-                        continue;
-                    }
-                    if (show_help and key.matches(vaxis.Key.escape, .{})) {
-                        show_help = false;
-                        continue;
-                    }
-                    if (key.matches('l', .{}) and has_command) {
-                        logs_visible = !logs_visible;
-                        if (!logs_visible) focus = .requests;
-                        continue;
-                    }
-                    if (key.matches(vaxis.Key.tab, .{}) and logs_visible and view != .edit) {
-                        focus = if (focus == .requests) .logs else .requests;
-                        continue;
-                    }
-
-                    switch (view) {
-                        .list => {
-                            if (key.matches('q', .{})) return;
-                            if (key.matches('/', .{})) {
-                                search_mode = true;
-                                search_len = 0;
-                                continue;
-                            }
-                            if (key.matches('s', .{})) {
-                                if (focus == .logs and logs_visible) {
-                                    logs_autoscroll = !logs_autoscroll;
-                                } else {
-                                    req_autoscroll = !req_autoscroll;
-                                }
-                            }
-                            if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                                if (focus == .logs and logs_visible) {
-                                    logs_scroll +|= 1;
-                                    logs_autoscroll = false;
-                                } else {
-                                    cursor +|= 1;
-                                }
-                            }
-                            if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                                if (focus == .logs and logs_visible) {
-                                    logs_scroll -|= 1;
-                                    logs_autoscroll = false;
-                                } else {
-                                    cursor -|= 1;
-                                }
-                            }
-                            if (key.matches('G', .{})) {
-                                if (focus == .logs and logs_visible) {
-                                    const total = subprocess.getLineCount();
-                                    logs_scroll = total;
-                                } else {
-                                    cursor = filtered_count -| 1;
-                                }
-                            }
-                            if (key.matches('g', .{})) {
-                                if (focus == .logs and logs_visible) {
-                                    logs_scroll = 0;
-                                } else {
-                                    cursor = 0;
-                                }
-                            }
-                            if (key.matches(vaxis.Key.escape, .{})) {
-                                // Clear filter
-                                search_len = 0;
-                                cursor = 0;
-                                scroll_offset = 0;
-                            }
-                            if (key.matches(vaxis.Key.enter, .{})) {
-                                // Map filtered cursor to real logical index
-                                detail_index = search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue;
-                                detail_scroll = 0;
-                                view = .detail;
-                            }
-                            if (key.matches('i', .{})) {
-                                if (intercept.isEnabled()) {
-                                    intercept.toggle();
-                                } else {
-                                    intercept_mode = true;
-                                    intercept_len = 0;
-                                }
-                            }
-                            if (key.matches('a', .{}))
-                                acceptEntry(search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue);
-                            if (key.matches('A', .{}))
-                                intercept.acceptAll();
-                            if (key.matches('C', .{}))
-                                requests.clearAll();
-                            if (key.matches('*', .{})) {
-                                const bi = requests.logicalToBackingIndex(search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue) orelse continue;
-                                requests.toggleStar(bi);
-                            }
-                            if (key.matches('d', .{}))
-                                dropOrDeleteEntry(search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue);
-                            if (key.matches('c', .{})) {
-                                const sel = search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue;
-                                const msg: []const u8 = switch (clipboard.copyAsCurl(alloc, sel, domain)) {
-                                    .copied => "Copied as curl!",
-                                    .truncated => "Request too large to copy: captured copy is truncated",
-                                    .missing => "",
-                                };
-                                @memcpy(flash_buf[0..msg.len], msg);
-                                flash_len = msg.len;
-                                flash_time = rt.milliTimestamp();
-                            }
-                            if (key.matches('u', .{})) {
-                                const msg = shareCopyFlash();
-                                if (msg.len > 0) {
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                            }
-                            if (key.matches('E', .{}) or key.matches('e', .{ .ctrl = true })) {
-                                const redact = key.matches('E', .{});
-                                if (har.exportHar(version, domain, redact, &har_fname_buf)) |fname_len| {
-                                    const note = if (redact) " (cookies and auth redacted; Ctrl+E for full)" else " (full, includes cookies and auth)";
-                                    const flash = std.fmt.bufPrint(&flash_buf, "Exported {s}{s}", .{ har_fname_buf[0..fname_len], note }) catch flash_buf[0..0];
-                                    flash_len = flash.len;
-                                } else {
-                                    const msg = "Export failed";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                }
-                                flash_time = rt.milliTimestamp();
-                            }
-                            if (key.matches('r', .{})) {
-                                const sel = search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue;
-                                if (edit_state.openForReplay(alloc, sel)) {
-                                    view = .edit;
-                                } else if (sel < summary_count and summaries[sel].request_truncated) {
-                                    const msg = "Request too large to replay: captured copy is truncated";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                            }
-                            if (key.matches('R', .{})) {
-                                if (focus == .logs and logs_visible and has_command) {
-                                    subprocess.restart();
-                                    const msg = "Restarting...";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                } else if (search.selectedIndex(&filter_map, filtered_count, cursor)) |sel| {
-                                    const msg: []const u8 = if (replayEntry(sel)) "Replayed!" else "Request too large to replay: captured copy is truncated";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                            }
-                            if (key.matches('e', .{})) {
-                                if (edit_state.open(alloc, search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue)) view = .edit;
-                            }
-                        },
-                        .detail => {
-                            if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
-                                view = .list;
-                            } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                                detail_scroll +|= 1;
-                            } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                                detail_scroll -|= 1;
-                            } else if (key.matches('n', .{}) or key.matches(vaxis.Key.right, .{})) {
-                                cursor +|= 1;
-                                detail_scroll = 0;
-                            } else if (key.matches('p', .{}) or key.matches(vaxis.Key.left, .{})) {
-                                cursor -|= 1;
-                                detail_scroll = 0;
-                            } else if (key.matches('G', .{})) {
-                                detail_scroll = std.math.maxInt(usize);
-                            } else if (key.matches('g', .{})) {
-                                detail_scroll = 0;
-                            } else if (key.matches('s', .{})) {
-                                req_autoscroll = !req_autoscroll;
-                            } else if (key.matches('i', .{})) {
-                                if (intercept.isEnabled()) {
-                                    intercept.toggle();
-                                } else {
-                                    intercept_mode = true;
-                                    intercept_len = 0;
-                                }
-                            } else if (key.matches('*', .{})) {
-                                const bi = requests.logicalToBackingIndex(detail_index) orelse continue;
-                                requests.toggleStar(bi);
-                            } else if (key.matches('a', .{})) {
-                                acceptEntry(detail_index);
-                            } else if (key.matches('d', .{})) {
-                                dropOrDeleteEntry(detail_index);
-                            } else if (key.matches('c', .{})) {
-                                const msg: []const u8 = switch (clipboard.copyAsCurl(alloc, detail_index, domain)) {
-                                    .copied => "Copied as curl!",
-                                    .truncated => "Request too large to copy: captured copy is truncated",
-                                    .missing => "",
-                                };
-                                @memcpy(flash_buf[0..msg.len], msg);
-                                flash_len = msg.len;
-                                flash_time = rt.milliTimestamp();
-                            } else if (key.matches('u', .{})) {
-                                const msg = shareCopyFlash();
-                                if (msg.len > 0) {
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                            } else if (key.matches('r', .{})) {
-                                if (edit_state.openForReplay(alloc, detail_index)) {
-                                    view = .edit;
-                                } else if (detail_index < summary_count and summaries[detail_index].request_truncated) {
-                                    const msg = "Request too large to replay: captured copy is truncated";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                            } else if (key.matches('R', .{})) {
-                                const msg: []const u8 = if (replayEntry(detail_index)) "Replayed!" else "Request too large to replay: captured copy is truncated";
-                                @memcpy(flash_buf[0..msg.len], msg);
-                                flash_len = msg.len;
-                                flash_time = rt.milliTimestamp();
-                            } else if (key.matches('b', .{})) {
-                                show_body = !show_body;
-                                detail_scroll = 0;
-                            } else if (key.matches('e', .{})) {
-                                if (edit_state.open(alloc, detail_index)) view = .edit;
-                            }
-                        },
-                        .edit => {
-                            if (key.matches(vaxis.Key.escape, .{})) {
-                                // Cancel edit
-                                edit_state.active = false;
-                                view = .list;
-                            } else if (key.matches('s', .{ .ctrl = true })) {
-                                if (edit_state.commit(alloc) == .replayed) {
-                                    const msg = "Replayed!";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                                edit_state.active = false;
-                                view = .list;
-                            } else if (key.matches(vaxis.Key.tab, .{})) {
-                                edit_state.nextField();
-                            } else if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
-                                edit_state.prevField();
-                            } else if (key.matches(vaxis.Key.left, .{})) {
-                                edit_state.cursor -|= 1;
-                            } else if (key.matches(vaxis.Key.right, .{})) {
-                                if (edit_state.cursor < edit_state.activeLen())
-                                    edit_state.cursor += 1;
-                            } else if (key.matches(vaxis.Key.home, .{})) {
-                                edit_state.cursor = 0;
-                            } else if (key.matches(vaxis.Key.end, .{})) {
-                                edit_state.cursor = edit_state.activeLen();
-                            } else if (key.matches(vaxis.Key.up, .{})) {
-                                if (edit_state.isMultiline()) {
-                                    edit_state.moveUp();
-                                }
-                            } else if (key.matches(vaxis.Key.down, .{})) {
-                                if (edit_state.isMultiline()) {
-                                    edit_state.moveDown();
-                                }
-                            } else if (key.matches(vaxis.Key.backspace, .{})) {
-                                edit_state.deleteBack();
-                            } else if (key.matches(vaxis.Key.delete, .{})) {
-                                edit_state.deleteForward();
-                            } else if (key.matches(vaxis.Key.enter, .{})) {
-                                if (edit_state.isMultiline()) {
-                                    edit_state.insertNewline();
-                                } else {
-                                    edit_state.nextField();
-                                }
-                            } else if (key.text) |text| {
-                                for (text) |ch| {
-                                    if (ch >= 32 and ch < 127) {
-                                        edit_state.insertChar(ch);
-                                    }
-                                }
-                            }
-                        },
-                    }
+                    if (handleKey(&st, key) == .quit) return;
                 },
                 .winsize => |ws| try vx.resize(alloc, tty.writer(), ws),
             }
@@ -799,48 +864,26 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
         const win = vx.window();
         win.clear();
 
-        // Build filter map (used by both views)
-        summary_count = requests.getSummaries(summaries);
-        const raw_count = summary_count;
-        const search_term = search_buf[0..search_len];
-        filtered_count = 0;
-        if (search_len > 0) {
-            for (0..raw_count) |i| {
-                if (search.entryMatchesSearch(&summaries[i], search_term)) {
-                    filter_map[filtered_count] = i;
-                    filtered_count += 1;
-                }
-            }
-        } else {
-            for (0..raw_count) |i| {
-                filter_map[i] = i;
-            }
-            filtered_count = raw_count;
-        }
+        refreshFrame(&st);
+        const raw_count = st.summary_count;
+        const search_term = st.search_buf[0..st.search_len];
 
-        // Clamp cursor to filtered list (key handlers read it through search.selectedIndex)
-        if (filtered_count > 0) {
-            if (cursor >= filtered_count) cursor = filtered_count - 1;
-        } else {
-            cursor = 0;
-        }
-
-        if (req_autoscroll and current_count > last_count and filtered_count > 0) {
-            cursor = filtered_count - 1;
-            if (view == .detail) detail_scroll = 0;
+        if (st.req_autoscroll and current_count > last_count and st.filtered_count > 0) {
+            st.cursor = st.filtered_count - 1;
+            if (st.view == .detail) st.detail_scroll = 0;
         }
         last_count = current_count;
 
         share.checkTimeout(rt.milliTimestamp());
 
-        switch (view) {
+        switch (st.view) {
             .list => {
-                const req_focused = !logs_visible or focus == .requests;
-                const header_rows = drawHeader(win, domain, proxy_text, ca_text, cert_warning, dns_warning, raw_count, req_autoscroll, routes, req_focused);
+                const req_focused = !st.logs_visible or st.focus == .requests;
+                const header_rows = drawHeader(win, domain, proxy_text, ca_text, cert_warning, dns_warning, raw_count, st.req_autoscroll, routes, req_focused);
                 const footer_h: u16 = 2; // footer + search/intercept bar
                 const body_h = if (win.height > header_rows + footer_h) win.height - header_rows - footer_h else 1;
 
-                if (logs_visible) {
+                if (st.logs_visible) {
                     // Split layout: 60% requests, 40% logs, 1 row for border between panes
                     const border_rows: u16 = 1;
                     const usable = if (body_h > border_rows) body_h - border_rows else 1;
@@ -857,85 +900,84 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                         .height = req_h,
                     });
                     // Adjust scroll to keep cursor visible within req_h
-                    if (cursor < scroll_offset) {
-                        scroll_offset = cursor;
-                    } else if (cursor >= scroll_offset + req_h) {
-                        scroll_offset = cursor - req_h + 1;
+                    if (st.cursor < st.scroll_offset) {
+                        st.scroll_offset = st.cursor;
+                    } else if (st.cursor >= st.scroll_offset + req_h) {
+                        st.scroll_offset = st.cursor - req_h + 1;
                     }
                     // Pass req_win with start_row=0 (drawing relative to the child window), draw_footer=false
-                    drawRequests(req_win, summaries[0..summary_count], &filter_map, filtered_count, 0, scroll_offset, cursor, req_autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len], false, has_command);
+                    drawRequests(req_win, st.summaries[0..st.summary_count], &st.filter_map, st.filtered_count, 0, st.scroll_offset, st.cursor, st.req_autoscroll, st.show_help, st.search_mode, search_term, st.intercept_mode, st.intercept_buf[0..st.intercept_len], false, has_command);
 
                     // Logs border + pane
                     const logs_border_y = req_start + req_h;
                     var label_buf: [32]u8 = undefined;
-                    const label = if (logs_autoscroll)
+                    const label = if (st.logs_autoscroll)
                         (std.fmt.bufPrint(&label_buf, " logs (autoscroll) ", .{}) catch " logs ")
                     else
                         " logs ";
-                    drawBorder(win, logs_border_y, label, focus == .logs);
-                    drawLogs(win, logs_border_y + 1, logs_h, logs_autoscroll, logs_scroll);
+                    drawBorder(win, logs_border_y, label, st.focus == .logs);
+                    drawLogs(win, logs_border_y + 1, logs_h, st.logs_autoscroll, st.logs_scroll);
 
                     // Draw footer in main window below logs pane
-                    if (intercept_mode)
-                        drawInterceptBar(win, intercept_buf[0..intercept_len])
-                    else if (search_mode or search_term.len > 0)
-                        drawSearchBar(win, search_mode, search_term)
+                    if (st.intercept_mode)
+                        drawInterceptBar(win, st.intercept_buf[0..st.intercept_len])
+                    else if (st.search_mode or search_term.len > 0)
+                        drawSearchBar(win, st.search_mode, search_term)
                     else
-                        drawFooter(win, req_autoscroll, show_help, has_command);
+                        drawFooter(win, st.req_autoscroll, st.show_help, has_command);
                 } else {
                     // Original single-pane layout (unchanged)
                     const available_rows = if (win.height > header_rows + 2) win.height - header_rows - 2 else 1;
-                    if (cursor < scroll_offset) {
-                        scroll_offset = cursor;
-                    } else if (cursor >= scroll_offset + available_rows) {
-                        scroll_offset = cursor - available_rows + 1;
+                    if (st.cursor < st.scroll_offset) {
+                        st.scroll_offset = st.cursor;
+                    } else if (st.cursor >= st.scroll_offset + available_rows) {
+                        st.scroll_offset = st.cursor - available_rows + 1;
                     }
-                    drawRequests(win, summaries[0..summary_count], &filter_map, filtered_count, header_rows, scroll_offset, cursor, req_autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len], true, has_command);
+                    drawRequests(win, st.summaries[0..st.summary_count], &st.filter_map, st.filtered_count, header_rows, st.scroll_offset, st.cursor, st.req_autoscroll, st.show_help, st.search_mode, search_term, st.intercept_mode, st.intercept_buf[0..st.intercept_len], true, has_command);
                 }
             },
             .detail => {
                 // Resolve filtered cursor to real logical index
-                if (filtered_count > 0) {
-                    detail_index = filter_map[cursor];
+                if (st.filtered_count > 0) {
+                    st.detail_index = st.filter_map[st.cursor];
                 }
-                const entry: ?*const requests.Entry = if (filtered_count > 0 and requests.copyEntry(detail_index, detail_entry)) detail_entry else null;
-                drawDetail(alloc, win, entry, detail_index, raw_count, req_autoscroll, &detail_scroll, show_help, show_body);
+                const entry: ?*const requests.Entry = if (st.filtered_count > 0 and requests.copyEntry(st.detail_index, detail_entry)) detail_entry else null;
+                drawDetail(alloc, win, entry, st.detail_index, raw_count, st.req_autoscroll, &st.detail_scroll, st.show_help, st.show_body);
             },
             .edit => {
-                drawEdit(win, &edit_state);
+                drawEdit(win, &st.edit_state);
             },
         }
 
         // Flash message (top-right, visible for 2 seconds)
-        if (flash_len > 0) {
+        if (st.flash_len > 0) {
             const now = rt.milliTimestamp();
-            if (now - flash_time < 2000) {
-                const col: u16 = @intCast(win.width -| (flash_len + 2));
+            if (now - st.flash_time < 2000) {
+                const col: u16 = @intCast(win.width -| (st.flash_len + 2));
                 const green: vaxis.Color = .{ .rgb = .{ 0x3f, 0xb9, 0x50 } };
-                writeAscii(win, col, 0, flash_buf[0..flash_len], .{ .fg = green, .bold = true });
+                writeAscii(win, col, 0, st.flash_buf[0..st.flash_len], .{ .fg = green, .bold = true });
             } else {
-                flash_len = 0;
+                st.flash_len = 0;
             }
         }
 
         try vx.render(tty.writer());
-        accepting_input = true;
+        st.accepting_input = true;
         rt.sleepMs(50);
     }
 }
 
-/// Flash text for the `u` key: copies the share URL when the tunnel is ready.
-fn shareCopyFlash() []const u8 {
+/// Flash text for the `u` key: copies the share URL when the tunnel is ready, or
+/// as unverified once the check timed out (our check may be what is blocked).
+fn shareCopyFlash(effects: *const Effects) []const u8 {
     const snap = share.snapshot();
-    switch (snap.status) {
-        .off => return "",
-        .ready => {
-            var url_buf: [share.max_host_len + 8]u8 = undefined;
-            const url = std.fmt.bufPrint(&url_buf, "https://{s}", .{snap.getHost()}) catch return "Share not ready";
-            return if (clipboard.copyText(url)) "Copied share URL!" else "Clipboard unavailable";
-        },
-        else => return "Share not ready",
-    }
+    if (snap.status == .off) return "";
+    const unverified = snap.hasUnverifiedUrl();
+    if (snap.status != .ready and !unverified) return "Share not ready";
+    var url_buf: [share.max_host_len + 8]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "https://{s}", .{snap.getHost()}) catch return "Share not ready";
+    if (!effects.copyText(url)) return "Clipboard unavailable";
+    return if (unverified) "Copied share URL (unverified)" else "Copied share URL!";
 }
 
 fn drawShareRows(win: vaxis.Window, start_row: u16, routes: []const proxy.Route) u16 {
@@ -949,17 +991,24 @@ fn drawShareRows(win: vaxis.Window, start_row: u16, routes: []const proxy.Route)
     printAt(win, 2, row, "SHARE", .{ .fg = dim });
     switch (snap.status) {
         .starting => printAt(win, 11, row, "starting…", .{ .fg = dim }),
+        .verifying => printAt(win, 11, row, "starting… waiting for Cloudflare", .{ .fg = dim }),
         .ready => {
             var url_buf: [share.max_host_len + 8]u8 = undefined;
             const url = std.fmt.bufPrint(&url_buf, "https://{s}", .{snap.getHost()}) catch "";
             writeAscii(win, 11, row, url, .{ .fg = blue });
             printAt(win, 11 + @as(u16, @intCast(url.len)), row, "  u: copy · public: anyone with this URL can reach your dev server", .{ .fg = yellow });
         },
-        else => writeAscii(win, 11, row, snap.getReason(), .{ .fg = yellow, .bold = true }),
+        else => {
+            const reason = snap.getReason();
+            writeAscii(win, 11, row, reason, .{ .fg = yellow, .bold = true });
+            if (snap.hasUnverifiedUrl()) {
+                writeAscii(win, 11 + @as(u16, @intCast(reason.len)), row, "  u: copy (unverified)", .{ .fg = dim });
+            }
+        },
     }
     row += 1;
 
-    if (snap.status == .starting or snap.status == .ready) {
+    if (snap.status == .starting or snap.status == .verifying or snap.status == .ready) {
         for (routes) |route| {
             const h = route.hostname orelse continue;
             if (route.kind != .path) continue;
@@ -1903,4 +1952,732 @@ fn replayEntry(logical: usize) bool {
     };
     thread.detach();
     return true;
+}
+
+// ---------------------------------------------------------------- tests
+
+const TestScreen = struct {
+    screen: vaxis.Screen,
+
+    fn init(cols: u16, rows: u16) !TestScreen {
+        return .{ .screen = try vaxis.Screen.init(std.testing.allocator, .{
+            .rows = rows,
+            .cols = cols,
+            .x_pixel = 0,
+            .y_pixel = 0,
+        }) };
+    }
+
+    fn deinit(self: *TestScreen) void {
+        self.screen.deinit(std.testing.allocator);
+    }
+
+    fn window(self: *TestScreen) vaxis.Window {
+        return .{
+            .x_off = 0,
+            .y_off = 0,
+            .parent_x_off = 0,
+            .parent_y_off = 0,
+            .width = self.screen.width,
+            .height = self.screen.height,
+            .screen = &self.screen,
+        };
+    }
+
+    /// Concatenated cell graphemes of one row (empty cell = space), right-trimmed.
+    /// Cells hold borrowed grapheme slices: draw code must pass stable text (see
+    /// `printAt`). A test that reads garbage here has found a real draw bug.
+    fn rowText(self: *TestScreen, row: u16, buf: []u8) []const u8 {
+        var n: usize = 0;
+        var col: u16 = 0;
+        while (col < self.screen.width) : (col += 1) {
+            const cell = self.screen.readCell(col, row) orelse break;
+            const g = if (cell.char.grapheme.len == 0) " " else cell.char.grapheme;
+            if (n + g.len > buf.len) @panic("rowText buffer too small");
+            @memcpy(buf[n..][0..g.len], g);
+            n += g.len;
+            // The cell after a wide character is its continuation.
+            if (cell.char.width == 2) col += 1;
+        }
+        return std.mem.trimEnd(u8, buf[0..n], " ");
+    }
+
+    /// True when any row contains `needle`.
+    fn hasText(self: *TestScreen, needle: []const u8) bool {
+        var buf: [1024]u8 = undefined;
+        var row: u16 = 0;
+        while (row < self.screen.height) : (row += 1) {
+            if (std.mem.indexOf(u8, self.rowText(row, &buf), needle) != null) return true;
+        }
+        return false;
+    }
+
+    /// Number of rows containing `needle`.
+    fn countText(self: *TestScreen, needle: []const u8) usize {
+        var buf: [1024]u8 = undefined;
+        var n: usize = 0;
+        var row: u16 = 0;
+        while (row < self.screen.height) : (row += 1) {
+            if (std.mem.indexOf(u8, self.rowText(row, &buf), needle) != null) n += 1;
+        }
+        return n;
+    }
+
+    fn cellText(self: *TestScreen, col: u16, row: u16) []const u8 {
+        const cell = self.screen.readCell(col, row) orelse return "";
+        return cell.char.grapheme;
+    }
+};
+
+test "tui: drawRequestLine shows method and path" {
+    var ts = try TestScreen.init(120, 5);
+    defer ts.deinit();
+    var sum: requests.Summary = .{};
+    @memcpy(sum.method[0..3], "GET");
+    sum.method_len = 3;
+    const path = "/api/x";
+    @memcpy(sum.path[0..path.len], path);
+    sum.path_len = path.len;
+    sum.status = 200;
+
+    drawRequestLine(ts.window(), 0, &sum, false);
+
+    var buf: [1024]u8 = undefined;
+    const text = ts.rowText(0, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "GET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/api/x") != null);
+}
+
+fn testSummary(method: []const u8, path: []const u8, status: u16) requests.Summary {
+    var sum: requests.Summary = .{};
+    @memcpy(sum.method[0..method.len], method);
+    sum.method_len = @intCast(method.len);
+    @memcpy(sum.path[0..path.len], path);
+    sum.path_len = @intCast(path.len);
+    sum.status = status;
+    return sum;
+}
+
+fn testHeader(win: vaxis.Window, cert: ?[]const u8, dns: ?[]const u8, routes: []const proxy.Route) u16 {
+    return drawHeader(win, "dev.lo", "https://dev.lo -> :3000", "installed", cert, dns, 0, false, routes, true);
+}
+
+test "tui: header row count matches rows drawn" {
+    share.resetForTest();
+    defer share.resetForTest();
+    var ts = try TestScreen.init(120, 24);
+    defer ts.deinit();
+    const base = testHeader(ts.window(), null, null, &.{});
+    var buf: [1024]u8 = undefined;
+    var last: u16 = 0;
+    var row: u16 = 0;
+    while (row < 24) : (row += 1) {
+        if (ts.rowText(row, &buf).len > 0) last = row;
+    }
+    try std.testing.expect(base > last);
+
+    var ts2 = try TestScreen.init(120, 24);
+    defer ts2.deinit();
+    const routes = [_]proxy.Route{.{ .kind = .path, .pattern = "/api", .port = 3001 }};
+    const more = testHeader(ts2.window(), "cert expiring", "dns missing", &routes);
+    try std.testing.expectEqual(base + 3, more);
+    try std.testing.expect(ts2.hasText("ROUTE"));
+    try std.testing.expect(ts2.hasText("CERT"));
+    try std.testing.expect(ts2.hasText("DNS"));
+}
+
+test "tui: SHARE row absent when share is off" {
+    share.resetForTest();
+    defer share.resetForTest();
+    var ts = try TestScreen.init(120, 24);
+    defer ts.deinit();
+    _ = testHeader(ts.window(), null, null, &.{});
+    try std.testing.expect(!ts.hasText("SHARE"));
+}
+
+test "tui: SHARE row shows starting" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    var ts = try TestScreen.init(120, 24);
+    defer ts.deinit();
+    _ = testHeader(ts.window(), null, null, &.{});
+    try std.testing.expect(ts.hasText("SHARE"));
+    try std.testing.expect(ts.hasText("starting"));
+}
+
+test "tui: SHARE row shows waiting for Cloudflare" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    var ts = try TestScreen.init(160, 24);
+    defer ts.deinit();
+    _ = testHeader(ts.window(), null, null, &.{});
+    try std.testing.expect(ts.hasText("starting… waiting for Cloudflare"));
+    try std.testing.expect(!ts.hasText("a-b.trycloudflare.com"));
+}
+
+test "tui: SHARE row shows the URL when ready" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    _ = share.markVerified();
+    var ts = try TestScreen.init(160, 24);
+    defer ts.deinit();
+    _ = testHeader(ts.window(), null, null, &.{});
+    try std.testing.expect(ts.hasText("https://a-b.trycloudflare.com"));
+    try std.testing.expect(ts.hasText("u: copy"));
+}
+
+test "tui: SHARE row shows failure and exit reasons" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    share.fail("boom");
+    {
+        var ts = try TestScreen.init(120, 24);
+        defer ts.deinit();
+        _ = testHeader(ts.window(), null, null, &.{});
+        try std.testing.expect(ts.hasText("boom"));
+    }
+    share.resetForTest();
+    share.begin(0);
+    share.markExited(3);
+    {
+        var ts = try TestScreen.init(120, 24);
+        defer ts.deinit();
+        _ = testHeader(ts.window(), null, null, &.{});
+        try std.testing.expect(ts.hasText("code 3"));
+    }
+}
+
+test "tui: SHARE row after the verify timeout shows the reason and unverified copy" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    share.setProbeHint("couldn't reach 1.1.1.1");
+    share.checkTimeout(std.math.maxInt(i64) / 2);
+    var ts = try TestScreen.init(200, 24);
+    defer ts.deinit();
+    _ = testHeader(ts.window(), null, null, &.{});
+    // The whole reason renders cell by cell, including its tail (ASCII only).
+    try std.testing.expect(ts.hasText("https://a-b.trycloudflare.com isn't reachable yet after 60s (couldn't reach 1.1.1.1); see zlodev.log"));
+    try std.testing.expect(ts.hasText("u: copy (unverified)"));
+}
+
+test "tui: SHARE lists external path routes while verifying" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    const routes = [_]proxy.Route{.{ .kind = .path, .pattern = "/api", .port = 443, .hostname = "staging.example.com" }};
+    var ts = try TestScreen.init(120, 24);
+    defer ts.deinit();
+    const end = drawShareRows(ts.window(), 0, &routes);
+    try std.testing.expectEqual(@as(u16, 2), end);
+    try std.testing.expect(ts.hasText("/api -> staging.example.com:443"));
+}
+
+test "tui: SHARE lists external path routes only" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    const routes = [_]proxy.Route{
+        .{ .kind = .path, .pattern = "/api", .port = 443, .hostname = "staging.example.com" },
+        .{ .kind = .subdomain, .pattern = "api", .port = 443, .hostname = "staging.example.com" },
+        .{ .kind = .path, .pattern = "/x", .port = 3001 },
+    };
+    var ts = try TestScreen.init(120, 24);
+    defer ts.deinit();
+    const end = drawShareRows(ts.window(), 0, &routes);
+    try std.testing.expectEqual(@as(u16, 2), end);
+    try std.testing.expectEqual(@as(usize, 1), ts.countText("public visitors can reach"));
+    try std.testing.expect(ts.hasText("/api"));
+    try std.testing.expect(!ts.hasText("/x"));
+    try std.testing.expect(!ts.hasText("api."));
+}
+
+test "tui: request line markers" {
+    var ts = try TestScreen.init(120, 5);
+    defer ts.deinit();
+    var sum = testSummary("GET", "/a", 200);
+    sum.starred = true;
+    drawRequestLine(ts.window(), 0, &sum, true);
+    try std.testing.expectEqualStrings("*", ts.cellText(0, 0));
+    try std.testing.expectEqualStrings(">", ts.cellText(1, 0));
+
+    var err = testSummary("GET", "/a", 502);
+    err.error_len = 5;
+    drawRequestLine(ts.window(), 1, &err, false);
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("502!", ts.rowText(1, &buf)[11..15]);
+}
+
+test "tui: shared marker at column 35" {
+    var ts = try TestScreen.init(120, 5);
+    defer ts.deinit();
+    var sum = testSummary("GET", "/a", 200);
+    sum.shared = true;
+    drawRequestLine(ts.window(), 0, &sum, false);
+    try std.testing.expectEqualStrings("^", ts.cellText(35, 0));
+
+    const plain = testSummary("GET", "/b", 200);
+    drawRequestLine(ts.window(), 2, &plain, false);
+    try std.testing.expect(!std.mem.eql(u8, "^", ts.cellText(35, 2)));
+
+    var held = testSummary("OPTIONS", "/a", 0);
+    held.shared = true;
+    held.resp_intercepted = true;
+    held.state = .intercepted;
+    drawRequestLine(ts.window(), 1, &held, false);
+    try std.testing.expectEqualStrings("^", ts.cellText(35, 1));
+    var buf: [1024]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, ts.rowText(1, &buf), "RESP") != null);
+}
+
+test "tui: hold, drop and big labels" {
+    var ts = try TestScreen.init(120, 5);
+    defer ts.deinit();
+    var held = testSummary("GET", "/a", 0);
+    held.state = .intercepted;
+    drawRequestLine(ts.window(), 0, &held, false);
+    var dropped = testSummary("GET", "/a", 0);
+    dropped.state = .dropped;
+    drawRequestLine(ts.window(), 1, &dropped, false);
+    var big = testSummary("GET", "/a", 200);
+    big.too_large_to_intercept = true;
+    drawRequestLine(ts.window(), 2, &big, false);
+    var buf: [1024]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, ts.rowText(0, &buf), "HOLD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts.rowText(1, &buf), "DROP") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts.rowText(2, &buf), "BIG") != null);
+}
+
+test "tui: help lists share and curl keys" {
+    inline for (.{ HelpContext.list, HelpContext.detail }) |ctx| {
+        var ts = try TestScreen.init(100, 40);
+        defer ts.deinit();
+        drawHelpOverlay(ts.window(), ctx);
+        try std.testing.expect(ts.hasText("copy share URL"));
+        try std.testing.expect(ts.hasText("copy as curl"));
+    }
+}
+
+// ---------------------------------------------------------------- key tests
+
+const KeyRec = struct {
+    var copy_calls: usize = 0;
+    var copied_buf: [256]u8 = undefined;
+    var copied_len: usize = 0;
+    var copy_result: bool = true;
+    var curl_calls: usize = 0;
+    var curl_index: usize = 0;
+
+    fn reset() void {
+        copy_calls = 0;
+        copied_len = 0;
+        copy_result = true;
+        curl_calls = 0;
+        curl_index = 0;
+    }
+
+    fn copyText(text: []const u8) bool {
+        copy_calls += 1;
+        copied_len = @min(text.len, copied_buf.len);
+        @memcpy(copied_buf[0..copied_len], text[0..copied_len]);
+        return copy_result;
+    }
+
+    fn copied() []const u8 {
+        return copied_buf[0..copied_len];
+    }
+
+    fn copyAsCurl(_: std.mem.Allocator, logical: usize, _: []const u8) clipboard.CopyResult {
+        curl_calls += 1;
+        curl_index = logical;
+        return .copied;
+    }
+
+    fn exportHar(_: []const u8, _: []const u8, _: bool, _: *[64]u8) ?usize {
+        return null;
+    }
+
+    fn replay(_: usize) bool {
+        return true;
+    }
+
+    fn restart() void {}
+};
+
+/// State wired to the recorder effects. Caller owns `summaries`
+/// (`requests.max_entries` long, heap: ~300 KB).
+fn testState(summaries: []requests.Summary) TuiState {
+    KeyRec.reset();
+    return .{
+        .alloc = std.testing.allocator,
+        .domain = "dev.lo",
+        .version = "test",
+        .routes = &.{},
+        .has_command = false,
+        .logs_visible = false,
+        .summaries = summaries,
+        .accepting_input = true,
+        .effects = .{
+            .copyText = KeyRec.copyText,
+            .copyAsCurl = KeyRec.copyAsCurl,
+            .exportHar = KeyRec.exportHar,
+            .replay = KeyRec.replay,
+            .restartSubprocess = KeyRec.restart,
+        },
+    };
+}
+
+/// A printable key as vaxis builds it: codepoint plus text.
+fn pk(comptime cp: u8) vaxis.Key {
+    return .{ .codepoint = cp, .text = &[_]u8{cp} };
+}
+
+fn nk(cp: u21) vaxis.Key {
+    return .{ .codepoint = cp };
+}
+
+fn testSummaries() ![]requests.Summary {
+    return std.testing.allocator.alloc(requests.Summary, requests.max_entries);
+}
+
+fn pushPath(path: []const u8) void {
+    var e: requests.Entry = .{};
+    @memcpy(e.method[0..3], "GET");
+    e.method_len = 3;
+    @memcpy(e.path[0..path.len], path);
+    e.path_len = @intCast(path.len);
+    e.status = 200;
+    requests.push(e);
+}
+
+test "tui: q quits from the list" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    try std.testing.expectEqual(KeyResult.quit, handleKey(&st, pk('q')));
+    try std.testing.expectEqual(KeyResult.none, handleKey(&st, pk('x')));
+}
+
+test "tui: help toggles with ? and closes with Escape" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    _ = handleKey(&st, pk('?'));
+    try std.testing.expect(st.show_help);
+    _ = handleKey(&st, pk('?'));
+    try std.testing.expect(!st.show_help);
+    _ = handleKey(&st, pk('?'));
+    _ = handleKey(&st, nk(vaxis.Key.escape));
+    try std.testing.expect(!st.show_help);
+}
+
+test "tui: search typing, backspace, escape and enter" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    _ = handleKey(&st, pk('/'));
+    try std.testing.expect(st.search_mode);
+    _ = handleKey(&st, pk('a'));
+    _ = handleKey(&st, pk('b'));
+    try std.testing.expectEqualStrings("ab", st.search_buf[0..st.search_len]);
+    _ = handleKey(&st, nk(vaxis.Key.backspace));
+    try std.testing.expectEqual(@as(usize, 1), st.search_len);
+    st.cursor = 1;
+    _ = handleKey(&st, nk(vaxis.Key.enter));
+    try std.testing.expect(!st.search_mode);
+    try std.testing.expectEqual(@as(usize, 1), st.search_len);
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+
+    _ = handleKey(&st, pk('/'));
+    _ = handleKey(&st, pk('x'));
+    _ = handleKey(&st, nk(vaxis.Key.escape));
+    try std.testing.expect(!st.search_mode);
+    try std.testing.expectEqual(@as(usize, 0), st.search_len);
+}
+
+test "tui: search input stops at buffer size" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    _ = handleKey(&st, pk('/'));
+    for (0..130) |_| _ = handleKey(&st, pk('a'));
+    try std.testing.expectEqual(@as(usize, 128), st.search_len);
+}
+
+test "tui: intercept prompt enables the pattern on Enter" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    defer {
+        if (intercept.isEnabled()) intercept.toggle();
+        intercept.setPattern("");
+    }
+
+    _ = handleKey(&st, pk('i'));
+    try std.testing.expect(st.intercept_mode);
+    _ = handleKey(&st, pk('/'));
+    _ = handleKey(&st, pk('a'));
+    _ = handleKey(&st, pk('p'));
+    _ = handleKey(&st, pk('i'));
+    _ = handleKey(&st, nk(vaxis.Key.enter));
+    try std.testing.expect(!st.intercept_mode);
+    try std.testing.expect(intercept.isEnabled());
+    var pbuf: [intercept.max_pattern_len]u8 = undefined;
+    try std.testing.expectEqualStrings("/api", intercept.getPattern(&pbuf));
+    intercept.toggle();
+
+    _ = handleKey(&st, pk('i'));
+    _ = handleKey(&st, pk('x'));
+    _ = handleKey(&st, nk(vaxis.Key.escape));
+    try std.testing.expect(!st.intercept_mode);
+    try std.testing.expect(!intercept.isEnabled());
+}
+
+test "tui: u with share off leaves the flash alone" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    @memcpy(st.flash_buf[0..5], "hello");
+    st.flash_len = 5;
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("hello", st.flash_buf[0..st.flash_len]);
+    try std.testing.expectEqual(@as(usize, 0), KeyRec.copy_calls);
+}
+
+test "tui: u before the URL says not ready" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("Share not ready", st.flash_buf[0..st.flash_len]);
+    try std.testing.expect(st.flash_time != 0);
+    try std.testing.expectEqual(@as(usize, 0), KeyRec.copy_calls);
+}
+
+test "tui: u while verifying says not ready" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("Share not ready", st.flash_buf[0..st.flash_len]);
+    try std.testing.expectEqual(@as(usize, 0), KeyRec.copy_calls);
+}
+
+test "tui: u copies the share URL" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    _ = share.markVerified();
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("https://a-b.trycloudflare.com", KeyRec.copied());
+    try std.testing.expectEqualStrings("Copied share URL!", st.flash_buf[0..st.flash_len]);
+    try std.testing.expect(st.flash_time != 0);
+}
+
+test "tui: u after the verify timeout copies the URL as unverified" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    share.setProbeHint("TLS check failed");
+    share.checkTimeout(std.math.maxInt(i64) / 2);
+    try std.testing.expect(share.snapshot().hasUnverifiedUrl());
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("https://a-b.trycloudflare.com", KeyRec.copied());
+    try std.testing.expectEqualStrings("Copied share URL (unverified)", st.flash_buf[0..st.flash_len]);
+}
+
+test "tui: u with a failure but no URL says not ready" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    share.fail("boom");
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("Share not ready", st.flash_buf[0..st.flash_len]);
+    try std.testing.expectEqual(@as(usize, 0), KeyRec.copy_calls);
+}
+
+test "tui: u reports a missing clipboard tool" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    _ = share.markVerified();
+    KeyRec.copy_result = false;
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("Clipboard unavailable", st.flash_buf[0..st.flash_len]);
+}
+
+test "tui: u in detail view copies the share URL" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    _ = share.markVerified();
+    st.view = .detail;
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("https://a-b.trycloudflare.com", KeyRec.copied());
+    try std.testing.expectEqualStrings("Copied share URL!", st.flash_buf[0..st.flash_len]);
+}
+
+test "tui: c copies the selected entry as curl" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    requests.clearAll();
+    defer requests.clearAll();
+    pushPath("/one");
+    pushPath("/two");
+    refreshFrame(&st);
+    st.cursor = 1;
+    _ = handleKey(&st, pk('c'));
+    try std.testing.expectEqual(@as(usize, 1), KeyRec.curl_calls);
+    try std.testing.expectEqual(search.selectedIndex(&st.filter_map, st.filtered_count, 1).?, KeyRec.curl_index);
+    try std.testing.expectEqualStrings("Copied as curl!", st.flash_buf[0..st.flash_len]);
+}
+
+test "tui: star toggles on the selected entry" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    requests.clearAll();
+    defer requests.clearAll();
+    pushPath("/one");
+    refreshFrame(&st);
+    _ = handleKey(&st, pk('*'));
+    refreshFrame(&st);
+    try std.testing.expect(st.summaries[0].starred);
+    _ = handleKey(&st, pk('*'));
+    refreshFrame(&st);
+    try std.testing.expect(!st.summaries[0].starred);
+}
+
+test "tui: l and Tab only act with a dev server" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    _ = handleKey(&st, pk('l'));
+    try std.testing.expect(!st.logs_visible);
+
+    st.has_command = true;
+    _ = handleKey(&st, pk('l'));
+    try std.testing.expect(st.logs_visible);
+    _ = handleKey(&st, nk(vaxis.Key.tab));
+    try std.testing.expectEqual(Focus.logs, st.focus);
+    _ = handleKey(&st, nk(vaxis.Key.tab));
+    try std.testing.expectEqual(Focus.requests, st.focus);
+
+    st.view = .edit;
+    _ = handleKey(&st, nk(vaxis.Key.tab));
+    try std.testing.expectEqual(Focus.requests, st.focus);
+
+    st.view = .list;
+    st.focus = .logs;
+    _ = handleKey(&st, pk('l'));
+    try std.testing.expect(!st.logs_visible);
+    try std.testing.expectEqual(Focus.requests, st.focus);
+    _ = handleKey(&st, nk(vaxis.Key.tab));
+    try std.testing.expectEqual(Focus.requests, st.focus);
+}
+
+test "tui: j k g G move within the list" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    requests.clearAll();
+    defer requests.clearAll();
+    pushPath("/1");
+    pushPath("/2");
+    pushPath("/3");
+    refreshFrame(&st);
+    for (0..5) |_| _ = handleKey(&st, pk('j'));
+    refreshFrame(&st);
+    try std.testing.expectEqual(@as(usize, 2), st.cursor);
+    _ = handleKey(&st, pk('k'));
+    try std.testing.expectEqual(@as(usize, 1), st.cursor);
+    _ = handleKey(&st, pk('g'));
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+    _ = handleKey(&st, pk('G'));
+    try std.testing.expectEqual(@as(usize, 2), st.cursor);
+}
+
+test "tui: list keys on an empty list are harmless" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    requests.clearAll();
+    defer requests.clearAll();
+    refreshFrame(&st);
+    _ = handleKey(&st, pk('G'));
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+    _ = handleKey(&st, nk(vaxis.Key.enter));
+    try std.testing.expectEqual(View.list, st.view);
+    try std.testing.expectEqual(KeyResult.none, handleKey(&st, pk('a')));
+}
+
+test "tui: refreshFrame clamps cursor to the filtered list" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    requests.clearAll();
+    defer requests.clearAll();
+    pushPath("/1");
+    pushPath("/2");
+    pushPath("/3");
+    refreshFrame(&st);
+    st.cursor = 2;
+    requests.clearAll();
+    pushPath("/1");
+    refreshFrame(&st);
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+
+    @memcpy(st.search_buf[0..3], "zzz");
+    st.search_len = 3;
+    refreshFrame(&st);
+    try std.testing.expectEqual(@as(usize, 0), st.filtered_count);
+    try std.testing.expectEqual(@as(usize, 0), st.cursor);
+}
+
+test "tui: keys ignored until accepting input" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    st.accepting_input = false;
+    try std.testing.expectEqual(KeyResult.none, handleKey(&st, pk('q')));
+    _ = handleKey(&st, pk('?'));
+    try std.testing.expect(!st.show_help);
 }

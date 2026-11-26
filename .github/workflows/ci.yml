@@ -73,6 +73,9 @@ jobs:
       - name: Test proxy + cert
         run: zig build test-c
 
+      - name: Test TUI
+        run: zig build test-tui
+
       - name: Test runtime, hold, wire, json, http server, shutdown, compat
         run: |
           zig test src/rt.zig
@@ -161,6 +164,9 @@ jobs:
       - name: Test proxy + cert
         run: zig build test-c
 
+      - name: Test TUI
+        run: zig build test-tui
+
       - name: Test runtime, hold, wire, json, http server, shutdown, compat
         run: |
           zig test src/rt.zig
@@ -230,6 +236,9 @@ jobs:
 
       - name: Test proxy + cert
         run: zig build test-c
+
+      - name: Test TUI
+        run: zig build test-tui
 
       - name: Test runtime, hold, wire, json, http server, shutdown, compat
         run: |

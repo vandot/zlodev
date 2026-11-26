@@ -112,14 +112,15 @@ fn startArgv(argv: []const []const u8) !void {
     }
     running.store(true, .release);
     errdefer running.store(false, .release);
-    log.info("component=tunnel op=start argv0={s}", .{argv[0]});
+    log.note("component=tunnel op=start argv0={s}", .{argv[0]});
     reader = try std.Thread.spawn(.{}, readerThread, .{group.child.?.stderr.?});
 }
 
 fn onLine(_: void, line: []const u8) void {
-    log.info("component=tunnel op=output line={s}", .{line});
+    log.note("component=tunnel op=output line={s}", .{line});
+    if (std.mem.indexOf(u8, line, "Registered tunnel connection") != null) share.markConnected();
     if (share.extractQuickTunnelHost(line)) |host| {
-        if (share.publishHost(host)) log.info("component=tunnel op=ready url=https://{s}", .{host});
+        if (share.publishHost(host)) log.note("component=tunnel op=url url=https://{s}", .{host});
     }
 }
 
@@ -145,10 +146,10 @@ fn readerThread(pipe: std.Io.File) void {
                 .signal, .stopped => |s| -@as(i64, @intFromEnum(s)),
                 .unknown => -1,
             };
-            log.info("component=tunnel op=exit code={d}", .{code});
+            log.note("component=tunnel op=exit code={d}", .{code});
             if (!stopping.load(.acquire) and shutdown.isRunning()) share.markExited(code);
         } else |err| {
-            log.info("component=tunnel op=wait error={s}", .{@errorName(err)});
+            log.note("component=tunnel op=wait error={s}", .{@errorName(err)});
             if (!stopping.load(.acquire) and shutdown.isRunning()) share.markExited(-1);
         }
     }
@@ -232,8 +233,19 @@ test "start publishes the URL from stderr" {
     defer share.resetForTest();
     try startArgv(&.{ "/bin/sh", "-c", "echo '|  https://a-b.trycloudflare.com  |' >&2; sleep 30" });
     defer stop();
-    try std.testing.expect(waitStatus(.ready, 2000));
+    try std.testing.expect(waitStatus(.verifying, 2000));
     try std.testing.expectEqualStrings("a-b.trycloudflare.com", share.snapshot().getHost());
+}
+
+test "start flags the tunnel connection from stderr" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    share.resetForTest();
+    defer share.resetForTest();
+    try startArgv(&.{ "/bin/sh", "-c", "echo '2026-11-26T10:00:01Z INF Registered tunnel connection connIndex=0 connection=abc event=0 ip=198.41.200.13 location=fra08 protocol=quic' >&2; sleep 30" });
+    defer stop();
+    const deadline = rt.milliTimestamp() + 2000;
+    while (!share.isConnected() and rt.milliTimestamp() < deadline) rt.sleepMs(20);
+    try std.testing.expect(share.isConnected());
 }
 
 test "stop kills cloudflared before URL" {

@@ -28,6 +28,7 @@ const compat = @import("compat.zig");
 const rt = @import("rt.zig");
 const tunnel = @import("tunnel.zig");
 const share = @import("share.zig");
+const share_probe = @import("share_probe.zig");
 
 pub fn main(init: std.process.Init) !void {
     compat.initNetworking();
@@ -630,6 +631,12 @@ fn doStart(
 
     var tunnel_started = false;
     defer if (tunnel_started) tunnel.stop();
+    // Declared after the tunnel defer so it runs first: the probe stops before cloudflared.
+    var probe_thread: ?std.Thread = null;
+    defer if (probe_thread) |t| {
+        share_probe_stop.store(true, .release);
+        t.join();
+    };
     if (share_on) {
         std.debug.print("warning: --share makes your dev server reachable by anyone with the URL\n", .{});
         for (routes) |route| {
@@ -642,6 +649,12 @@ fn doStart(
         var target_buf: [128]u8 = undefined;
         if (tunnel.start(cloudflared_path, tunnel.targetAddr(bind_owned, &target_buf))) |_| {
             tunnel_started = true;
+            probe_thread = std.Thread.spawn(.{}, shareProbeLoop, .{}) catch |e| blk: {
+                // Without the check, show the URL (unverified) as soon as it appears.
+                log.err("component=share op=probe_start error={any} fallback=unverified", .{e});
+                share.skipVerification();
+                break :blk null;
+            };
         } else |e| {
             log.err("component=tunnel op=start error={any}", .{e});
             if (!no_tui) std.debug.print("cloudflared failed to start: {s}\n", .{@errorName(e)});
@@ -671,7 +684,16 @@ fn doStart(
                                 std.Io.File.stdout().writeStreamingAll(rt.io(), line) catch {};
                             } else |_| {}
                         },
-                        .failed, .exited => std.debug.print("share: {s}\n", .{snap.getReason()}),
+                        .failed, .exited => {
+                            std.debug.print("share: {s}\n", .{snap.getReason()});
+                            // Our check may be what is blocked: still give the URL.
+                            if (snap.hasUnverifiedUrl()) {
+                                var out_buf: [share.max_host_len + 48]u8 = undefined;
+                                if (std.fmt.bufPrint(&out_buf, "share: https://{s} (unverified)\n", .{snap.getHost()})) |line| {
+                                    std.Io.File.stdout().writeStreamingAll(rt.io(), line) catch {};
+                                } else |_| {}
+                            }
+                        },
                         else => {},
                     }
                 }
@@ -689,11 +711,59 @@ fn doStart(
 
     // Signal all server loops to stop and wait for them
     shutdown.requestShutdown();
+    if (probe_thread) |t| {
+        share_probe_stop.store(true, .release);
+        t.join();
+        probe_thread = null;
+    }
     if (share_on) tunnel.stop();
     if (command != null) subprocess.stop();
     proxy_thread.join();
     http_thread.join();
     if (dns_thread) |dt| dt.join();
+}
+
+var share_probe_stop: std.atomic.Value(bool) = .init(false);
+
+fn shareProbeKeepGoing() bool {
+    return shutdown.isRunning() and !share_probe_stop.load(.acquire);
+}
+
+/// Checks the public URL end to end once a second, from cloudflared's registered
+/// connection (or 5s after the URL appeared), and marks it ready on the first
+/// success, so the URL is never shown (or copied) before a browser can open it.
+/// After the 60s deadline it keeps checking every 10s. Logs each change of result.
+fn shareProbeLoop() void {
+    var client = share_probe.Client.init();
+    defer client.deinit();
+    var last: ?share_probe.ProbeResult = null;
+    while (shareProbeKeepGoing()) {
+        const status = share.snapshot().status;
+        if (status == .ready or status == .exited) return;
+        if (share.shouldProbe(rt.milliTimestamp())) {
+            if (share.publicHost()) |host| {
+                const result = client.probe(host, shareProbeKeepGoing);
+                if (!shareProbeKeepGoing()) return;
+                if (result == .ok) {
+                    if (share.markVerified()) log.note("component=share op=ready url=https://{s}", .{host});
+                    return;
+                }
+                share.setProbeHint(share_probe.hint(result));
+                if (last != result) {
+                    if (result == .tls_failed) {
+                        log.note("component=share op=probe url=https://{s} result={s} error=\"{s}\"", .{ host, @tagName(result), client.tls_error });
+                    } else {
+                        log.note("component=share op=probe url=https://{s} result={s}", .{ host, @tagName(result) });
+                    }
+                }
+                last = result;
+            }
+        }
+        // Sliced so quitting isn't held up.
+        const interval_ms: u32 = if (share.snapshot().status == .failed) 10_000 else 1000;
+        var slept: u32 = 0;
+        while (slept < interval_ms and shareProbeKeepGoing()) : (slept += 100) rt.sleepMs(100);
+    }
 }
 
 fn doUninstallDns(allocator: std.mem.Allocator, tld: []const u8) !void {
