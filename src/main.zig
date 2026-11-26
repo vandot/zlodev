@@ -672,7 +672,6 @@ fn doStart(
                             } else |_| {}
                         },
                         .failed, .exited => std.debug.print("share: {s}\n", .{snap.getReason()}),
-                        .verifying => {},
                         else => {},
                     }
                 }

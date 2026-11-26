@@ -2149,6 +2149,19 @@ test "tui: SHARE row shows failure and exit reasons" {
     }
 }
 
+test "tui: SHARE lists external path routes while verifying" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    const routes = [_]proxy.Route{.{ .kind = .path, .pattern = "/api", .port = 443, .hostname = "staging.example.com" }};
+    var ts = try TestScreen.init(120, 24);
+    defer ts.deinit();
+    const end = drawShareRows(ts.window(), 0, &routes);
+    try std.testing.expectEqual(@as(u16, 2), end);
+    try std.testing.expect(ts.hasText("/api -> staging.example.com:443"));
+}
+
 test "tui: SHARE lists external path routes only" {
     share.resetForTest();
     defer share.resetForTest();

@@ -119,17 +119,16 @@ pub fn markExited(code: i64) void {
 
 pub fn checkTimeout(now_ms: i64) void {
     mutex.lockUncancelable(rt.io());
-    const timed_out = state.status == .starting and now_ms - start_ms >= start_timeout_ms;
-    const verify_timed_out = state.status == .verifying and now_ms - verify_start_ms >= verify_timeout_ms;
-    var host_buf: [max_host_len]u8 = undefined;
-    const host_len = state.host_len;
-    @memcpy(host_buf[0..host_len], state.host[0..host_len]);
-    mutex.unlock(rt.io());
-    if (timed_out) fail("no URL from cloudflared after 30s \u{2014} see zlodev.log");
-    if (verify_timed_out) {
+    defer mutex.unlock(rt.io());
+    // Check and set under one lock so a concurrent publishHost can't be overwritten.
+    if (state.status == .starting and now_ms - start_ms >= start_timeout_ms) {
+        state.status = .failed;
+        setReason("no URL from cloudflared after 30s \u{2014} see zlodev.log");
+    } else if (state.status == .verifying and now_ms - verify_start_ms >= verify_timeout_ms) {
         var buf: [max_reason_len]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "Cloudflare hasn't routed https://{s} yet after 60s \u{2014} see zlodev.log", .{host_buf[0..host_len]}) catch "Cloudflare hasn't routed the URL yet after 60s \u{2014} see zlodev.log";
-        fail(msg);
+        const msg = std.fmt.bufPrint(&buf, "Cloudflare hasn't routed https://{s} yet after 60s \u{2014} see zlodev.log", .{state.host[0..state.host_len]}) catch "Cloudflare hasn't routed the URL yet after 60s \u{2014} see zlodev.log";
+        state.status = .failed;
+        setReason(msg);
     }
 }
 
@@ -307,4 +306,15 @@ test "state: exit reports code" {
     const s = snapshot();
     try testing.expectEqual(Status.exited, s.status);
     try testing.expect(std.mem.indexOf(u8, s.getReason(), "code 1") != null);
+}
+
+test "state: checkTimeout never fails a state that already moved on" {
+    resetForTest();
+    begin(0);
+    try testing.expect(publishHostAt("a.trycloudflare.com", 100_000));
+    checkTimeout(100_000 + 59_999); // start deadline long past, but we are verifying
+    try testing.expectEqual(Status.verifying, snapshot().status);
+    try testing.expect(markVerified());
+    checkTimeout(1_000_000);
+    try testing.expectEqual(Status.ready, snapshot().status);
 }
