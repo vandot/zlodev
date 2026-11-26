@@ -309,7 +309,7 @@ until curl -sf https://dev.lo/.zlodev/health; do sleep 0.2; done
 zlodev start --share
 ```
 
-Runs `cloudflared tunnel --no-autoupdate --url https://127.0.0.1:443 --no-tls-verify` and gives you a public `https://….trycloudflare.com` URL for your dev server. The TUI shows it in a `SHARE` row (press `u` to copy it) and marks requests that came through the tunnel with `^`. With `--no-tui` the URL is printed to stdout as `share: https://…`. Or put `share` in `.zlodev`. `--share` can't be combined with `--dns`.
+Runs `cloudflared tunnel --no-autoupdate --grace-period=1s --url https://127.0.0.1:443 --no-tls-verify` and gives you a public `https://….trycloudflare.com` URL for your dev server. The TUI shows it in a `SHARE` row (press `u` to copy it) and marks requests that came through the tunnel with `^`. With `--no-tui` the URL is printed to stdout as `share: https://…`. Or put `share` in `.zlodev`. `--share` can't be combined with `--dns`.
 
 It needs [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) on your `PATH` (`brew install cloudflared` on macOS, `winget install --id Cloudflare.cloudflared` on Windows). zlodev refuses to start the tunnel if a cloudflared config file exists in its default directories (`~/.cloudflared/config.yml` and friends), because cloudflared would then ignore `--url`; move it aside.
 

@@ -99,7 +99,7 @@ var reader: ?std.Thread = null;
 pub fn start(cloudflared_path: []const u8, target: []const u8) !void {
     var url_buf: [256]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "https://{s}:443", .{target});
-    try startArgv(&.{ cloudflared_path, "tunnel", "--no-autoupdate", "--url", url, "--no-tls-verify" });
+    try startArgv(&.{ cloudflared_path, "tunnel", "--no-autoupdate", "--grace-period=1s", "--url", url, "--no-tls-verify" });
 }
 
 fn startArgv(argv: []const []const u8) !void {

@@ -1172,9 +1172,6 @@ fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Summary, 
         printAt(win, 1, row, ">", .{ .fg = .{ .rgb = .{ 0x58, 0xa6, 0xff } }, .bg = bg, .bold = true });
     }
 
-    // Came through the share tunnel; drawn first so a long method wins the cell.
-    if (entry.shared) writeAscii(win, 10, row, "^", .{ .fg = .{ .rgb = .{ 0xe3, 0xb3, 0x41 } }, .bg = bg, .bold = true });
-
     const method_color = methodColor(entry.getMethod());
     if (entry.resp_intercepted) {
         printAt(win, 2, row, "↳", .{ .fg = dim, .bg = bg });
@@ -1182,6 +1179,9 @@ fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Summary, 
     } else {
         writeAscii(win, 2, row, entry.getMethod(), .{ .fg = method_color, .bg = bg, .bold = true });
     }
+
+    // Came through the share tunnel: the free cell right before the path.
+    if (entry.shared) writeAscii(win, 35, row, "^", .{ .fg = .{ .rgb = .{ 0xe3, 0xb3, 0x41 } }, .bg = bg, .bold = true });
 
     const orange: vaxis.Color = .{ .rgb = .{ 0xd2, 0x9e, 0x22 } };
     const red: vaxis.Color = .{ .rgb = .{ 0xf8, 0x51, 0x49 } };

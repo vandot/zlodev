@@ -639,9 +639,9 @@ fn handleConnection(
         const route_result = resolveRoute(config, host, uri);
         // Arrived through the share tunnel: the app sees its local domain, the
         // public host goes in X-Forwarded-Host, and responses are rewritten back.
-        const shared = share.isPublicHost(host);
+        const public_host: ?[]const u8 = if (share.publicHost()) |h| (if (share.hostMatches(host, h)) h else null) else null;
+        const shared = public_host != null;
         const real_ip = if (shared) shareRealIp(client_addr, req_hdr_section) else "";
-        const public_host: ?[]const u8 = if (shared) share.publicHost() else null;
         const upstream_port = route_result.port;
 
         // Capture for display only: what goes upstream comes from req_buf, which
@@ -675,6 +675,7 @@ fn handleConnection(
                 .domain = config.domain,
                 .shared = shared,
                 .real_ip = real_ip,
+                .public_host = public_host,
             }, client_ctx, conn_id, &entry);
             return;
         }
@@ -1080,6 +1081,8 @@ const RequestForward = struct {
     shared: bool = false,
     /// X-Real-IP override (a validated CF-Connecting-IP); empty uses client_ip.
     real_ip: []const u8 = "",
+    /// The tunnel's public host for shared requests: non-101 WebSocket answers are rewritten with it.
+    public_host: ?[]const u8 = null,
 };
 
 /// Headers zlodev writes itself (client copies dropped so they aren't doubled or
@@ -1611,8 +1614,25 @@ fn handleWebSocket(
         return;
     }
 
-    // Forward response to client
-    sslWriteAll(ssl, resp_buf[0..resp_total]);
+    // Forward response to client. A shared refusal (not 101) gets the same
+    // Location/Set-Cookie rewrite as plain responses; everything else is raw.
+    const ws_head_end = std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n\r\n");
+    const ws_line_end = std.mem.indexOf(u8, resp_buf[0..resp_total], "\r\n");
+    const refused = !std.mem.startsWith(u8, resp_buf[0..resp_total], "HTTP/1.1 101") and !std.mem.startsWith(u8, resp_buf[0..resp_total], "HTTP/1.0 101");
+    if (fwd.shared and refused and ws_head_end != null and ws_line_end != null) {
+        if (fwd.public_host) |ph| {
+            const hdr_end_i = ws_head_end.?;
+            const line_end_i = ws_line_end.?;
+            sslWriteAll(ssl, resp_buf[0 .. line_end_i + 2]);
+            if (line_end_i < hdr_end_i) {
+                http_wire.forwardHeaders(resp_buf[line_end_i + 2 .. hdr_end_i], SslSink{ .ssl = ssl }, .{
+                    .rewrite_set_cookie = target.is_external,
+                    .public_host = ph,
+                }, config.domain);
+            }
+            sslWriteAll(ssl, resp_buf[hdr_end_i + 2 .. resp_total]);
+        } else sslWriteAll(ssl, resp_buf[0..resp_total]);
+    } else sslWriteAll(ssl, resp_buf[0..resp_total]);
 
     // Log as a WS entry (pinned so it won't be overwritten during long-lived connection)
     entry.status = 101;
@@ -3688,4 +3708,38 @@ test "shared WebSocket upgrade gets Host of the local domain" {
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\r\nHost: dev.lo\r\n"));
     try testing.expect(std.mem.indexOf(u8, got, "\r\nHost: x.trycloudflare.com\r\n") == null);
     try testing.expect(std.mem.indexOf(u8, got, "\r\nX-Forwarded-Host: x.trycloudflare.com\r\n") != null);
+}
+
+const ws_refusal_response = "HTTP/1.1 302 Found\r\nLocation: https://dev.lo/login\r\nSet-Cookie: s=1; Domain=dev.lo; Path=/\r\nContent-Length: 0\r\n\r\n";
+const ws_upgrade_request = "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+test "shared WebSocket upgrade refusal is rewritten to the public host" {
+    startShareForTest();
+    defer share.resetForTest();
+    var up = RecordingUpstream{ .response = ws_refusal_response };
+    try up.start(18917);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18916, 18917);
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /hmr HTTP/1.1\r\nHost: x.trycloudflare.com" ++ ws_upgrade_request, "\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 302 Found\r\n"));
+    try testing.expect(std.mem.indexOf(u8, resp, "\r\nLocation: https://x.trycloudflare.com/login\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "\r\nSet-Cookie: s=1; Path=/\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "dev.lo") == null);
+}
+
+test "non-shared WebSocket upgrade refusal is relayed byte-identical" {
+    share.resetForTest();
+    defer share.resetForTest();
+    var up = RecordingUpstream{ .response = ws_refusal_response };
+    try up.start(18919);
+    defer up.stop();
+    var px: ProxyHarness = undefined;
+    try px.start(18918, 18919);
+    defer px.stop();
+    var buf: [1024]u8 = undefined;
+    const resp = try px.roundTrip("GET /hmr HTTP/1.1\r\nHost: dev.lo" ++ ws_upgrade_request, "\r\n\r\n", &buf);
+    try testing.expectEqualStrings(ws_refusal_response, resp);
 }
