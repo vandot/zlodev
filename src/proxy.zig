@@ -220,7 +220,7 @@ const root_bundles = [_][:0]const u8{
 /// Load the OS trust store into `ctx` for verifying external upstreams. BoringSSL
 /// built from source doesn't know the platform stores, so macOS and Linux load a
 /// PEM bundle and Windows copies the system ROOT store. False if nothing loaded.
-fn loadSystemRoots(ctx: *ssl_c.SSL_CTX) bool {
+pub fn loadSystemRoots(ctx: *ssl_c.SSL_CTX) bool {
     defer ssl_c.ERR_clear_error();
     if (builtin.os.tag == .windows) return loadWindowsRoots(ctx) > 0;
     _ = ssl_c.SSL_CTX_set_default_verify_paths(ctx);
@@ -267,7 +267,7 @@ fn createClientSslCtx(insecure: bool) ?*ssl_c.SSL_CTX {
 /// TLS-wrap a connected upstream socket: SNI plus verification against `host`
 /// (DNS name or IP literal). A rejected certificate is `UpstreamCertUntrusted`, so
 /// the client gets a 502 that names the fix.
-fn upstreamHandshake(cctx: *ssl_c.SSL_CTX, sock: compat.socket_t, host: []const u8, conn_id: u64) !*ssl_c.SSL {
+pub fn upstreamHandshake(cctx: *ssl_c.SSL_CTX, sock: compat.socket_t, host: []const u8, conn_id: u64) !*ssl_c.SSL {
     const us = ssl_c.SSL_new(cctx) orelse {
         log.err("component=proxy conn={d} op=upstream_ssl_new error=alloc_failed", .{conn_id});
         return error.UpstreamUnavailable;

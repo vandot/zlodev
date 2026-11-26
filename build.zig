@@ -43,15 +43,25 @@ pub fn build(b: *std.Build) void {
     };
     configureModule(b, exe.root_module, deps, target, optimize, true);
 
-    // proxy.zig and cert.zig import translate-c modules, so their tests need the build graph.
+    // proxy.zig, cert.zig and share_probe.zig import translate-c modules, so their tests
+    // need the build graph. share_probe.zig imports proxy.zig; its filter keeps proxy's
+    // tests to the proxy.zig run.
     const test_step = b.step("test-c", "Run tests for modules that import BoringSSL headers");
-    for ([_][]const u8{ "src/proxy.zig", "src/cert.zig" }) |path| {
-        const t = b.addTest(.{ .root_module = b.createModule(.{
-            .root_source_file = b.path(path),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }) });
+    for ([_]struct { []const u8, []const []const u8 }{
+        .{ "src/proxy.zig", &.{} },
+        .{ "src/cert.zig", &.{} },
+        .{ "src/share_probe.zig", &.{"share_probe: "} },
+    }) |entry| {
+        const path, const filters = entry;
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(path),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+            .filters = filters,
+        });
         configureModule(b, t.root_module, deps, target, optimize, false);
         test_step.dependOn(&b.addRunArtifact(t).step);
     }

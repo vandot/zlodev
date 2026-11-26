@@ -13,7 +13,7 @@ zig build                            # build (output: zig-out/bin/zlodev)
 zig build -Doptimize=ReleaseSafe     # release build
 zig test src/dns.zig                 # run DNS unit tests
 zig test src/har.zig                 # run HAR + requests tests
-zig build test-c                     # run proxy + cert tests (they import BoringSSL headers)
+zig build test-c                     # run proxy + cert + share_probe tests (they import BoringSSL headers)
 zig build test-tui                   # run TUI draw + key tests (needs vaxis)
 zig test src/intercept.zig           # run intercept tests
 zig test src/requests.zig            # run requests tests
@@ -37,7 +37,7 @@ zig test tests/install.zig           # run install/uninstall tests
 zig test tests/integration.zig       # run integration tests (needs running zlodev + httpbin, see CI)
 ```
 
-No `zig build test` step. Tests run per-file w/ `zig test src/<file>.zig`, except `proxy.zig` and `cert.zig`, which need translated BoringSSL headers → run via `zig build test-c`; `tui.zig` (needs vaxis + proxy) → `zig build test-tui` (runs only tests named `tui: …`).
+No `zig build test` step. Tests run per-file w/ `zig test src/<file>.zig`, except `proxy.zig`, `cert.zig` and `share_probe.zig`, which need translated BoringSSL headers → run via `zig build test-c` (share_probe root filtered to tests named `share_probe: …`, since it imports proxy.zig); `tui.zig` (needs vaxis + proxy) → `zig build test-tui` (runs only tests named `tui: …`).
 
 ## Architecture
 
@@ -66,6 +66,7 @@ compat.zig        Cross-platform socket layer (Winsock on Windows, BSD sockets o
 rt.zig            Process-wide std.Io handle, timestamps, sleep, worker spawn + slot caps
 win32.zig         Win32/Winsock bindings Zig 0.17 std no longer exposes (console, sockets, job objects)
 tunnel.zig        cloudflared quick-tunnel for `start --share` (preflight, spawn via ChildGroup, stderr URL scrape → share.zig)
+share_probe.zig   End-to-end check of the share URL (A lookup at 1.1.1.1, never the system resolver; TLS w/ SNI + verify; `GET /.zlodev/health` → `200 ok`)
 ```
 
 ## Key design decisions
