@@ -2164,7 +2164,8 @@ test "tui: SHARE row after the verify timeout shows the reason and unverified co
     var ts = try TestScreen.init(200, 24);
     defer ts.deinit();
     _ = testHeader(ts.window(), null, null, &.{});
-    try std.testing.expect(ts.hasText("https://a-b.trycloudflare.com isn't reachable yet after 60s (couldn't reach 1.1.1.1)"));
+    // The whole reason renders cell by cell, including its tail (ASCII only).
+    try std.testing.expect(ts.hasText("https://a-b.trycloudflare.com isn't reachable yet after 60s (couldn't reach 1.1.1.1); see zlodev.log"));
     try std.testing.expect(ts.hasText("u: copy (unverified)"));
 }
 

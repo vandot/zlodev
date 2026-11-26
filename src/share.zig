@@ -162,7 +162,7 @@ pub fn markExited(code: i64) void {
     defer mutex.unlock(rt.io());
     state.status = .exited;
     var buf: [max_reason_len]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "cloudflared exited (code {d}) \u{2014} see zlodev.log", .{code}) catch "cloudflared exited \u{2014} see zlodev.log";
+    const msg = std.fmt.bufPrint(&buf, "cloudflared exited (code {d}); see zlodev.log", .{code}) catch "cloudflared exited; see zlodev.log";
     setReason(msg);
 }
 
@@ -172,14 +172,14 @@ pub fn checkTimeout(now_ms: i64) void {
     // Check and set under one lock so a concurrent publishHost can't be overwritten.
     if (state.status == .starting and now_ms - start_ms >= start_timeout_ms) {
         state.status = .failed;
-        setReason("no URL from cloudflared after 30s \u{2014} see zlodev.log");
+        setReason("no URL from cloudflared after 30s; see zlodev.log");
     } else if (state.status == .verifying and now_ms - verify_start_ms >= verify_timeout_ms) {
         var buf: [max_reason_len]u8 = undefined;
         const host = state.host[0..state.host_len];
         const msg = if (probe_hint_len > 0)
-            std.fmt.bufPrint(&buf, "https://{s} isn't reachable yet after 60s ({s}) \u{2014} see zlodev.log", .{ host, probe_hint[0..probe_hint_len] }) catch "the URL isn't reachable yet after 60s \u{2014} see zlodev.log"
+            std.fmt.bufPrint(&buf, "https://{s} isn't reachable yet after 60s ({s}); see zlodev.log", .{ host, probe_hint[0..probe_hint_len] }) catch "the URL isn't reachable yet after 60s; see zlodev.log"
         else
-            std.fmt.bufPrint(&buf, "Cloudflare hasn't routed https://{s} yet after 60s \u{2014} see zlodev.log", .{host}) catch "Cloudflare hasn't routed the URL yet after 60s \u{2014} see zlodev.log";
+            std.fmt.bufPrint(&buf, "Cloudflare hasn't routed https://{s} yet after 60s; see zlodev.log", .{host}) catch "Cloudflare hasn't routed the URL yet after 60s; see zlodev.log";
         state.status = .failed;
         setReason(msg);
     }
@@ -328,7 +328,7 @@ test "state: verify timeout fails with the URL in the reason" {
     checkTimeout(65_000);
     const s = snapshot();
     try testing.expectEqual(Status.failed, s.status);
-    try testing.expectEqualStrings("Cloudflare hasn't routed https://a.trycloudflare.com yet after 60s \u{2014} see zlodev.log", s.getReason());
+    try testing.expectEqualStrings("Cloudflare hasn't routed https://a.trycloudflare.com yet after 60s; see zlodev.log", s.getReason());
     try testing.expectEqualStrings("a.trycloudflare.com", s.getHost());
     try testing.expect(isPublicHost("a.trycloudflare.com"));
 }
@@ -382,7 +382,7 @@ test "state: verify timeout reason names the last probe result" {
     checkTimeout(60_000);
     const s = snapshot();
     try testing.expectEqual(Status.failed, s.status);
-    try testing.expectEqualStrings("https://a.trycloudflare.com isn't reachable yet after 60s (couldn't reach 1.1.1.1) \u{2014} see zlodev.log", s.getReason());
+    try testing.expectEqualStrings("https://a.trycloudflare.com isn't reachable yet after 60s (couldn't reach 1.1.1.1); see zlodev.log", s.getReason());
     try testing.expect(s.hasUnverifiedUrl());
     // begin clears the hint.
     begin(0);
