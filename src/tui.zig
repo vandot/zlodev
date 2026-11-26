@@ -23,6 +23,8 @@ pub const panic = vaxis.panic_handler;
 
 const View = enum { list, detail, edit };
 
+const Focus = enum { requests, logs };
+
 const EditField = enum(u8) { method = 0, path = 1, headers = 2, body = 3 };
 
 const CommitOutcome = enum { accepted, replayed, failed };
@@ -375,6 +377,426 @@ const EditState = struct {
     }
 };
 
+/// Side effects reached from key handling that leave the process
+/// (clipboard, files, network, child process). Tests swap them for fakes.
+const Effects = struct {
+    copyText: *const fn ([]const u8) bool = clipboard.copyText,
+    copyAsCurl: *const fn (std.mem.Allocator, usize, []const u8) clipboard.CopyResult = clipboard.copyAsCurl,
+    exportHar: *const fn ([]const u8, []const u8, bool, *[64]u8) ?usize = har.exportHar,
+    replay: *const fn (usize) bool = replayEntry,
+    restartSubprocess: *const fn () void = subprocess.restart,
+};
+
+/// Everything key handling and the per-frame refresh read or write.
+/// Large (filter_map, edit_state): lives on run()'s stack, always passed by pointer.
+const TuiState = struct {
+    alloc: std.mem.Allocator,
+    domain: []const u8,
+    version: []const u8,
+    routes: []const proxy.Route,
+    has_command: bool,
+    effects: Effects = .{},
+
+    cursor: usize = 0,
+    scroll_offset: usize = 0,
+    req_autoscroll: bool = true,
+    logs_visible: bool,
+    focus: Focus = .requests,
+    logs_scroll: usize = 0,
+    logs_autoscroll: bool = true,
+    view: View = .list,
+    detail_scroll: usize = 0,
+    detail_index: usize = 0,
+    show_help: bool = false,
+    show_body: bool = false,
+    edit_state: EditState = .{},
+    search_mode: bool = false,
+    search_buf: [128]u8 = @splat(0),
+    search_len: usize = 0,
+    intercept_mode: bool = false,
+    intercept_buf: [intercept.max_pattern_len]u8 = @splat(0),
+    intercept_len: usize = 0,
+    flash_buf: [128]u8 = undefined,
+    flash_len: usize = 0,
+    flash_time: i64 = 0, // timestamp when flash message was set
+    har_fname_buf: [64]u8 = undefined,
+    // On Windows, discard key events until after the first render — terminal
+    // init can produce spurious events from escape sequence responses.
+    accepting_input: bool = (builtin.os.tag != .windows),
+
+    summaries: []requests.Summary,
+    summary_count: usize = 0,
+    // Maps filtered index -> index in summaries (= logical index)
+    filter_map: [requests.max_entries]usize = undefined,
+    filtered_count: usize = 0,
+};
+
+const KeyResult = enum { none, quit };
+
+/// Applies one key press to the TUI state. `.quit` means leave the TUI.
+fn handleKey(st: *TuiState, key: vaxis.Key) KeyResult {
+    if (!st.accepting_input) return .none;
+
+    // Search mode input handling
+    if (st.search_mode) {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            // Cancel search, clear filter
+            st.search_mode = false;
+            st.search_len = 0;
+            st.cursor = 0;
+            st.scroll_offset = 0;
+        } else if (key.matches(vaxis.Key.enter, .{})) {
+            // Confirm search, keep filter
+            st.search_mode = false;
+            st.cursor = 0;
+            st.scroll_offset = 0;
+        } else if (key.matches(vaxis.Key.backspace, .{})) {
+            st.search_len -|= 1;
+            st.cursor = 0;
+            st.scroll_offset = 0;
+        } else if (key.text) |text| {
+            if (st.search_len + text.len <= st.search_buf.len) {
+                @memcpy(st.search_buf[st.search_len .. st.search_len + text.len], text);
+                st.search_len += text.len;
+                st.cursor = 0;
+                st.scroll_offset = 0;
+            }
+        }
+        return .none;
+    }
+
+    // Intercept pattern input mode
+    if (st.intercept_mode) {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            st.intercept_mode = false;
+            st.intercept_len = 0;
+        } else if (key.matches(vaxis.Key.enter, .{})) {
+            st.intercept_mode = false;
+            intercept.enableWithPattern(st.intercept_buf[0..st.intercept_len]);
+        } else if (key.matches(vaxis.Key.backspace, .{})) {
+            st.intercept_len -|= 1;
+        } else if (key.text) |text| {
+            if (st.intercept_len + text.len <= st.intercept_buf.len) {
+                @memcpy(st.intercept_buf[st.intercept_len .. st.intercept_len + text.len], text);
+                st.intercept_len += text.len;
+            }
+        }
+        return .none;
+    }
+
+    if (key.matches('?', .{})) {
+        st.show_help = !st.show_help;
+        return .none;
+    }
+    if (st.show_help and key.matches(vaxis.Key.escape, .{})) {
+        st.show_help = false;
+        return .none;
+    }
+    if (key.matches('l', .{}) and st.has_command) {
+        st.logs_visible = !st.logs_visible;
+        if (!st.logs_visible) st.focus = .requests;
+        return .none;
+    }
+    if (key.matches(vaxis.Key.tab, .{}) and st.logs_visible and st.view != .edit) {
+        st.focus = if (st.focus == .requests) .logs else .requests;
+        return .none;
+    }
+
+    switch (st.view) {
+        .list => {
+            if (key.matches('q', .{})) return .quit;
+            if (key.matches('/', .{})) {
+                st.search_mode = true;
+                st.search_len = 0;
+                return .none;
+            }
+            if (key.matches('s', .{})) {
+                if (st.focus == .logs and st.logs_visible) {
+                    st.logs_autoscroll = !st.logs_autoscroll;
+                } else {
+                    st.req_autoscroll = !st.req_autoscroll;
+                }
+            }
+            if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+                if (st.focus == .logs and st.logs_visible) {
+                    st.logs_scroll +|= 1;
+                    st.logs_autoscroll = false;
+                } else {
+                    st.cursor +|= 1;
+                }
+            }
+            if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+                if (st.focus == .logs and st.logs_visible) {
+                    st.logs_scroll -|= 1;
+                    st.logs_autoscroll = false;
+                } else {
+                    st.cursor -|= 1;
+                }
+            }
+            if (key.matches('G', .{})) {
+                if (st.focus == .logs and st.logs_visible) {
+                    const total = subprocess.getLineCount();
+                    st.logs_scroll = total;
+                } else {
+                    st.cursor = st.filtered_count -| 1;
+                }
+            }
+            if (key.matches('g', .{})) {
+                if (st.focus == .logs and st.logs_visible) {
+                    st.logs_scroll = 0;
+                } else {
+                    st.cursor = 0;
+                }
+            }
+            if (key.matches(vaxis.Key.escape, .{})) {
+                // Clear filter
+                st.search_len = 0;
+                st.cursor = 0;
+                st.scroll_offset = 0;
+            }
+            if (key.matches(vaxis.Key.enter, .{})) {
+                // Map filtered cursor to real logical index
+                st.detail_index = search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none;
+                st.detail_scroll = 0;
+                st.view = .detail;
+            }
+            if (key.matches('i', .{})) {
+                if (intercept.isEnabled()) {
+                    intercept.toggle();
+                } else {
+                    st.intercept_mode = true;
+                    st.intercept_len = 0;
+                }
+            }
+            if (key.matches('a', .{}))
+                acceptEntry(search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none);
+            if (key.matches('A', .{}))
+                intercept.acceptAll();
+            if (key.matches('C', .{}))
+                requests.clearAll();
+            if (key.matches('*', .{})) {
+                const bi = requests.logicalToBackingIndex(search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none) orelse return .none;
+                requests.toggleStar(bi);
+            }
+            if (key.matches('d', .{}))
+                dropOrDeleteEntry(search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none);
+            if (key.matches('c', .{})) {
+                const sel = search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none;
+                const msg: []const u8 = switch (st.effects.copyAsCurl(st.alloc, sel, st.domain)) {
+                    .copied => "Copied as curl!",
+                    .truncated => "Request too large to copy: captured copy is truncated",
+                    .missing => "",
+                };
+                @memcpy(st.flash_buf[0..msg.len], msg);
+                st.flash_len = msg.len;
+                st.flash_time = rt.milliTimestamp();
+            }
+            if (key.matches('u', .{})) {
+                const msg = shareCopyFlash(&st.effects);
+                if (msg.len > 0) {
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+            }
+            if (key.matches('E', .{}) or key.matches('e', .{ .ctrl = true })) {
+                const redact = key.matches('E', .{});
+                if (st.effects.exportHar(st.version, st.domain, redact, &st.har_fname_buf)) |fname_len| {
+                    const note = if (redact) " (cookies and auth redacted; Ctrl+E for full)" else " (full, includes cookies and auth)";
+                    const flash = std.fmt.bufPrint(&st.flash_buf, "Exported {s}{s}", .{ st.har_fname_buf[0..fname_len], note }) catch st.flash_buf[0..0];
+                    st.flash_len = flash.len;
+                } else {
+                    const msg = "Export failed";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                }
+                st.flash_time = rt.milliTimestamp();
+            }
+            if (key.matches('r', .{})) {
+                const sel = search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none;
+                if (st.edit_state.openForReplay(st.alloc, sel)) {
+                    st.view = .edit;
+                } else if (sel < st.summary_count and st.summaries[sel].request_truncated) {
+                    const msg = "Request too large to replay: captured copy is truncated";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+            }
+            if (key.matches('R', .{})) {
+                if (st.focus == .logs and st.logs_visible and st.has_command) {
+                    st.effects.restartSubprocess();
+                    const msg = "Restarting...";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                } else if (search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor)) |sel| {
+                    const msg: []const u8 = if (st.effects.replay(sel)) "Replayed!" else "Request too large to replay: captured copy is truncated";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+            }
+            if (key.matches('e', .{})) {
+                if (st.edit_state.open(st.alloc, search.selectedIndex(&st.filter_map, st.filtered_count, st.cursor) orelse return .none)) st.view = .edit;
+            }
+        },
+        .detail => {
+            if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
+                st.view = .list;
+            } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+                st.detail_scroll +|= 1;
+            } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+                st.detail_scroll -|= 1;
+            } else if (key.matches('n', .{}) or key.matches(vaxis.Key.right, .{})) {
+                st.cursor +|= 1;
+                st.detail_scroll = 0;
+            } else if (key.matches('p', .{}) or key.matches(vaxis.Key.left, .{})) {
+                st.cursor -|= 1;
+                st.detail_scroll = 0;
+            } else if (key.matches('G', .{})) {
+                st.detail_scroll = std.math.maxInt(usize);
+            } else if (key.matches('g', .{})) {
+                st.detail_scroll = 0;
+            } else if (key.matches('s', .{})) {
+                st.req_autoscroll = !st.req_autoscroll;
+            } else if (key.matches('i', .{})) {
+                if (intercept.isEnabled()) {
+                    intercept.toggle();
+                } else {
+                    st.intercept_mode = true;
+                    st.intercept_len = 0;
+                }
+            } else if (key.matches('*', .{})) {
+                const bi = requests.logicalToBackingIndex(st.detail_index) orelse return .none;
+                requests.toggleStar(bi);
+            } else if (key.matches('a', .{})) {
+                acceptEntry(st.detail_index);
+            } else if (key.matches('d', .{})) {
+                dropOrDeleteEntry(st.detail_index);
+            } else if (key.matches('c', .{})) {
+                const msg: []const u8 = switch (st.effects.copyAsCurl(st.alloc, st.detail_index, st.domain)) {
+                    .copied => "Copied as curl!",
+                    .truncated => "Request too large to copy: captured copy is truncated",
+                    .missing => "",
+                };
+                @memcpy(st.flash_buf[0..msg.len], msg);
+                st.flash_len = msg.len;
+                st.flash_time = rt.milliTimestamp();
+            } else if (key.matches('u', .{})) {
+                const msg = shareCopyFlash(&st.effects);
+                if (msg.len > 0) {
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+            } else if (key.matches('r', .{})) {
+                if (st.edit_state.openForReplay(st.alloc, st.detail_index)) {
+                    st.view = .edit;
+                } else if (st.detail_index < st.summary_count and st.summaries[st.detail_index].request_truncated) {
+                    const msg = "Request too large to replay: captured copy is truncated";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+            } else if (key.matches('R', .{})) {
+                const msg: []const u8 = if (st.effects.replay(st.detail_index)) "Replayed!" else "Request too large to replay: captured copy is truncated";
+                @memcpy(st.flash_buf[0..msg.len], msg);
+                st.flash_len = msg.len;
+                st.flash_time = rt.milliTimestamp();
+            } else if (key.matches('b', .{})) {
+                st.show_body = !st.show_body;
+                st.detail_scroll = 0;
+            } else if (key.matches('e', .{})) {
+                if (st.edit_state.open(st.alloc, st.detail_index)) st.view = .edit;
+            }
+        },
+        .edit => {
+            if (key.matches(vaxis.Key.escape, .{})) {
+                // Cancel edit
+                st.edit_state.active = false;
+                st.view = .list;
+            } else if (key.matches('s', .{ .ctrl = true })) {
+                if (st.edit_state.commit(st.alloc) == .replayed) {
+                    const msg = "Replayed!";
+                    @memcpy(st.flash_buf[0..msg.len], msg);
+                    st.flash_len = msg.len;
+                    st.flash_time = rt.milliTimestamp();
+                }
+                st.edit_state.active = false;
+                st.view = .list;
+            } else if (key.matches(vaxis.Key.tab, .{})) {
+                st.edit_state.nextField();
+            } else if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
+                st.edit_state.prevField();
+            } else if (key.matches(vaxis.Key.left, .{})) {
+                st.edit_state.cursor -|= 1;
+            } else if (key.matches(vaxis.Key.right, .{})) {
+                if (st.edit_state.cursor < st.edit_state.activeLen())
+                    st.edit_state.cursor += 1;
+            } else if (key.matches(vaxis.Key.home, .{})) {
+                st.edit_state.cursor = 0;
+            } else if (key.matches(vaxis.Key.end, .{})) {
+                st.edit_state.cursor = st.edit_state.activeLen();
+            } else if (key.matches(vaxis.Key.up, .{})) {
+                if (st.edit_state.isMultiline()) {
+                    st.edit_state.moveUp();
+                }
+            } else if (key.matches(vaxis.Key.down, .{})) {
+                if (st.edit_state.isMultiline()) {
+                    st.edit_state.moveDown();
+                }
+            } else if (key.matches(vaxis.Key.backspace, .{})) {
+                st.edit_state.deleteBack();
+            } else if (key.matches(vaxis.Key.delete, .{})) {
+                st.edit_state.deleteForward();
+            } else if (key.matches(vaxis.Key.enter, .{})) {
+                if (st.edit_state.isMultiline()) {
+                    st.edit_state.insertNewline();
+                } else {
+                    st.edit_state.nextField();
+                }
+            } else if (key.text) |text| {
+                for (text) |ch| {
+                    if (ch >= 32 and ch < 127) {
+                        st.edit_state.insertChar(ch);
+                    }
+                }
+            }
+        },
+    }
+    return .none;
+}
+
+/// Per-frame refresh: copies summaries from the ring, applies the search
+/// filter into filter_map, clamps the cursor to the filtered list.
+fn refreshFrame(st: *TuiState) void {
+    st.summary_count = requests.getSummaries(st.summaries);
+    const raw_count = st.summary_count;
+    const search_term = st.search_buf[0..st.search_len];
+    st.filtered_count = 0;
+    if (st.search_len > 0) {
+        for (0..raw_count) |i| {
+            if (search.entryMatchesSearch(&st.summaries[i], search_term)) {
+                st.filter_map[st.filtered_count] = i;
+                st.filtered_count += 1;
+            }
+        }
+    } else {
+        for (0..raw_count) |i| {
+            st.filter_map[i] = i;
+        }
+        st.filtered_count = raw_count;
+    }
+
+    // Clamp cursor to filtered list (key handlers read it through search.selectedIndex)
+    if (st.filtered_count > 0) {
+        if (st.cursor >= st.filtered_count) st.cursor = st.filtered_count - 1;
+    } else {
+        st.cursor = 0;
+    }
+}
+
 pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, routes: []const proxy.Route, has_command: bool, cert_warning: ?[]const u8, dns_warning: ?[]const u8, version: []const u8) !void {
     const proxy_text = try std.fmt.allocPrint(alloc, "https -> 127.0.0.1:{d}", .{target_port});
     defer alloc.free(proxy_text);
@@ -410,46 +832,18 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
         try vx.queryTerminal(tty.writer(), .fromSeconds(1));
     }
 
-    var cursor: usize = 0;
-    var scroll_offset: usize = 0;
-    var req_autoscroll: bool = true;
-    var logs_visible: bool = has_command;
-    _ = &logs_visible;
-    const Focus = enum { requests, logs };
-    var focus: Focus = .requests;
-    _ = &focus;
-    var logs_scroll: usize = 0;
-    _ = &logs_scroll;
-    var logs_autoscroll: bool = true;
-    _ = &logs_autoscroll;
+    var st: TuiState = .{
+        .alloc = alloc,
+        .domain = domain,
+        .version = version,
+        .routes = routes,
+        .has_command = has_command,
+        .logs_visible = has_command,
+        // Heap: [max_entries]Summary is ~300 KB, too big for a 1 MB main-thread stack.
+        .summaries = try std.heap.page_allocator.alloc(requests.Summary, requests.max_entries),
+    };
+    defer std.heap.page_allocator.free(st.summaries);
     var last_count: usize = 0;
-    var view: View = .list;
-    var detail_scroll: usize = 0;
-    var detail_index: usize = 0;
-    var show_help: bool = false;
-    // On Windows, discard key events until after the first render — terminal
-    // init can produce spurious events from escape sequence responses.
-    var accepting_input: bool = (builtin.os.tag != .windows);
-    var show_body: bool = false;
-    var edit_state: EditState = .{};
-    var search_mode: bool = false;
-    var search_buf: [128]u8 = @splat(0);
-    var search_len: usize = 0;
-    var intercept_mode: bool = false;
-    var intercept_buf: [intercept.max_pattern_len]u8 = @splat(0);
-    var intercept_len: usize = 0;
-    var filtered_count: usize = 0;
-    // Maps filtered index -> index in summaries (= logical index)
-    var filter_map: [requests.max_entries]usize = undefined;
-    var flash_time: i64 = 0; // timestamp when flash message was set
-    var flash_buf: [128]u8 = undefined;
-    var flash_len: usize = 0;
-    var har_fname_buf: [64]u8 = undefined;
-
-    // Heap: [max_entries]Summary is ~300 KB, too big for a 1 MB main-thread stack.
-    const summaries = try std.heap.page_allocator.alloc(requests.Summary, requests.max_entries);
-    defer std.heap.page_allocator.free(summaries);
-    var summary_count: usize = 0;
     const detail_entry = try std.heap.page_allocator.create(requests.Entry);
     defer std.heap.page_allocator.destroy(detail_entry);
 
@@ -459,336 +853,7 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
             switch (event) {
                 .key_press => |key| {
                     if (key.matches('c', .{ .ctrl = true })) return;
-                    if (!accepting_input) continue;
-
-                    // Search mode input handling
-                    if (search_mode) {
-                        if (key.matches(vaxis.Key.escape, .{})) {
-                            // Cancel search, clear filter
-                            search_mode = false;
-                            search_len = 0;
-                            cursor = 0;
-                            scroll_offset = 0;
-                        } else if (key.matches(vaxis.Key.enter, .{})) {
-                            // Confirm search, keep filter
-                            search_mode = false;
-                            cursor = 0;
-                            scroll_offset = 0;
-                        } else if (key.matches(vaxis.Key.backspace, .{})) {
-                            search_len -|= 1;
-                            cursor = 0;
-                            scroll_offset = 0;
-                        } else if (key.text) |text| {
-                            if (search_len + text.len <= search_buf.len) {
-                                @memcpy(search_buf[search_len .. search_len + text.len], text);
-                                search_len += text.len;
-                                cursor = 0;
-                                scroll_offset = 0;
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Intercept pattern input mode
-                    if (intercept_mode) {
-                        if (key.matches(vaxis.Key.escape, .{})) {
-                            intercept_mode = false;
-                            intercept_len = 0;
-                        } else if (key.matches(vaxis.Key.enter, .{})) {
-                            intercept_mode = false;
-                            intercept.enableWithPattern(intercept_buf[0..intercept_len]);
-                        } else if (key.matches(vaxis.Key.backspace, .{})) {
-                            intercept_len -|= 1;
-                        } else if (key.text) |text| {
-                            if (intercept_len + text.len <= intercept_buf.len) {
-                                @memcpy(intercept_buf[intercept_len .. intercept_len + text.len], text);
-                                intercept_len += text.len;
-                            }
-                        }
-                        continue;
-                    }
-
-                    if (key.matches('?', .{})) {
-                        show_help = !show_help;
-                        continue;
-                    }
-                    if (show_help and key.matches(vaxis.Key.escape, .{})) {
-                        show_help = false;
-                        continue;
-                    }
-                    if (key.matches('l', .{}) and has_command) {
-                        logs_visible = !logs_visible;
-                        if (!logs_visible) focus = .requests;
-                        continue;
-                    }
-                    if (key.matches(vaxis.Key.tab, .{}) and logs_visible and view != .edit) {
-                        focus = if (focus == .requests) .logs else .requests;
-                        continue;
-                    }
-
-                    switch (view) {
-                        .list => {
-                            if (key.matches('q', .{})) return;
-                            if (key.matches('/', .{})) {
-                                search_mode = true;
-                                search_len = 0;
-                                continue;
-                            }
-                            if (key.matches('s', .{})) {
-                                if (focus == .logs and logs_visible) {
-                                    logs_autoscroll = !logs_autoscroll;
-                                } else {
-                                    req_autoscroll = !req_autoscroll;
-                                }
-                            }
-                            if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                                if (focus == .logs and logs_visible) {
-                                    logs_scroll +|= 1;
-                                    logs_autoscroll = false;
-                                } else {
-                                    cursor +|= 1;
-                                }
-                            }
-                            if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                                if (focus == .logs and logs_visible) {
-                                    logs_scroll -|= 1;
-                                    logs_autoscroll = false;
-                                } else {
-                                    cursor -|= 1;
-                                }
-                            }
-                            if (key.matches('G', .{})) {
-                                if (focus == .logs and logs_visible) {
-                                    const total = subprocess.getLineCount();
-                                    logs_scroll = total;
-                                } else {
-                                    cursor = filtered_count -| 1;
-                                }
-                            }
-                            if (key.matches('g', .{})) {
-                                if (focus == .logs and logs_visible) {
-                                    logs_scroll = 0;
-                                } else {
-                                    cursor = 0;
-                                }
-                            }
-                            if (key.matches(vaxis.Key.escape, .{})) {
-                                // Clear filter
-                                search_len = 0;
-                                cursor = 0;
-                                scroll_offset = 0;
-                            }
-                            if (key.matches(vaxis.Key.enter, .{})) {
-                                // Map filtered cursor to real logical index
-                                detail_index = search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue;
-                                detail_scroll = 0;
-                                view = .detail;
-                            }
-                            if (key.matches('i', .{})) {
-                                if (intercept.isEnabled()) {
-                                    intercept.toggle();
-                                } else {
-                                    intercept_mode = true;
-                                    intercept_len = 0;
-                                }
-                            }
-                            if (key.matches('a', .{}))
-                                acceptEntry(search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue);
-                            if (key.matches('A', .{}))
-                                intercept.acceptAll();
-                            if (key.matches('C', .{}))
-                                requests.clearAll();
-                            if (key.matches('*', .{})) {
-                                const bi = requests.logicalToBackingIndex(search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue) orelse continue;
-                                requests.toggleStar(bi);
-                            }
-                            if (key.matches('d', .{}))
-                                dropOrDeleteEntry(search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue);
-                            if (key.matches('c', .{})) {
-                                const sel = search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue;
-                                const msg: []const u8 = switch (clipboard.copyAsCurl(alloc, sel, domain)) {
-                                    .copied => "Copied as curl!",
-                                    .truncated => "Request too large to copy: captured copy is truncated",
-                                    .missing => "",
-                                };
-                                @memcpy(flash_buf[0..msg.len], msg);
-                                flash_len = msg.len;
-                                flash_time = rt.milliTimestamp();
-                            }
-                            if (key.matches('u', .{})) {
-                                const msg = shareCopyFlash();
-                                if (msg.len > 0) {
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                            }
-                            if (key.matches('E', .{}) or key.matches('e', .{ .ctrl = true })) {
-                                const redact = key.matches('E', .{});
-                                if (har.exportHar(version, domain, redact, &har_fname_buf)) |fname_len| {
-                                    const note = if (redact) " (cookies and auth redacted; Ctrl+E for full)" else " (full, includes cookies and auth)";
-                                    const flash = std.fmt.bufPrint(&flash_buf, "Exported {s}{s}", .{ har_fname_buf[0..fname_len], note }) catch flash_buf[0..0];
-                                    flash_len = flash.len;
-                                } else {
-                                    const msg = "Export failed";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                }
-                                flash_time = rt.milliTimestamp();
-                            }
-                            if (key.matches('r', .{})) {
-                                const sel = search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue;
-                                if (edit_state.openForReplay(alloc, sel)) {
-                                    view = .edit;
-                                } else if (sel < summary_count and summaries[sel].request_truncated) {
-                                    const msg = "Request too large to replay: captured copy is truncated";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                            }
-                            if (key.matches('R', .{})) {
-                                if (focus == .logs and logs_visible and has_command) {
-                                    subprocess.restart();
-                                    const msg = "Restarting...";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                } else if (search.selectedIndex(&filter_map, filtered_count, cursor)) |sel| {
-                                    const msg: []const u8 = if (replayEntry(sel)) "Replayed!" else "Request too large to replay: captured copy is truncated";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                            }
-                            if (key.matches('e', .{})) {
-                                if (edit_state.open(alloc, search.selectedIndex(&filter_map, filtered_count, cursor) orelse continue)) view = .edit;
-                            }
-                        },
-                        .detail => {
-                            if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
-                                view = .list;
-                            } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                                detail_scroll +|= 1;
-                            } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                                detail_scroll -|= 1;
-                            } else if (key.matches('n', .{}) or key.matches(vaxis.Key.right, .{})) {
-                                cursor +|= 1;
-                                detail_scroll = 0;
-                            } else if (key.matches('p', .{}) or key.matches(vaxis.Key.left, .{})) {
-                                cursor -|= 1;
-                                detail_scroll = 0;
-                            } else if (key.matches('G', .{})) {
-                                detail_scroll = std.math.maxInt(usize);
-                            } else if (key.matches('g', .{})) {
-                                detail_scroll = 0;
-                            } else if (key.matches('s', .{})) {
-                                req_autoscroll = !req_autoscroll;
-                            } else if (key.matches('i', .{})) {
-                                if (intercept.isEnabled()) {
-                                    intercept.toggle();
-                                } else {
-                                    intercept_mode = true;
-                                    intercept_len = 0;
-                                }
-                            } else if (key.matches('*', .{})) {
-                                const bi = requests.logicalToBackingIndex(detail_index) orelse continue;
-                                requests.toggleStar(bi);
-                            } else if (key.matches('a', .{})) {
-                                acceptEntry(detail_index);
-                            } else if (key.matches('d', .{})) {
-                                dropOrDeleteEntry(detail_index);
-                            } else if (key.matches('c', .{})) {
-                                const msg: []const u8 = switch (clipboard.copyAsCurl(alloc, detail_index, domain)) {
-                                    .copied => "Copied as curl!",
-                                    .truncated => "Request too large to copy: captured copy is truncated",
-                                    .missing => "",
-                                };
-                                @memcpy(flash_buf[0..msg.len], msg);
-                                flash_len = msg.len;
-                                flash_time = rt.milliTimestamp();
-                            } else if (key.matches('u', .{})) {
-                                const msg = shareCopyFlash();
-                                if (msg.len > 0) {
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                            } else if (key.matches('r', .{})) {
-                                if (edit_state.openForReplay(alloc, detail_index)) {
-                                    view = .edit;
-                                } else if (detail_index < summary_count and summaries[detail_index].request_truncated) {
-                                    const msg = "Request too large to replay: captured copy is truncated";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                            } else if (key.matches('R', .{})) {
-                                const msg: []const u8 = if (replayEntry(detail_index)) "Replayed!" else "Request too large to replay: captured copy is truncated";
-                                @memcpy(flash_buf[0..msg.len], msg);
-                                flash_len = msg.len;
-                                flash_time = rt.milliTimestamp();
-                            } else if (key.matches('b', .{})) {
-                                show_body = !show_body;
-                                detail_scroll = 0;
-                            } else if (key.matches('e', .{})) {
-                                if (edit_state.open(alloc, detail_index)) view = .edit;
-                            }
-                        },
-                        .edit => {
-                            if (key.matches(vaxis.Key.escape, .{})) {
-                                // Cancel edit
-                                edit_state.active = false;
-                                view = .list;
-                            } else if (key.matches('s', .{ .ctrl = true })) {
-                                if (edit_state.commit(alloc) == .replayed) {
-                                    const msg = "Replayed!";
-                                    @memcpy(flash_buf[0..msg.len], msg);
-                                    flash_len = msg.len;
-                                    flash_time = rt.milliTimestamp();
-                                }
-                                edit_state.active = false;
-                                view = .list;
-                            } else if (key.matches(vaxis.Key.tab, .{})) {
-                                edit_state.nextField();
-                            } else if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
-                                edit_state.prevField();
-                            } else if (key.matches(vaxis.Key.left, .{})) {
-                                edit_state.cursor -|= 1;
-                            } else if (key.matches(vaxis.Key.right, .{})) {
-                                if (edit_state.cursor < edit_state.activeLen())
-                                    edit_state.cursor += 1;
-                            } else if (key.matches(vaxis.Key.home, .{})) {
-                                edit_state.cursor = 0;
-                            } else if (key.matches(vaxis.Key.end, .{})) {
-                                edit_state.cursor = edit_state.activeLen();
-                            } else if (key.matches(vaxis.Key.up, .{})) {
-                                if (edit_state.isMultiline()) {
-                                    edit_state.moveUp();
-                                }
-                            } else if (key.matches(vaxis.Key.down, .{})) {
-                                if (edit_state.isMultiline()) {
-                                    edit_state.moveDown();
-                                }
-                            } else if (key.matches(vaxis.Key.backspace, .{})) {
-                                edit_state.deleteBack();
-                            } else if (key.matches(vaxis.Key.delete, .{})) {
-                                edit_state.deleteForward();
-                            } else if (key.matches(vaxis.Key.enter, .{})) {
-                                if (edit_state.isMultiline()) {
-                                    edit_state.insertNewline();
-                                } else {
-                                    edit_state.nextField();
-                                }
-                            } else if (key.text) |text| {
-                                for (text) |ch| {
-                                    if (ch >= 32 and ch < 127) {
-                                        edit_state.insertChar(ch);
-                                    }
-                                }
-                            }
-                        },
-                    }
+                    if (handleKey(&st, key) == .quit) return;
                 },
                 .winsize => |ws| try vx.resize(alloc, tty.writer(), ws),
             }
@@ -799,48 +864,26 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
         const win = vx.window();
         win.clear();
 
-        // Build filter map (used by both views)
-        summary_count = requests.getSummaries(summaries);
-        const raw_count = summary_count;
-        const search_term = search_buf[0..search_len];
-        filtered_count = 0;
-        if (search_len > 0) {
-            for (0..raw_count) |i| {
-                if (search.entryMatchesSearch(&summaries[i], search_term)) {
-                    filter_map[filtered_count] = i;
-                    filtered_count += 1;
-                }
-            }
-        } else {
-            for (0..raw_count) |i| {
-                filter_map[i] = i;
-            }
-            filtered_count = raw_count;
-        }
+        refreshFrame(&st);
+        const raw_count = st.summary_count;
+        const search_term = st.search_buf[0..st.search_len];
 
-        // Clamp cursor to filtered list (key handlers read it through search.selectedIndex)
-        if (filtered_count > 0) {
-            if (cursor >= filtered_count) cursor = filtered_count - 1;
-        } else {
-            cursor = 0;
-        }
-
-        if (req_autoscroll and current_count > last_count and filtered_count > 0) {
-            cursor = filtered_count - 1;
-            if (view == .detail) detail_scroll = 0;
+        if (st.req_autoscroll and current_count > last_count and st.filtered_count > 0) {
+            st.cursor = st.filtered_count - 1;
+            if (st.view == .detail) st.detail_scroll = 0;
         }
         last_count = current_count;
 
         share.checkTimeout(rt.milliTimestamp());
 
-        switch (view) {
+        switch (st.view) {
             .list => {
-                const req_focused = !logs_visible or focus == .requests;
-                const header_rows = drawHeader(win, domain, proxy_text, ca_text, cert_warning, dns_warning, raw_count, req_autoscroll, routes, req_focused);
+                const req_focused = !st.logs_visible or st.focus == .requests;
+                const header_rows = drawHeader(win, domain, proxy_text, ca_text, cert_warning, dns_warning, raw_count, st.req_autoscroll, routes, req_focused);
                 const footer_h: u16 = 2; // footer + search/intercept bar
                 const body_h = if (win.height > header_rows + footer_h) win.height - header_rows - footer_h else 1;
 
-                if (logs_visible) {
+                if (st.logs_visible) {
                     // Split layout: 60% requests, 40% logs, 1 row for border between panes
                     const border_rows: u16 = 1;
                     const usable = if (body_h > border_rows) body_h - border_rows else 1;
@@ -857,82 +900,82 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                         .height = req_h,
                     });
                     // Adjust scroll to keep cursor visible within req_h
-                    if (cursor < scroll_offset) {
-                        scroll_offset = cursor;
-                    } else if (cursor >= scroll_offset + req_h) {
-                        scroll_offset = cursor - req_h + 1;
+                    if (st.cursor < st.scroll_offset) {
+                        st.scroll_offset = st.cursor;
+                    } else if (st.cursor >= st.scroll_offset + req_h) {
+                        st.scroll_offset = st.cursor - req_h + 1;
                     }
                     // Pass req_win with start_row=0 (drawing relative to the child window), draw_footer=false
-                    drawRequests(req_win, summaries[0..summary_count], &filter_map, filtered_count, 0, scroll_offset, cursor, req_autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len], false, has_command);
+                    drawRequests(req_win, st.summaries[0..st.summary_count], &st.filter_map, st.filtered_count, 0, st.scroll_offset, st.cursor, st.req_autoscroll, st.show_help, st.search_mode, search_term, st.intercept_mode, st.intercept_buf[0..st.intercept_len], false, has_command);
 
                     // Logs border + pane
                     const logs_border_y = req_start + req_h;
                     var label_buf: [32]u8 = undefined;
-                    const label = if (logs_autoscroll)
+                    const label = if (st.logs_autoscroll)
                         (std.fmt.bufPrint(&label_buf, " logs (autoscroll) ", .{}) catch " logs ")
                     else
                         " logs ";
-                    drawBorder(win, logs_border_y, label, focus == .logs);
-                    drawLogs(win, logs_border_y + 1, logs_h, logs_autoscroll, logs_scroll);
+                    drawBorder(win, logs_border_y, label, st.focus == .logs);
+                    drawLogs(win, logs_border_y + 1, logs_h, st.logs_autoscroll, st.logs_scroll);
 
                     // Draw footer in main window below logs pane
-                    if (intercept_mode)
-                        drawInterceptBar(win, intercept_buf[0..intercept_len])
-                    else if (search_mode or search_term.len > 0)
-                        drawSearchBar(win, search_mode, search_term)
+                    if (st.intercept_mode)
+                        drawInterceptBar(win, st.intercept_buf[0..st.intercept_len])
+                    else if (st.search_mode or search_term.len > 0)
+                        drawSearchBar(win, st.search_mode, search_term)
                     else
-                        drawFooter(win, req_autoscroll, show_help, has_command);
+                        drawFooter(win, st.req_autoscroll, st.show_help, has_command);
                 } else {
                     // Original single-pane layout (unchanged)
                     const available_rows = if (win.height > header_rows + 2) win.height - header_rows - 2 else 1;
-                    if (cursor < scroll_offset) {
-                        scroll_offset = cursor;
-                    } else if (cursor >= scroll_offset + available_rows) {
-                        scroll_offset = cursor - available_rows + 1;
+                    if (st.cursor < st.scroll_offset) {
+                        st.scroll_offset = st.cursor;
+                    } else if (st.cursor >= st.scroll_offset + available_rows) {
+                        st.scroll_offset = st.cursor - available_rows + 1;
                     }
-                    drawRequests(win, summaries[0..summary_count], &filter_map, filtered_count, header_rows, scroll_offset, cursor, req_autoscroll, show_help, search_mode, search_term, intercept_mode, intercept_buf[0..intercept_len], true, has_command);
+                    drawRequests(win, st.summaries[0..st.summary_count], &st.filter_map, st.filtered_count, header_rows, st.scroll_offset, st.cursor, st.req_autoscroll, st.show_help, st.search_mode, search_term, st.intercept_mode, st.intercept_buf[0..st.intercept_len], true, has_command);
                 }
             },
             .detail => {
                 // Resolve filtered cursor to real logical index
-                if (filtered_count > 0) {
-                    detail_index = filter_map[cursor];
+                if (st.filtered_count > 0) {
+                    st.detail_index = st.filter_map[st.cursor];
                 }
-                const entry: ?*const requests.Entry = if (filtered_count > 0 and requests.copyEntry(detail_index, detail_entry)) detail_entry else null;
-                drawDetail(alloc, win, entry, detail_index, raw_count, req_autoscroll, &detail_scroll, show_help, show_body);
+                const entry: ?*const requests.Entry = if (st.filtered_count > 0 and requests.copyEntry(st.detail_index, detail_entry)) detail_entry else null;
+                drawDetail(alloc, win, entry, st.detail_index, raw_count, st.req_autoscroll, &st.detail_scroll, st.show_help, st.show_body);
             },
             .edit => {
-                drawEdit(win, &edit_state);
+                drawEdit(win, &st.edit_state);
             },
         }
 
         // Flash message (top-right, visible for 2 seconds)
-        if (flash_len > 0) {
+        if (st.flash_len > 0) {
             const now = rt.milliTimestamp();
-            if (now - flash_time < 2000) {
-                const col: u16 = @intCast(win.width -| (flash_len + 2));
+            if (now - st.flash_time < 2000) {
+                const col: u16 = @intCast(win.width -| (st.flash_len + 2));
                 const green: vaxis.Color = .{ .rgb = .{ 0x3f, 0xb9, 0x50 } };
-                writeAscii(win, col, 0, flash_buf[0..flash_len], .{ .fg = green, .bold = true });
+                writeAscii(win, col, 0, st.flash_buf[0..st.flash_len], .{ .fg = green, .bold = true });
             } else {
-                flash_len = 0;
+                st.flash_len = 0;
             }
         }
 
         try vx.render(tty.writer());
-        accepting_input = true;
+        st.accepting_input = true;
         rt.sleepMs(50);
     }
 }
 
 /// Flash text for the `u` key: copies the share URL when the tunnel is ready.
-fn shareCopyFlash() []const u8 {
+fn shareCopyFlash(effects: *const Effects) []const u8 {
     const snap = share.snapshot();
     switch (snap.status) {
         .off => return "",
         .ready => {
             var url_buf: [share.max_host_len + 8]u8 = undefined;
             const url = std.fmt.bufPrint(&url_buf, "https://{s}", .{snap.getHost()}) catch return "Share not ready";
-            return if (clipboard.copyText(url)) "Copied share URL!" else "Clipboard unavailable";
+            return if (effects.copyText(url)) "Copied share URL!" else "Clipboard unavailable";
         },
         else => return "Share not ready",
     }
