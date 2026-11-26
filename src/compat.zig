@@ -393,6 +393,19 @@ pub fn tcpConnect(ip: Ip) SocketError!socket_t {
 /// (0 = block like tcpConnect). The returned socket is blocking.
 pub fn tcpConnectTimeout(ip: Ip, timeout_ms: u32) SocketError!socket_t {
     if (timeout_ms == 0) return tcpConnect(ip);
+    const sock = try connectNonBlocking(ip, timeout_ms, null);
+    errdefer closeSocket(sock);
+    try setBlocking(sock, true);
+    return sock;
+}
+
+/// Like tcpConnectTimeout, but the returned socket stays non-blocking and the
+/// wait also ends (`error.TimedOut`) within 100ms of `running()` turning false.
+pub fn tcpConnectNonBlocking(ip: Ip, timeout_ms: u32, running: *const fn () bool) SocketError!socket_t {
+    return connectNonBlocking(ip, timeout_ms, running);
+}
+
+fn connectNonBlocking(ip: Ip, timeout_ms: u32, running: ?*const fn () bool) SocketError!socket_t {
     const sock = try openSocket(family(ip), posix.SOCK.STREAM);
     errdefer closeSocket(sock);
     try setBlocking(sock, false);
@@ -400,28 +413,34 @@ pub fn tcpConnectTimeout(ip: Ip, timeout_ms: u32) SocketError!socket_t {
     if (builtin.os.tag == .windows) {
         if (win32.connect(sock, &sa.storage, @intCast(sa.len)) != 0) {
             if (win32.WSAGetLastError() != 10035) return lastError(); // WSAEWOULDBLOCK
-            try awaitConnect(sock, timeout_ms);
+            try awaitConnect(sock, timeout_ms, running);
         }
     } else connect: while (true) {
         switch (posix.errno(posix.system.connect(sock, @ptrCast(&sa.storage), sa.len))) {
             .SUCCESS => break :connect,
             .INTR => continue,
             .INPROGRESS => {
-                try awaitConnect(sock, timeout_ms);
+                try awaitConnect(sock, timeout_ms, running);
                 break :connect;
             },
             else => |e| return posixError(e),
         }
     }
-    try setBlocking(sock, true);
     return sock;
 }
 
-/// Wait for a non-blocking connect to finish and report its result.
-fn awaitConnect(sock: socket_t, timeout_ms: u32) SocketError!void {
+/// Wait for a non-blocking connect to finish and report its result. With
+/// `running`, polls in 100ms slices and gives up once it returns false.
+fn awaitConnect(sock: socket_t, timeout_ms: u32, running: ?*const fn () bool) SocketError!void {
     var fds = [1]pollfd{.{ .fd = sock, .events = POLL.OUT, .revents = 0 }};
-    const n = poll(&fds, @intCast(timeout_ms)) catch return error.Unexpected;
-    if (n == 0) return error.TimedOut;
+    var waited: u32 = 0;
+    while (true) {
+        if (running) |r| if (!r()) return error.TimedOut;
+        if (waited >= timeout_ms) return error.TimedOut;
+        const slice = if (running != null) @min(100, timeout_ms - waited) else timeout_ms;
+        if ((poll(&fds, @intCast(slice)) catch return error.Unexpected) > 0) break;
+        waited += slice;
+    }
     var err: c_int = 0;
     if (builtin.os.tag == .windows) {
         var len: c_int = @sizeOf(c_int);
@@ -732,4 +751,33 @@ test "tcpConnectTimeout gives up on an address that never answers" {
         return error.TestUnexpectedResult;
     } else |e| try std.testing.expect(e == error.TimedOut or e == error.NetworkUnreachable or e == error.Unexpected);
     try std.testing.expect(rt.milliTimestamp() - t0 < 1500);
+}
+
+const StopAfter = struct {
+    var deadline: i64 = 0;
+    fn running() bool {
+        return @import("rt.zig").milliTimestamp() < deadline;
+    }
+    fn always() bool {
+        return true;
+    }
+};
+
+test "tcpConnectNonBlocking connects to a listener" {
+    const l = try tcpListen(try Ip.parseIp4("127.0.0.1", 18362));
+    defer closeSocket(l);
+    const s = try tcpConnectNonBlocking(try Ip.parseIp4("127.0.0.1", 18362), 1000, StopAfter.always);
+    closeSocket(s);
+}
+
+test "tcpConnectNonBlocking stops soon after running() turns false" {
+    const rt = @import("rt.zig");
+    const t0 = rt.milliTimestamp();
+    StopAfter.deadline = t0 + 100;
+    const r = tcpConnectNonBlocking(try Ip.parseIp4("10.255.255.1", 9), 5000, StopAfter.running);
+    if (r) |s| {
+        closeSocket(s);
+        return error.TestUnexpectedResult;
+    } else |e| try std.testing.expect(e == error.TimedOut or e == error.NetworkUnreachable or e == error.Unexpected);
+    try std.testing.expect(rt.milliTimestamp() - t0 < 500);
 }

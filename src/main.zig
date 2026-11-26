@@ -650,8 +650,9 @@ fn doStart(
         if (tunnel.start(cloudflared_path, tunnel.targetAddr(bind_owned, &target_buf))) |_| {
             tunnel_started = true;
             probe_thread = std.Thread.spawn(.{}, shareProbeLoop, .{}) catch |e| blk: {
-                log.err("component=share op=probe_start error={any}", .{e});
-                share.fail("could not start the share URL check");
+                // Without the check, show the URL (unverified) as soon as it appears.
+                log.err("component=share op=probe_start error={any} fallback=unverified", .{e});
+                share.skipVerification();
                 break :blk null;
             };
         } else |e| {
@@ -683,7 +684,16 @@ fn doStart(
                                 std.Io.File.stdout().writeStreamingAll(rt.io(), line) catch {};
                             } else |_| {}
                         },
-                        .failed, .exited => std.debug.print("share: {s}\n", .{snap.getReason()}),
+                        .failed, .exited => {
+                            std.debug.print("share: {s}\n", .{snap.getReason()});
+                            // Our check may be what is blocked: still give the URL.
+                            if (snap.hasUnverifiedUrl()) {
+                                var out_buf: [share.max_host_len + 48]u8 = undefined;
+                                if (std.fmt.bufPrint(&out_buf, "share: https://{s} (unverified)\n", .{snap.getHost()})) |line| {
+                                    std.Io.File.stdout().writeStreamingAll(rt.io(), line) catch {};
+                                } else |_| {}
+                            }
+                        },
                         else => {},
                     }
                 }
@@ -715,29 +725,44 @@ fn doStart(
 
 var share_probe_stop: std.atomic.Value(bool) = .init(false);
 
-/// Checks the public URL end to end once a second after cloudflared registers its
-/// connection, and marks it ready on the first success, so the URL is never shown
-/// (or copied) before a browser can open it. Logs each change of result.
+fn shareProbeKeepGoing() bool {
+    return shutdown.isRunning() and !share_probe_stop.load(.acquire);
+}
+
+/// Checks the public URL end to end once a second, from cloudflared's registered
+/// connection (or 5s after the URL appeared), and marks it ready on the first
+/// success, so the URL is never shown (or copied) before a browser can open it.
+/// After the 60s deadline it keeps checking every 10s. Logs each change of result.
 fn shareProbeLoop() void {
+    var client = share_probe.Client.init();
+    defer client.deinit();
     var last: ?share_probe.ProbeResult = null;
-    while (shutdown.isRunning() and !share_probe_stop.load(.acquire)) {
+    while (shareProbeKeepGoing()) {
         const status = share.snapshot().status;
         if (status == .ready or status == .exited) return;
-        const waiting = status == .verifying or status == .failed;
-        if (waiting and share.isConnected()) {
+        if (share.shouldProbe(rt.milliTimestamp())) {
             if (share.publicHost()) |host| {
-                const result = share_probe.probeOnce(host);
+                const result = client.probe(host, shareProbeKeepGoing);
+                if (!shareProbeKeepGoing()) return;
                 if (result == .ok) {
                     if (share.markVerified()) log.note("component=share op=ready url=https://{s}", .{host});
                     return;
                 }
-                if (last != result) log.note("component=share op=probe url=https://{s} result={s}", .{ host, @tagName(result) });
+                share.setProbeHint(share_probe.hint(result));
+                if (last != result) {
+                    if (result == .tls_failed) {
+                        log.note("component=share op=probe url=https://{s} result={s} error=\"{s}\"", .{ host, @tagName(result), client.tls_error });
+                    } else {
+                        log.note("component=share op=probe url=https://{s} result={s}", .{ host, @tagName(result) });
+                    }
+                }
                 last = result;
             }
         }
-        // 1s between checks, sliced so quitting isn't held up.
+        // Sliced so quitting isn't held up.
+        const interval_ms: u32 = if (share.snapshot().status == .failed) 10_000 else 1000;
         var slept: u32 = 0;
-        while (slept < 1000 and shutdown.isRunning() and !share_probe_stop.load(.acquire)) : (slept += 100) rt.sleepMs(100);
+        while (slept < interval_ms and shareProbeKeepGoing()) : (slept += 100) rt.sleepMs(100);
     }
 }
 

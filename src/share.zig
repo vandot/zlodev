@@ -9,6 +9,10 @@ pub const max_reason_len = 192;
 
 const start_timeout_ms: i64 = 30_000;
 const verify_timeout_ms: i64 = 60_000;
+/// Probe this long after the URL appears even if cloudflared never logged its
+/// registered connection (its wording may change).
+const probe_fallback_ms: i64 = 5_000;
+const max_hint_len = 64;
 const tunnel_suffix = ".trycloudflare.com";
 
 pub const Snapshot = struct {
@@ -25,6 +29,12 @@ pub const Snapshot = struct {
     pub fn getReason(self: *const Snapshot) []const u8 {
         return self.reason[0..self.reason_len];
     }
+
+    /// The URL was never verified within the deadline: shown and copyable only as
+    /// unverified, next to the failure reason.
+    pub fn hasUnverifiedUrl(self: *const Snapshot) bool {
+        return self.status == .failed and self.host_len > 0;
+    }
 };
 
 var mutex: std.Io.Mutex = .init;
@@ -37,6 +47,11 @@ var state: Snapshot = .{
 };
 var start_ms: i64 = 0;
 var verify_start_ms: i64 = 0;
+// Last probe outcome in words, for the verify-timeout reason (mutex).
+var probe_hint: [max_hint_len]u8 = undefined;
+var probe_hint_len: usize = 0;
+// The end-to-end check can't run: publishHost goes straight to ready (mutex).
+var verify_skipped = false;
 // cloudflared reported a registered tunnel connection.
 var connected = std.atomic.Value(bool).init(false);
 // Set (release) once host bytes are final; they are never written again until
@@ -56,6 +71,8 @@ pub fn begin(now_ms: i64) void {
     state.host_len = 0;
     state.reason_len = 0;
     start_ms = now_ms;
+    probe_hint_len = 0;
+    verify_skipped = false;
     host_published.store(false, .release);
     connected.store(false, .release);
 }
@@ -75,7 +92,7 @@ fn publishHostAt(host: []const u8, now_ms: i64) bool {
     @memcpy(state.host[0..host.len], host);
     state.host_len = @intCast(host.len);
     state.reason_len = 0;
-    state.status = .verifying;
+    state.status = if (verify_skipped) .ready else .verifying;
     verify_start_ms = now_ms;
     host_published.store(true, .release);
     return true;
@@ -90,6 +107,38 @@ pub fn markVerified() bool {
     state.status = .ready;
     state.reason_len = 0;
     return true;
+}
+
+/// The check can't run (its thread failed to start): show the URL unverified as
+/// soon as it appears, or right away if it already has.
+pub fn skipVerification() void {
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
+    verify_skipped = true;
+    if (host_published.load(.monotonic) and (state.status == .verifying or state.status == .failed)) {
+        state.status = .ready;
+        state.reason_len = 0;
+    }
+}
+
+/// Remember the last probe outcome (short words, e.g. `TLS check failed`) for the
+/// verify-timeout reason.
+pub fn setProbeHint(hint: []const u8) void {
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
+    const n = @min(hint.len, max_hint_len);
+    @memcpy(probe_hint[0..n], hint[0..n]);
+    probe_hint_len = n;
+}
+
+/// True when the URL should be checked now: it is published but not ready, and
+/// cloudflared registered its connection or the URL is 5s old.
+pub fn shouldProbe(now_ms: i64) bool {
+    mutex.lockUncancelable(rt.io());
+    defer mutex.unlock(rt.io());
+    if (!host_published.load(.monotonic)) return false;
+    if (state.status != .verifying and state.status != .failed) return false;
+    return connected.load(.acquire) or now_ms - verify_start_ms >= probe_fallback_ms;
 }
 
 pub fn markConnected() void {
@@ -126,7 +175,11 @@ pub fn checkTimeout(now_ms: i64) void {
         setReason("no URL from cloudflared after 30s \u{2014} see zlodev.log");
     } else if (state.status == .verifying and now_ms - verify_start_ms >= verify_timeout_ms) {
         var buf: [max_reason_len]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "Cloudflare hasn't routed https://{s} yet after 60s \u{2014} see zlodev.log", .{state.host[0..state.host_len]}) catch "Cloudflare hasn't routed the URL yet after 60s \u{2014} see zlodev.log";
+        const host = state.host[0..state.host_len];
+        const msg = if (probe_hint_len > 0)
+            std.fmt.bufPrint(&buf, "https://{s} isn't reachable yet after 60s ({s}) \u{2014} see zlodev.log", .{ host, probe_hint[0..probe_hint_len] }) catch "the URL isn't reachable yet after 60s \u{2014} see zlodev.log"
+        else
+            std.fmt.bufPrint(&buf, "Cloudflare hasn't routed https://{s} yet after 60s \u{2014} see zlodev.log", .{host}) catch "Cloudflare hasn't routed the URL yet after 60s \u{2014} see zlodev.log";
         state.status = .failed;
         setReason(msg);
     }
@@ -156,6 +209,8 @@ pub fn resetForTest() void {
     state.reason_len = 0;
     start_ms = 0;
     verify_start_ms = 0;
+    probe_hint_len = 0;
+    verify_skipped = false;
     host_published.store(false, .release);
     connected.store(false, .release);
 }
@@ -317,4 +372,65 @@ test "state: checkTimeout never fails a state that already moved on" {
     try testing.expect(markVerified());
     checkTimeout(1_000_000);
     try testing.expectEqual(Status.ready, snapshot().status);
+}
+
+test "state: verify timeout reason names the last probe result" {
+    resetForTest();
+    begin(0);
+    try testing.expect(publishHostAt("a.trycloudflare.com", 0));
+    setProbeHint("couldn't reach 1.1.1.1");
+    checkTimeout(60_000);
+    const s = snapshot();
+    try testing.expectEqual(Status.failed, s.status);
+    try testing.expectEqualStrings("https://a.trycloudflare.com isn't reachable yet after 60s (couldn't reach 1.1.1.1) \u{2014} see zlodev.log", s.getReason());
+    try testing.expect(s.hasUnverifiedUrl());
+    // begin clears the hint.
+    begin(0);
+    try testing.expect(publishHostAt("a.trycloudflare.com", 0));
+    checkTimeout(60_000);
+    try testing.expect(std.mem.startsWith(u8, snapshot().getReason(), "Cloudflare hasn't routed"));
+}
+test "state: hasUnverifiedUrl only when failed with a host" {
+    resetForTest();
+    begin(0);
+    try testing.expect(!snapshot().hasUnverifiedUrl());
+    checkTimeout(30_000);
+    try testing.expect(!snapshot().hasUnverifiedUrl()); // failed, no host
+    try testing.expect(publishHostAt("a.trycloudflare.com", 30_000));
+    try testing.expect(!snapshot().hasUnverifiedUrl()); // verifying
+    checkTimeout(90_000);
+    try testing.expect(snapshot().hasUnverifiedUrl());
+    try testing.expect(markVerified());
+    try testing.expect(!snapshot().hasUnverifiedUrl());
+}
+test "state: shouldProbe after connect or 5s after the URL" {
+    resetForTest();
+    begin(0);
+    try testing.expect(!shouldProbe(100_000)); // no URL yet
+    try testing.expect(publishHostAt("a.trycloudflare.com", 1000));
+    try testing.expect(!shouldProbe(5999));
+    try testing.expect(shouldProbe(6000));
+    markConnected();
+    try testing.expect(shouldProbe(1000));
+    checkTimeout(61_000);
+    try testing.expect(shouldProbe(61_000)); // failed with host: keep checking
+    try testing.expect(markVerified());
+    try testing.expect(!shouldProbe(70_000));
+}
+test "state: skipVerification marks the URL ready when it appears" {
+    resetForTest();
+    begin(0);
+    skipVerification();
+    try testing.expect(publishHost("a.trycloudflare.com"));
+    try testing.expectEqual(Status.ready, snapshot().status);
+    // Already verifying: moves to ready right away.
+    resetForTest();
+    begin(0);
+    try testing.expect(publishHost("a.trycloudflare.com"));
+    skipVerification();
+    try testing.expectEqual(Status.ready, snapshot().status);
+    // begin clears it.
+    begin(0);
+    try testing.expect(publishHost("b.trycloudflare.com"));
+    try testing.expectEqual(Status.verifying, snapshot().status);
 }

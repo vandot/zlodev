@@ -967,18 +967,17 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     }
 }
 
-/// Flash text for the `u` key: copies the share URL when the tunnel is ready.
+/// Flash text for the `u` key: copies the share URL when the tunnel is ready, or
+/// as unverified once the check timed out (our check may be what is blocked).
 fn shareCopyFlash(effects: *const Effects) []const u8 {
     const snap = share.snapshot();
-    switch (snap.status) {
-        .off => return "",
-        .ready => {
-            var url_buf: [share.max_host_len + 8]u8 = undefined;
-            const url = std.fmt.bufPrint(&url_buf, "https://{s}", .{snap.getHost()}) catch return "Share not ready";
-            return if (effects.copyText(url)) "Copied share URL!" else "Clipboard unavailable";
-        },
-        else => return "Share not ready",
-    }
+    if (snap.status == .off) return "";
+    const unverified = snap.hasUnverifiedUrl();
+    if (snap.status != .ready and !unverified) return "Share not ready";
+    var url_buf: [share.max_host_len + 8]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "https://{s}", .{snap.getHost()}) catch return "Share not ready";
+    if (!effects.copyText(url)) return "Clipboard unavailable";
+    return if (unverified) "Copied share URL (unverified)" else "Copied share URL!";
 }
 
 fn drawShareRows(win: vaxis.Window, start_row: u16, routes: []const proxy.Route) u16 {
@@ -999,7 +998,13 @@ fn drawShareRows(win: vaxis.Window, start_row: u16, routes: []const proxy.Route)
             writeAscii(win, 11, row, url, .{ .fg = blue });
             printAt(win, 11 + @as(u16, @intCast(url.len)), row, "  u: copy · public: anyone with this URL can reach your dev server", .{ .fg = yellow });
         },
-        else => writeAscii(win, 11, row, snap.getReason(), .{ .fg = yellow, .bold = true }),
+        else => {
+            const reason = snap.getReason();
+            writeAscii(win, 11, row, reason, .{ .fg = yellow, .bold = true });
+            if (snap.hasUnverifiedUrl()) {
+                writeAscii(win, 11 + @as(u16, @intCast(reason.len)), row, "  u: copy (unverified)", .{ .fg = dim });
+            }
+        },
     }
     row += 1;
 
@@ -2149,6 +2154,20 @@ test "tui: SHARE row shows failure and exit reasons" {
     }
 }
 
+test "tui: SHARE row after the verify timeout shows the reason and unverified copy" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    share.setProbeHint("couldn't reach 1.1.1.1");
+    share.checkTimeout(std.math.maxInt(i64) / 2);
+    var ts = try TestScreen.init(200, 24);
+    defer ts.deinit();
+    _ = testHeader(ts.window(), null, null, &.{});
+    try std.testing.expect(ts.hasText("https://a-b.trycloudflare.com isn't reachable yet after 60s (couldn't reach 1.1.1.1)"));
+    try std.testing.expect(ts.hasText("u: copy (unverified)"));
+}
+
 test "tui: SHARE lists external path routes while verifying" {
     share.resetForTest();
     defer share.resetForTest();
@@ -2474,6 +2493,35 @@ test "tui: u copies the share URL" {
     try std.testing.expectEqualStrings("https://a-b.trycloudflare.com", KeyRec.copied());
     try std.testing.expectEqualStrings("Copied share URL!", st.flash_buf[0..st.flash_len]);
     try std.testing.expect(st.flash_time != 0);
+}
+
+test "tui: u after the verify timeout copies the URL as unverified" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    share.setProbeHint("TLS check failed");
+    share.checkTimeout(std.math.maxInt(i64) / 2);
+    try std.testing.expect(share.snapshot().hasUnverifiedUrl());
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("https://a-b.trycloudflare.com", KeyRec.copied());
+    try std.testing.expectEqualStrings("Copied share URL (unverified)", st.flash_buf[0..st.flash_len]);
+}
+
+test "tui: u with a failure but no URL says not ready" {
+    const sums = try testSummaries();
+    defer std.testing.allocator.free(sums);
+    var st = testState(sums);
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    share.fail("boom");
+    _ = handleKey(&st, pk('u'));
+    try std.testing.expectEqualStrings("Share not ready", st.flash_buf[0..st.flash_len]);
+    try std.testing.expectEqual(@as(usize, 0), KeyRec.copy_calls);
 }
 
 test "tui: u reports a missing clipboard tool" {

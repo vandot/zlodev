@@ -1,28 +1,55 @@
 //! End-to-end check that a share URL works: resolve the tunnel host at a public
 //! resolver (never the system one, so the OS can't cache an early NXDOMAIN), then
 //! TLS to that address with SNI + hostname verification and `GET /.zlodev/health`.
+//!
+//! Every wait is sliced (100ms) and checks a caller's `keep_going`, so quitting
+//! never waits on a probe; sockets are non-blocking throughout.
 const std = @import("std");
-const builtin = @import("builtin");
-const posix = std.posix;
 const compat = @import("compat.zig");
 const http_wire = @import("http_wire.zig");
 const proxy = @import("proxy.zig");
 const rt = @import("rt.zig");
-const shutdown = @import("shutdown.zig");
-const win32 = @import("win32.zig");
 
 const ssl_c = @import("ssl_c");
 
 const IpAddress = std.Io.net.IpAddress;
 
-pub const ProbeResult = enum { ok, no_dns, connect_failed, tls_failed, bad_response };
+pub const ProbeResult = enum {
+    ok,
+    /// Neither public resolver answered (UDP/53 blocked?).
+    dns_unreachable,
+    /// The resolver answered without an A record (not routed yet).
+    no_dns,
+    connect_failed,
+    tls_failed,
+    bad_response,
+};
 
-/// Public resolver for the tunnel host (Cloudflare's own, so it sees new
-/// trycloudflare names first).
-pub const public_resolver = [4]u8{ 1, 1, 1, 1 };
+/// Short words for the failure reason: `isn't reachable yet after 60s (<hint>)`.
+pub fn hint(result: ProbeResult) []const u8 {
+    return switch (result) {
+        .ok => "",
+        .dns_unreachable => "couldn't reach 1.1.1.1",
+        .no_dns => "no DNS record yet",
+        .connect_failed => "couldn't connect",
+        .tls_failed => "TLS check failed",
+        .bad_response => "Cloudflare answered with an error",
+    };
+}
+
+/// Public resolvers for the tunnel host (Cloudflare's own, so they see new
+/// trycloudflare names first); the second is asked only if the first is silent.
+pub const public_resolvers = [_]IpAddress{
+    .{ .ip4 = .{ .bytes = .{ 1, 1, 1, 1 }, .port = 53 } },
+    .{ .ip4 = .{ .bytes = .{ 1, 0, 0, 1 }, .port = 53 } },
+};
 const dns_timeout_ms: u32 = 2000;
-/// Budget for TCP connect + TLS handshake + response.
+/// Hard budget for TCP connect + TLS handshake + response.
 const fetch_timeout_ms: u32 = 5000;
+/// Longest single wait, so a stop is noticed quickly.
+const slice_ms: u32 = 100;
+
+pub const KeepGoing = *const fn () bool;
 
 const dns_header_len = 12;
 const dns_type_a: u16 = 1;
@@ -108,36 +135,60 @@ pub fn parseAAnswer(resp: []const u8, id: u16) ?[4]u8 {
     return null;
 }
 
-/// Resolve `host`'s A record at `server` port 53 (UDP), waiting up to `timeout_ms`.
-pub fn resolveA(host: []const u8, server: [4]u8, timeout_ms: u32) ?[4]u8 {
-    return resolveAAt(host, .{ .ip4 = .{ .bytes = server, .port = 53 } }, timeout_ms);
+pub const Lookup = union(enum) {
+    addr: [4]u8,
+    /// Answered, but no A record (NXDOMAIN, empty, malformed).
+    no_record,
+    /// No reply in time (or stopped, or a socket error).
+    no_reply,
+};
+
+/// Resolve `host`'s A record at each of `servers` in turn, moving on only when
+/// one doesn't answer at all.
+pub fn resolveAFrom(host: []const u8, servers: []const IpAddress, timeout_ms: u32, keep_going: KeepGoing) Lookup {
+    for (servers) |server| {
+        if (!keep_going()) return .no_reply;
+        const got = resolveAAt(host, server, timeout_ms, keep_going);
+        if (got != .no_reply) return got;
+    }
+    return .no_reply;
 }
 
-/// `resolveA` against any IPv4 address and port (tests use a local stub).
+/// Resolve `host`'s A record at `server` (UDP), waiting up to `timeout_ms`.
 /// Datagrams from elsewhere or with another id are ignored; the first reply from
-/// `server` with our id decides (an NXDOMAIN is null right away).
-pub fn resolveAAt(host: []const u8, server: IpAddress, timeout_ms: u32) ?[4]u8 {
+/// `server` with our id decides.
+pub fn resolveAAt(host: []const u8, server: IpAddress, timeout_ms: u32, keep_going: KeepGoing) Lookup {
     var query_buf: [512]u8 = undefined;
     var id_bytes: [2]u8 = undefined;
     rt.io().random(&id_bytes);
     const id = std.mem.readInt(u16, &id_bytes, .big);
-    const query = buildAQuery(id, host, &query_buf) orelse return null;
+    const query = buildAQuery(id, host, &query_buf) orelse return .no_record;
 
-    const sock = compat.udpBind(.{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } }) catch return null;
+    const sock = compat.udpBind(.{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } }) catch return .no_reply;
     defer compat.closeSocket(sock);
-    compat.sendTo(sock, server, query) catch return null;
+    compat.sendTo(sock, server, query) catch return .no_reply;
 
     const deadline = rt.milliTimestamp() + timeout_ms;
     var resp_buf: [1500]u8 = undefined;
     while (true) {
-        const left = remainingMs(deadline) orelse return null;
-        var fds = [1]compat.pollfd{.{ .fd = sock, .events = compat.POLL.IN, .revents = 0 }};
-        if (compat.pollWhileRunning(&fds, left, shutdown.isRunning) != .ready) return null;
-        const dg = compat.recvFrom(sock, &resp_buf) catch return null;
+        if (!waitFd(sock, compat.POLL.IN, deadline, keep_going)) return .no_reply;
+        const dg = compat.recvFrom(sock, &resp_buf) catch return .no_reply;
         if (!sameAddress(dg.from, server)) continue;
         if (dg.data.len < 2 or std.mem.readInt(u16, dg.data[0..2], .big) != id) continue;
-        return parseAAnswer(dg.data, id);
+        return if (parseAAnswer(dg.data, id)) |a| .{ .addr = a } else .no_record;
     }
+}
+
+/// Wait for `events` on `sock` until `deadline`, in short slices so a false
+/// `keep_going()` ends the wait within `slice_ms`. True when ready.
+fn waitFd(sock: compat.socket_t, events: i16, deadline: i64, keep_going: KeepGoing) bool {
+    while (keep_going()) {
+        const left = remainingMs(deadline) orelse return false;
+        var fds = [1]compat.pollfd{.{ .fd = sock, .events = events, .revents = 0 }};
+        const n = compat.poll(&fds, @intCast(@min(left, slice_ms))) catch return false;
+        if (n > 0) return true;
+    }
+    return false;
 }
 
 fn sameAddress(a: IpAddress, b: IpAddress) bool {
@@ -184,70 +235,122 @@ pub fn parseHealthResponse(bytes: []const u8) bool {
     return std.mem.eql(u8, body, "ok");
 }
 
-/// One end-to-end check of `https://<host>/.zlodev/health`: resolve at 1.1.1.1,
-/// connect to the A address, TLS with SNI + hostname verification against the
-/// system roots, expect `200` + `ok`. Bounded by the DNS timeout (2s) plus the
-/// connect/TLS/response budget (5s).
-pub fn probeOnce(host: []const u8) ProbeResult {
-    const addr = resolveA(host, public_resolver, dns_timeout_ms) orelse return .no_dns;
-    return fetchHealth(host, addr);
-}
+/// Probes `https://<host>/.zlodev/health` end to end. Holds the client TLS
+/// context (system roots loaded once) for the whole probe loop.
+pub const Client = struct {
+    /// Null when no context or no trusted roots: every probe is `tls_failed`.
+    ctx: ?*ssl_c.SSL_CTX,
+    /// Why the last TLS check failed (static text), for the log.
+    tls_error: []const u8 = "",
 
-fn fetchHealth(host: []const u8, addr: [4]u8) ProbeResult {
-    const deadline = rt.milliTimestamp() + fetch_timeout_ms;
-    const sock = compat.tcpConnectTimeout(.{ .ip4 = .{ .bytes = addr, .port = 443 } }, fetch_timeout_ms) catch return .connect_failed;
-    defer compat.closeSocket(sock);
-
-    _ = ssl_c.OPENSSL_init_ssl(0, null);
-    const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_client_method()) orelse return .tls_failed;
-    defer ssl_c.SSL_CTX_free(ctx);
-    ssl_c.SSL_CTX_set_verify(ctx, ssl_c.SSL_VERIFY_PEER, null);
-    if (!proxy.loadSystemRoots(ctx)) return .tls_failed;
-
-    // Blocking socket; per-call receive/send timeouts keep the handshake and each
-    // read inside the deadline.
-    setSocketTimeouts(sock, remainingMs(deadline) orelse return .tls_failed);
-    const ssl = proxy.upstreamHandshake(ctx, sock, host, 0) catch return .tls_failed;
-    defer ssl_c.SSL_free(ssl);
-
-    var req_buf: [512]u8 = undefined;
-    const req = std.fmt.bufPrint(&req_buf, "GET " ++ http_wire.health_path ++ " HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{host}) catch return .bad_response;
-    setSocketTimeouts(sock, remainingMs(deadline) orelse return .bad_response);
-    if (ssl_c.SSL_write(ssl, req.ptr, @intCast(req.len)) != @as(c_int, @intCast(req.len))) {
-        ssl_c.ERR_clear_error();
-        return .bad_response;
-    }
-
-    // Read until close, 4KB, the deadline, or a complete `ok` response.
-    var buf: [4096]u8 = undefined;
-    var n: usize = 0;
-    while (n < buf.len and !parseHealthResponse(buf[0..n])) {
-        const left = remainingMs(deadline) orelse break;
-        if (ssl_c.SSL_pending(ssl) == 0) {
-            var fds = [1]compat.pollfd{.{ .fd = sock, .events = compat.POLL.IN, .revents = 0 }};
-            if (compat.pollWhileRunning(&fds, left, shutdown.isRunning) != .ready) break;
+    pub fn init() Client {
+        _ = ssl_c.OPENSSL_init_ssl(0, null);
+        const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_client_method()) orelse return .{ .ctx = null, .tls_error = "no TLS context" };
+        ssl_c.SSL_CTX_set_verify(ctx, ssl_c.SSL_VERIFY_PEER, null);
+        if (!proxy.loadSystemRoots(ctx)) {
+            ssl_c.SSL_CTX_free(ctx);
+            return .{ .ctx = null, .tls_error = "no trusted roots" };
         }
-        setSocketTimeouts(sock, remainingMs(deadline) orelse break);
-        const r = ssl_c.SSL_read(ssl, buf[n..].ptr, @intCast(buf.len - n));
-        if (r <= 0) break;
-        n += @intCast(r);
+        return .{ .ctx = ctx };
     }
-    ssl_c.ERR_clear_error();
-    return if (parseHealthResponse(buf[0..n])) .ok else .bad_response;
-}
 
-/// SO_RCVTIMEO + SO_SNDTIMEO of `ms` milliseconds.
-fn setSocketTimeouts(sock: compat.socket_t, ms: u32) void {
-    if (builtin.os.tag == .windows) {
-        // Windows takes DWORD milliseconds.
-        const bytes = std.mem.toBytes(ms);
-        _ = win32.setsockopt(sock, 0xffff, 0x1006, &bytes, bytes.len); // SOL_SOCKET, SO_RCVTIMEO
-        _ = win32.setsockopt(sock, 0xffff, 0x1005, &bytes, bytes.len); // SO_SNDTIMEO
-    } else {
-        const tv = posix.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
-        posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-        posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+    pub fn deinit(self: *Client) void {
+        if (self.ctx) |c| ssl_c.SSL_CTX_free(c);
+        self.ctx = null;
     }
+
+    /// One check: resolve at 1.1.1.1 (then 1.0.0.1 if silent), connect to the A
+    /// address, TLS with SNI + hostname verification, expect `200` + `ok`. Bounded
+    /// by the DNS timeouts plus a hard 5s for connect/TLS/response, and ends
+    /// within ~100ms once `keep_going()` is false.
+    pub fn probe(self: *Client, host: []const u8, keep_going: KeepGoing) ProbeResult {
+        const addr = switch (resolveAFrom(host, &public_resolvers, dns_timeout_ms, keep_going)) {
+            .addr => |a| a,
+            .no_record => return .no_dns,
+            .no_reply => return .dns_unreachable,
+        };
+        return self.fetchHealthAt(host, .{ .ip4 = .{ .bytes = addr, .port = 443 } }, keep_going);
+    }
+
+    fn fetchHealthAt(self: *Client, host: []const u8, addr: IpAddress, keep_going: KeepGoing) ProbeResult {
+        const deadline = rt.milliTimestamp() + fetch_timeout_ms;
+        const sock = compat.tcpConnectNonBlocking(addr, fetch_timeout_ms, keep_going) catch return .connect_failed;
+        defer compat.closeSocket(sock);
+
+        const ctx = self.ctx orelse return .tls_failed;
+        const ssl = self.handshake(ctx, sock, host, deadline, keep_going) orelse return .tls_failed;
+        defer ssl_c.SSL_free(ssl);
+        defer ssl_c.ERR_clear_error();
+
+        var req_buf: [512]u8 = undefined;
+        const req = std.fmt.bufPrint(&req_buf, "GET " ++ http_wire.health_path ++ " HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{host}) catch return .bad_response;
+        var sent: usize = 0;
+        while (sent < req.len) {
+            const r = ssl_c.SSL_write(ssl, req[sent..].ptr, @intCast(req.len - sent));
+            if (r > 0) {
+                sent += @intCast(r);
+                continue;
+            }
+            const events = wantEvents(ssl, r) orelse return .bad_response;
+            if (!waitFd(sock, events, deadline, keep_going)) return .bad_response;
+        }
+
+        // Read until close, 4KB, the deadline, or a complete `ok` response.
+        var buf: [4096]u8 = undefined;
+        var n: usize = 0;
+        while (n < buf.len and !parseHealthResponse(buf[0..n])) {
+            const r = ssl_c.SSL_read(ssl, buf[n..].ptr, @intCast(buf.len - n));
+            if (r > 0) {
+                n += @intCast(r);
+                continue;
+            }
+            const events = wantEvents(ssl, r) orelse break; // closed or error
+            if (!waitFd(sock, events, deadline, keep_going)) break;
+        }
+        return if (parseHealthResponse(buf[0..n])) .ok else .bad_response;
+    }
+
+    /// Non-blocking client handshake with SNI + hostname verification. Logs
+    /// nothing (the probe loop logs outcomes, deduplicated); the verify error, if
+    /// any, lands in `tls_error`.
+    fn handshake(self: *Client, ctx: *ssl_c.SSL_CTX, sock: compat.socket_t, host: []const u8, deadline: i64, keep_going: KeepGoing) ?*ssl_c.SSL {
+        self.tls_error = "";
+        var host_buf: [256]u8 = undefined;
+        const host_z = std.fmt.bufPrintSentinel(&host_buf, "{s}", .{host}, 0) catch return null;
+        const ssl = ssl_c.SSL_new(ctx) orelse return null;
+        _ = ssl_c.SSL_set_fd(ssl, compat.socketToFd(sock));
+        _ = ssl_c.SSL_set_tlsext_host_name(ssl, host_z.ptr);
+        if (ssl_c.SSL_set1_host(ssl, host_z.ptr) != 1) {
+            ssl_c.SSL_free(ssl);
+            return null;
+        }
+        while (true) {
+            const r = ssl_c.SSL_connect(ssl);
+            if (r == 1) return ssl;
+            const events = wantEvents(ssl, r) orelse {
+                const verify = ssl_c.SSL_get_verify_result(ssl);
+                self.tls_error = if (verify != ssl_c.X509_V_OK) std.mem.span(ssl_c.X509_verify_cert_error_string(verify)) else "handshake failed";
+                break;
+            };
+            if (!waitFd(sock, events, deadline, keep_going)) {
+                self.tls_error = "handshake timed out";
+                break;
+            }
+        }
+        ssl_c.ERR_clear_error();
+        ssl_c.SSL_free(ssl);
+        return null;
+    }
+};
+
+/// Poll events a non-blocking SSL call that returned `r` waits for, or null when
+/// it failed for good (or the peer closed).
+fn wantEvents(ssl: *ssl_c.SSL, r: c_int) ?i16 {
+    return switch (ssl_c.SSL_get_error(ssl, r)) {
+        ssl_c.SSL_ERROR_WANT_READ => compat.POLL.IN,
+        ssl_c.SSL_ERROR_WANT_WRITE => compat.POLL.OUT,
+        else => null,
+    };
 }
 
 // --- Unit Tests ---
@@ -440,9 +543,9 @@ test "share_probe: resolveA against a local UDP stub" {
     defer compat.closeSocket(stub.sock);
     const t = try std.Thread.spawn(.{}, DnsStub.serve, .{&stub});
     const server: IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = stub.port } };
-    const got = resolveAAt("words-here.trycloudflare.com", server, 2000);
+    const got = resolveAAt("words-here.trycloudflare.com", server, 2000, testAlways);
     t.join();
-    try testing.expectEqual([4]u8{ 203, 0, 113, 7 }, got.?);
+    try testing.expectEqual(Lookup{ .addr = .{ 203, 0, 113, 7 } }, got);
 }
 
 test "share_probe: resolveA times out on a silent server" {
@@ -450,6 +553,101 @@ test "share_probe: resolveA times out on a silent server" {
     defer compat.closeSocket(stub.sock);
     const server: IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = stub.port } };
     const start = rt.milliTimestamp();
-    try testing.expect(resolveAAt("x.trycloudflare.com", server, 300) == null);
+    try testing.expectEqual(Lookup.no_reply, resolveAAt("x.trycloudflare.com", server, 300, testAlways));
     try testing.expect(rt.milliTimestamp() - start < 2000);
+}
+
+fn testAlways() bool {
+    return true;
+}
+
+const TestStop = struct {
+    var deadline: i64 = 0;
+    fn running() bool {
+        return rt.milliTimestamp() < deadline;
+    }
+};
+
+test "share_probe: resolve falls back to the second resolver" {
+    const silent = try DnsStub.bind();
+    defer compat.closeSocket(silent.sock);
+    const stub = try DnsStub.bind();
+    defer compat.closeSocket(stub.sock);
+    const t = try std.Thread.spawn(.{}, DnsStub.serve, .{&stub});
+    const servers = [_]IpAddress{
+        .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = silent.port } },
+        .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = stub.port } },
+    };
+    const got = resolveAFrom("x.trycloudflare.com", &servers, 300, testAlways);
+    t.join();
+    try testing.expectEqual(Lookup{ .addr = .{ 203, 0, 113, 7 } }, got);
+}
+
+test "share_probe: resolve stops soon after keep_going turns false" {
+    const stub = try DnsStub.bind();
+    defer compat.closeSocket(stub.sock);
+    const servers = [_]IpAddress{
+        .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = stub.port } },
+        .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = stub.port } },
+    };
+    const start = rt.milliTimestamp();
+    TestStop.deadline = start + 100;
+    try testing.expectEqual(Lookup.no_reply, resolveAFrom("x.trycloudflare.com", &servers, 5000, TestStop.running));
+    try testing.expect(rt.milliTimestamp() - start < 500);
+}
+
+test "share_probe: hints name the failing step" {
+    try testing.expectEqualStrings("couldn't reach 1.1.1.1", hint(.dns_unreachable));
+    try testing.expectEqualStrings("no DNS record yet", hint(.no_dns));
+    try testing.expectEqualStrings("couldn't connect", hint(.connect_failed));
+    try testing.expectEqualStrings("TLS check failed", hint(.tls_failed));
+    try testing.expectEqualStrings("Cloudflare answered with an error", hint(.bad_response));
+}
+
+/// TCP listener on 127.0.0.1 that accepts and then stays silent.
+fn silentListener() !struct { sock: compat.socket_t, port: u16 } {
+    var port: u16 = 20000 + @as(u16, @intCast(@mod(rt.milliTimestamp() + 7, 20000)));
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        const s = compat.tcpListen(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } }) catch {
+            port = if (port >= 60000) 20000 else port + 1;
+            continue;
+        };
+        return .{ .sock = s, .port = port };
+    }
+    return error.NoPort;
+}
+
+test "share_probe: a silent TLS peer is abandoned soon after stop" {
+    var client = Client.init();
+    defer client.deinit();
+    const l = try silentListener();
+    defer compat.closeSocket(l.sock);
+    const start = rt.milliTimestamp();
+    TestStop.deadline = start + 150;
+    const r = client.fetchHealthAt("x.trycloudflare.com", .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = l.port } }, TestStop.running);
+    try testing.expectEqual(ProbeResult.tls_failed, r);
+    try testing.expect(rt.milliTimestamp() - start < 600);
+}
+
+test "share_probe: a silent TLS peer fails at the fetch deadline" {
+    var client = Client.init();
+    defer client.deinit();
+    const l = try silentListener();
+    defer compat.closeSocket(l.sock);
+    const start = rt.milliTimestamp();
+    const r = client.fetchHealthAt("x.trycloudflare.com", .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = l.port } }, testAlways);
+    try testing.expectEqual(ProbeResult.tls_failed, r);
+    const took = rt.milliTimestamp() - start;
+    try testing.expect(took >= fetch_timeout_ms - 100 and took < fetch_timeout_ms + 1000);
+}
+
+test "share_probe: nothing listening is connect_failed" {
+    var client = Client.init();
+    defer client.deinit();
+    const l = try silentListener();
+    const port = l.port;
+    compat.closeSocket(l.sock);
+    const r = client.fetchHealthAt("x.trycloudflare.com", .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } }, testAlways);
+    try testing.expectEqual(ProbeResult.connect_failed, r);
 }
