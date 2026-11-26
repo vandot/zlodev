@@ -1936,17 +1936,47 @@ const TestScreen = struct {
     }
 
     /// Concatenated cell graphemes of one row (empty cell = space), right-trimmed.
+    /// Cells hold borrowed grapheme slices: draw code must pass stable text (see
+    /// `printAt`). A test that reads garbage here has found a real draw bug.
     fn rowText(self: *TestScreen, row: u16, buf: []u8) []const u8 {
         var n: usize = 0;
         var col: u16 = 0;
         while (col < self.screen.width) : (col += 1) {
             const cell = self.screen.readCell(col, row) orelse break;
             const g = if (cell.char.grapheme.len == 0) " " else cell.char.grapheme;
-            if (n + g.len > buf.len) break;
+            if (n + g.len > buf.len) @panic("rowText buffer too small");
             @memcpy(buf[n..][0..g.len], g);
             n += g.len;
+            // The cell after a wide character is its continuation.
+            if (cell.char.width == 2) col += 1;
         }
         return std.mem.trimEnd(u8, buf[0..n], " ");
+    }
+
+    /// True when any row contains `needle`.
+    fn hasText(self: *TestScreen, needle: []const u8) bool {
+        var buf: [1024]u8 = undefined;
+        var row: u16 = 0;
+        while (row < self.screen.height) : (row += 1) {
+            if (std.mem.indexOf(u8, self.rowText(row, &buf), needle) != null) return true;
+        }
+        return false;
+    }
+
+    /// Number of rows containing `needle`.
+    fn countText(self: *TestScreen, needle: []const u8) usize {
+        var buf: [1024]u8 = undefined;
+        var n: usize = 0;
+        var row: u16 = 0;
+        while (row < self.screen.height) : (row += 1) {
+            if (std.mem.indexOf(u8, self.rowText(row, &buf), needle) != null) n += 1;
+        }
+        return n;
+    }
+
+    fn cellText(self: *TestScreen, col: u16, row: u16) []const u8 {
+        const cell = self.screen.readCell(col, row) orelse return "";
+        return cell.char.grapheme;
     }
 };
 
@@ -1968,4 +1998,175 @@ test "tui: drawRequestLine shows method and path" {
     try std.testing.expect(std.mem.indexOf(u8, text, "GET") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "200") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "/api/x") != null);
+}
+
+fn testSummary(method: []const u8, path: []const u8, status: u16) requests.Summary {
+    var sum: requests.Summary = .{};
+    @memcpy(sum.method[0..method.len], method);
+    sum.method_len = @intCast(method.len);
+    @memcpy(sum.path[0..path.len], path);
+    sum.path_len = @intCast(path.len);
+    sum.status = status;
+    return sum;
+}
+
+fn testHeader(win: vaxis.Window, cert: ?[]const u8, dns: ?[]const u8, routes: []const proxy.Route) u16 {
+    return drawHeader(win, "dev.lo", "https://dev.lo -> :3000", "installed", cert, dns, 0, false, routes, true);
+}
+
+test "tui: header row count matches rows drawn" {
+    share.resetForTest();
+    defer share.resetForTest();
+    var ts = try TestScreen.init(120, 24);
+    defer ts.deinit();
+    const base = testHeader(ts.window(), null, null, &.{});
+    var buf: [1024]u8 = undefined;
+    var last: u16 = 0;
+    var row: u16 = 0;
+    while (row < 24) : (row += 1) {
+        if (ts.rowText(row, &buf).len > 0) last = row;
+    }
+    try std.testing.expect(base > last);
+
+    var ts2 = try TestScreen.init(120, 24);
+    defer ts2.deinit();
+    const routes = [_]proxy.Route{.{ .kind = .path, .pattern = "/api", .port = 3001 }};
+    const more = testHeader(ts2.window(), "cert expiring", "dns missing", &routes);
+    try std.testing.expectEqual(base + 3, more);
+    try std.testing.expect(ts2.hasText("ROUTE"));
+    try std.testing.expect(ts2.hasText("CERT"));
+    try std.testing.expect(ts2.hasText("DNS"));
+}
+
+test "tui: SHARE row absent when share is off" {
+    share.resetForTest();
+    defer share.resetForTest();
+    var ts = try TestScreen.init(120, 24);
+    defer ts.deinit();
+    _ = testHeader(ts.window(), null, null, &.{});
+    try std.testing.expect(!ts.hasText("SHARE"));
+}
+
+test "tui: SHARE row shows starting" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    var ts = try TestScreen.init(120, 24);
+    defer ts.deinit();
+    _ = testHeader(ts.window(), null, null, &.{});
+    try std.testing.expect(ts.hasText("SHARE"));
+    try std.testing.expect(ts.hasText("starting"));
+}
+
+test "tui: SHARE row shows the URL when ready" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    _ = share.publishHost("a-b.trycloudflare.com");
+    var ts = try TestScreen.init(160, 24);
+    defer ts.deinit();
+    _ = testHeader(ts.window(), null, null, &.{});
+    try std.testing.expect(ts.hasText("https://a-b.trycloudflare.com"));
+    try std.testing.expect(ts.hasText("u: copy"));
+}
+
+test "tui: SHARE row shows failure and exit reasons" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    share.fail("boom");
+    {
+        var ts = try TestScreen.init(120, 24);
+        defer ts.deinit();
+        _ = testHeader(ts.window(), null, null, &.{});
+        try std.testing.expect(ts.hasText("boom"));
+    }
+    share.resetForTest();
+    share.begin(0);
+    share.markExited(3);
+    {
+        var ts = try TestScreen.init(120, 24);
+        defer ts.deinit();
+        _ = testHeader(ts.window(), null, null, &.{});
+        try std.testing.expect(ts.hasText("code 3"));
+    }
+}
+
+test "tui: SHARE lists external path routes only" {
+    share.resetForTest();
+    defer share.resetForTest();
+    share.begin(0);
+    const routes = [_]proxy.Route{
+        .{ .kind = .path, .pattern = "/api", .port = 443, .hostname = "staging.example.com" },
+        .{ .kind = .subdomain, .pattern = "api", .port = 443, .hostname = "staging.example.com" },
+        .{ .kind = .path, .pattern = "/x", .port = 3001 },
+    };
+    var ts = try TestScreen.init(120, 24);
+    defer ts.deinit();
+    const end = drawShareRows(ts.window(), 0, &routes);
+    try std.testing.expectEqual(@as(u16, 2), end);
+    try std.testing.expectEqual(@as(usize, 1), ts.countText("public visitors can reach"));
+    try std.testing.expect(ts.hasText("/api"));
+}
+
+test "tui: request line markers" {
+    var ts = try TestScreen.init(120, 5);
+    defer ts.deinit();
+    var sum = testSummary("GET", "/a", 200);
+    sum.starred = true;
+    drawRequestLine(ts.window(), 0, &sum, true);
+    try std.testing.expectEqualStrings("*", ts.cellText(0, 0));
+    try std.testing.expectEqualStrings(">", ts.cellText(1, 0));
+
+    var err = testSummary("GET", "/a", 502);
+    err.error_len = 5;
+    drawRequestLine(ts.window(), 1, &err, false);
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("502!", ts.rowText(1, &buf)[11..15]);
+}
+
+test "tui: shared marker at column 35" {
+    var ts = try TestScreen.init(120, 5);
+    defer ts.deinit();
+    var sum = testSummary("GET", "/a", 200);
+    sum.shared = true;
+    drawRequestLine(ts.window(), 0, &sum, false);
+    try std.testing.expectEqualStrings("^", ts.cellText(35, 0));
+
+    var held = testSummary("OPTIONS", "/a", 0);
+    held.shared = true;
+    held.resp_intercepted = true;
+    held.state = .intercepted;
+    drawRequestLine(ts.window(), 1, &held, false);
+    try std.testing.expectEqualStrings("^", ts.cellText(35, 1));
+    var buf: [1024]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, ts.rowText(1, &buf), "RESP") != null);
+}
+
+test "tui: hold, drop and big labels" {
+    var ts = try TestScreen.init(120, 5);
+    defer ts.deinit();
+    var held = testSummary("GET", "/a", 0);
+    held.state = .intercepted;
+    drawRequestLine(ts.window(), 0, &held, false);
+    var dropped = testSummary("GET", "/a", 0);
+    dropped.state = .dropped;
+    drawRequestLine(ts.window(), 1, &dropped, false);
+    var big = testSummary("GET", "/a", 200);
+    big.too_large_to_intercept = true;
+    drawRequestLine(ts.window(), 2, &big, false);
+    var buf: [1024]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, ts.rowText(0, &buf), "HOLD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts.rowText(1, &buf), "DROP") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts.rowText(2, &buf), "BIG") != null);
+}
+
+test "tui: help lists share and curl keys" {
+    inline for (.{ HelpContext.list, HelpContext.detail }) |ctx| {
+        var ts = try TestScreen.init(100, 40);
+        defer ts.deinit();
+        drawHelpOverlay(ts.window(), ctx);
+        try std.testing.expect(ts.hasText("copy share URL"));
+        try std.testing.expect(ts.hasText("copy as curl"));
+    }
 }
