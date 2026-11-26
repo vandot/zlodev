@@ -14,6 +14,7 @@ zig build -Doptimize=ReleaseSafe     # release build
 zig test src/dns.zig                 # run DNS unit tests
 zig test src/har.zig                 # run HAR + requests tests
 zig build test-c                     # run proxy + cert tests (they import BoringSSL headers)
+zig build test-tui                   # run TUI draw + key tests (needs vaxis)
 zig test src/intercept.zig           # run intercept tests
 zig test src/requests.zig            # run requests tests
 zig test src/http_wire.zig           # run HTTP wire parsing tests
@@ -36,7 +37,7 @@ zig test tests/install.zig           # run install/uninstall tests
 zig test tests/integration.zig       # run integration tests (needs running zlodev + httpbin, see CI)
 ```
 
-No `zig build test` step. Tests run per-file w/ `zig test src/<file>.zig`, except `proxy.zig` and `cert.zig`, which need translated BoringSSL headers → run via `zig build test-c`.
+No `zig build test` step. Tests run per-file w/ `zig test src/<file>.zig`, except `proxy.zig` and `cert.zig`, which need translated BoringSSL headers → run via `zig build test-c`; `tui.zig` (needs vaxis + proxy) → `zig build test-tui` (runs only tests named `tui: …`).
 
 ## Architecture
 

@@ -30,27 +30,18 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    exe.root_module.addOptions("build_options", options);
-
-    // Zig 0.17 removed @cImport; translate BoringSSL headers in the build graph.
-    addBoringSslHeaders(b, exe.root_module, boringssl, target, optimize);
-
     const vaxis = b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,
     });
-    exe.root_module.addImport("vaxis", vaxis.module("vaxis"));
-
-    // Link BoringSSL
-    exe.root_module.linkLibrary(crypto_lib);
-    exe.root_module.linkLibrary(ssl_lib);
-    exe.root_module.addIncludePath(boringssl.path("include"));
-
-    // Link Winsock on Windows
-    if (target.result.os.tag == .windows) {
-        exe.root_module.linkSystemLibrary("ws2_32", .{});
-        exe.root_module.linkSystemLibrary("crypt32", .{});
-    }
+    const deps: Deps = .{
+        .options = options,
+        .boringssl = boringssl,
+        .crypto_lib = crypto_lib,
+        .ssl_lib = ssl_lib,
+        .vaxis = vaxis,
+    };
+    configureModule(b, exe.root_module, deps, target, optimize, true);
 
     // proxy.zig and cert.zig import translate-c modules, so their tests need the build graph.
     const test_step = b.step("test-c", "Run tests for modules that import BoringSSL headers");
@@ -61,17 +52,23 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         }) });
-        t.root_module.addOptions("build_options", options);
-        addBoringSslHeaders(b, t.root_module, boringssl, target, optimize);
-        t.root_module.linkLibrary(crypto_lib);
-        t.root_module.linkLibrary(ssl_lib);
-        t.root_module.addIncludePath(boringssl.path("include"));
-        if (target.result.os.tag == .windows) {
-            t.root_module.linkSystemLibrary("ws2_32", .{});
-            t.root_module.linkSystemLibrary("crypt32", .{});
-        }
+        configureModule(b, t.root_module, deps, target, optimize, false);
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+
+    // tui.zig imports vaxis and proxy.zig; the filter keeps imported modules' tests out.
+    const tui_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tui.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = &.{"tui: "},
+    });
+    configureModule(b, tui_test.root_module, deps, target, optimize, true);
+    const tui_test_step = b.step("test-tui", "Run TUI draw and key tests");
+    tui_test_step.dependOn(&b.addRunArtifact(tui_test).step);
 
     b.installArtifact(exe);
 
@@ -81,6 +78,36 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run zlodev");
     run_step.dependOn(&run_cmd.step);
+}
+
+const Deps = struct {
+    options: *std.Build.Step.Options,
+    boringssl: *std.Build.Dependency,
+    crypto_lib: *std.Build.Step.Compile,
+    ssl_lib: *std.Build.Step.Compile,
+    vaxis: *std.Build.Dependency,
+};
+
+/// Shared import/link setup for the exe and the test steps.
+fn configureModule(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    deps: Deps,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    with_vaxis: bool,
+) void {
+    mod.addOptions("build_options", deps.options);
+    // Zig 0.17 removed @cImport; translate BoringSSL headers in the build graph.
+    addBoringSslHeaders(b, mod, deps.boringssl, target, optimize);
+    if (with_vaxis) mod.addImport("vaxis", deps.vaxis.module("vaxis"));
+    mod.linkLibrary(deps.crypto_lib);
+    mod.linkLibrary(deps.ssl_lib);
+    mod.addIncludePath(deps.boringssl.path("include"));
+    if (target.result.os.tag == .windows) {
+        mod.linkSystemLibrary("ws2_32", .{});
+        mod.linkSystemLibrary("crypt32", .{});
+    }
 }
 
 fn addBoringSslHeaders(

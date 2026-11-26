@@ -1904,3 +1904,68 @@ fn replayEntry(logical: usize) bool {
     thread.detach();
     return true;
 }
+
+// ---------------------------------------------------------------- tests
+
+const TestScreen = struct {
+    screen: vaxis.Screen,
+
+    fn init(cols: u16, rows: u16) !TestScreen {
+        return .{ .screen = try vaxis.Screen.init(std.testing.allocator, .{
+            .rows = rows,
+            .cols = cols,
+            .x_pixel = 0,
+            .y_pixel = 0,
+        }) };
+    }
+
+    fn deinit(self: *TestScreen) void {
+        self.screen.deinit(std.testing.allocator);
+    }
+
+    fn window(self: *TestScreen) vaxis.Window {
+        return .{
+            .x_off = 0,
+            .y_off = 0,
+            .parent_x_off = 0,
+            .parent_y_off = 0,
+            .width = self.screen.width,
+            .height = self.screen.height,
+            .screen = &self.screen,
+        };
+    }
+
+    /// Concatenated cell graphemes of one row (empty cell = space), right-trimmed.
+    fn rowText(self: *TestScreen, row: u16, buf: []u8) []const u8 {
+        var n: usize = 0;
+        var col: u16 = 0;
+        while (col < self.screen.width) : (col += 1) {
+            const cell = self.screen.readCell(col, row) orelse break;
+            const g = if (cell.char.grapheme.len == 0) " " else cell.char.grapheme;
+            if (n + g.len > buf.len) break;
+            @memcpy(buf[n..][0..g.len], g);
+            n += g.len;
+        }
+        return std.mem.trimEnd(u8, buf[0..n], " ");
+    }
+};
+
+test "tui: drawRequestLine shows method and path" {
+    var ts = try TestScreen.init(120, 5);
+    defer ts.deinit();
+    var sum: requests.Summary = .{};
+    @memcpy(sum.method[0..3], "GET");
+    sum.method_len = 3;
+    const path = "/api/x";
+    @memcpy(sum.path[0..path.len], path);
+    sum.path_len = path.len;
+    sum.status = 200;
+
+    drawRequestLine(ts.window(), 0, &sum, false);
+
+    var buf: [1024]u8 = undefined;
+    const text = ts.rowText(0, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "GET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/api/x") != null);
+}
