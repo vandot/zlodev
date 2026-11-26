@@ -89,6 +89,24 @@ pub fn buildCurl(entry: *const requests.Entry, domain: []const u8, out: []u8) ?[
 
 }
 
+/// Pipe text to the platform clipboard tool. False when none is available.
+pub fn copyText(text: []const u8) bool {
+    const clip_cmd: []const []const u8 = switch (@import("builtin").os.tag) {
+        .macos => &.{"pbcopy"},
+        .linux => &.{ "xclip", "-selection", "clipboard" },
+        .windows => &.{"clip.exe"},
+        else => return false,
+    };
+    var child = std.process.spawn(rt.io(), .{ .argv = clip_cmd, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore }) catch return false;
+    if (child.stdin) |stdin| {
+        stdin.writeStreamingAll(rt.io(), text) catch {};
+        stdin.close(rt.io());
+        child.stdin = null;
+    }
+    _ = child.wait(rt.io()) catch {};
+    return true;
+}
+
 pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) CopyResult {
     _ = alloc; // std.process.spawn no longer takes an allocator
     var entry_copy: requests.Entry = undefined;
@@ -99,20 +117,7 @@ pub fn copyAsCurl(alloc: std.mem.Allocator, logical: usize, domain: []const u8) 
     var buf: [65536]u8 = undefined;
     const cmd = buildCurl(entry, domain, &buf) orelse return .truncated;
 
-    // Pipe to clipboard (platform-specific)
-    const clip_cmd: []const []const u8 = switch (@import("builtin").os.tag) {
-        .macos => &.{"pbcopy"},
-        .linux => &.{ "xclip", "-selection", "clipboard" },
-        .windows => &.{"clip.exe"},
-        else => return .missing,
-    };
-    var child = std.process.spawn(rt.io(), .{ .argv = clip_cmd, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore }) catch return .missing;
-    if (child.stdin) |stdin| {
-        stdin.writeStreamingAll(rt.io(), cmd) catch {};
-        stdin.close(rt.io());
-        child.stdin = null;
-    }
-    _ = child.wait(rt.io()) catch {};
+    if (!copyText(cmd)) return .missing;
     return .copied;
 }
 

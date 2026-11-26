@@ -20,12 +20,15 @@ zig test src/http_wire.zig           # run HTTP wire parsing tests
 zig test src/hold.zig                # run hold coordinator tests
 zig test src/jsonfmt.zig             # run JSON formatting tests
 zig test src/subprocess.zig          # run subprocess/log ring tests
+zig test src/child.zig               # run child process group (spawn/terminate) tests
 zig test src/search.zig              # run search tests
 zig test src/clipboard.zig           # run clipboard tests
+zig test src/share.zig               # run share (tunnel state, URL parse) tests
 zig test src/rt.zig                  # run runtime (Io, timestamps, worker slots) tests
 zig test src/compat.zig              # run socket layer tests
 zig test src/http_server.zig         # run HTTP server tests
 zig test src/shutdown.zig            # run shutdown/signal tests
+zig test src/tunnel.zig              # run cloudflared preflight/process tests
 zig test src/cli.zig                 # run CLI flag/size parsing tests
 zig test src/sys.zig -lc             # run temp file / data dir tests
 zig test src/log.zig -lc             # run log file tests
@@ -45,6 +48,7 @@ hold.zig          Hold coordinator for one intercepted entry (owns ring pin + in
 jsonfmt.zig       JSON pretty/compact reserialization for TUI body views and edited bodies
 tui.zig           Terminal UI (vaxis-based, list/detail/edit views, split-pane logs, route colors)
 subprocess.zig    Dev server launcher & log capture (process spawn, pipe reading, ANSI strip, log ring buffer)
+child.zig         Child process group (own pgid / Windows kill-on-close job; spawn, terminate with grace, release)
 dns.zig           UDP DNS server (resolves *.lo → 127.0.0.1)
 http_server.zig   HTTP server on port 80 (CA cert download page, HTTPS redirect)
 cert.zig          Certificate generation and system trust store management (BoringSSL)
@@ -60,6 +64,7 @@ cli.zig           Pure CLI helpers (flag matching, size parsing)
 compat.zig        Cross-platform socket layer (Winsock on Windows, BSD sockets on POSIX: bind/listen/accept/connect/UDP, poll, SocketStream)
 rt.zig            Process-wide std.Io handle, timestamps, sleep, worker spawn + slot caps
 win32.zig         Win32/Winsock bindings Zig 0.17 std no longer exposes (console, sockets, job objects)
+tunnel.zig        cloudflared quick-tunnel for `start --share` (preflight, spawn via ChildGroup, stderr URL scrape → share.zig)
 ```
 
 ## Key design decisions
@@ -82,7 +87,8 @@ win32.zig         Win32/Winsock bindings Zig 0.17 std no longer exposes (console
 - **Health check**: `http_wire.health_path` (`/.zlodev/health`) answered by proxy and HTTP server w/ `ok`; every other path, incl. `/health`, reaches app.
 - **Key files**: `cert.writePemKey` builds PEM in memory BIO, writes to file created `0600` (tightens keys left `0644` by older versions); `makePrivateDir` makes cert dir `0700`. Windows relies on user-profile ACL. CA key kept so `start` can renew leaf: `cert.ensureLeaf` (called in `doStart` before `getCert`) re-signs when <30 days left (`needsRenewal`), leaf unreadable, or key mismatch (crash between two renames in `writeLeaf`, key first). Leaf = 398 days, clamped to CA's notAfter, written tmp+rename. If renewal fails while old leaf still valid, start warns and keeps it; else exits (`CaExpired` → `install -f`, `CaNotFound` (no CA cert) → `install`, `CaKeyNotFound` → `install -f`). `ensureLeafIn` also tightens old `0644` keys and dir. Tests go through `ensureLeafIn(allocator, domain, cert_dir, now)`. New CAs carry critical `nameConstraints` (`permitted;DNS:<domain>`, all IPv4/IPv6 excluded); BoringSSL rejects IP-SAN leaves with `UNSUPPORTED_CONSTRAINT_TYPE`, not `EXCLUDED_VIOLATION`. Old CAs untouched (release notes say `install -f`).
 - **Windows**: `compat.SocketStream` wraps Winsock `recv`/`send`. `socketToFd`/`fdToSocket` handle SOCKET↔c_int conversion. TUI skips `queryTerminal` on Windows to avoid spurious key events. Subprocess puts `cmd.exe` in kill-on-close job object (`win32.assignToKillJob`); stop calls `TerminateJobObject`, kills whole tree, no graceful signal (falls back to `TerminateProcess` if job setup failed).
-- **Dev server integration**: `subprocess.zig` spawns shell command (`sh -c` on Unix, `cmd /c` on Windows), captures stdout/stderr into log ring, strips ANSI escapes on ingest, splits bytes on `\n` into fixed-length lines. Reader threads check `shutdown.isRunning()` for graceful shutdown. TUI split-pane (60% requests, 40% logs) toggled w/ `l` key; focus switch w/ `Tab`; autoscroll per-pane via `s` key. Child stdin is `.ignore` (`/dev/null`): in background process group, reading TUI's terminal would raise SIGTTIN and stop it. On Unix child spawns in own process group (`pgid = 0`, stored as `child_pgid`); restart w/ `R` key sends SIGTERM to group (3s grace) then SIGKILL — signals stored group even if shell already exited, since its children may outlive it. On Windows terminates job.
+- **Share (`start --share`)**: `tunnel.zig` runs `cloudflared tunnel --no-autoupdate --grace-period=1s --url https://127.0.0.1:443 --no-tls-verify` (refuses if a cloudflared config file exists in its default dirs), scrapes the `*.trycloudflare.com` host from stderr into `share.zig` state (30s → failed, tunnel keeps running; exit shown, no restart). Hybrid host handling in proxy: request on the public host reaches app with `Host: <domain>`, public host in `X-Forwarded-Host`, `X-Forwarded-Proto: https`, `X-Real-IP` from `CF-Connecting-IP`; response `Location`/`Content-Location` to local domain rewritten to public host, `Set-Cookie Domain=<domain>` dropped. Entries from the tunnel set `shared` (TUI `^`). Subdomain routes unreachable (one host); path routes and default port work. Quick-tunnel limits: URL per run, no SSE, ~200 in flight. Cannot combine with `--dns`. SIGKILL of zlodev can orphan cloudflared on Unix.
+- **Dev server integration**: `subprocess.zig` spawns shell command (`sh -c` on Unix, `cmd /c` on Windows), captures stdout/stderr into log ring, strips ANSI escapes on ingest, splits bytes on `\n` into fixed-length lines. Reader threads check `shutdown.isRunning()` for graceful shutdown. TUI split-pane (60% requests, 40% logs) toggled w/ `l` key; focus switch w/ `Tab`; autoscroll per-pane via `s` key. Child stdin is `.ignore` (`/dev/null`): in background process group, reading TUI's terminal would raise SIGTTIN and stop it. On Unix child spawns in own process group (`pgid = 0`, stored as `ChildGroup.pgid` in `child.zig`); restart w/ `R` key sends SIGTERM to group (3s grace) then SIGKILL — signals stored group even if shell already exited, since its children may outlive it. On Windows terminates job.
 
 ## Code conventions
 

@@ -20,6 +20,9 @@ contents:
     file_info:
       mode: 0755
 
+suggests:
+  - cloudflared
+
 scripts:
   postinstall: packaging/postinstall.sh
 

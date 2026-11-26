@@ -12,6 +12,7 @@ const clipboard = @import("clipboard.zig");
 const search = @import("search.zig");
 const subprocess = @import("subprocess.zig");
 const shutdown = @import("shutdown.zig");
+const share = @import("share.zig");
 
 pub const Event = union(enum) {
     key_press: vaxis.Key,
@@ -614,6 +615,14 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 flash_len = msg.len;
                                 flash_time = rt.milliTimestamp();
                             }
+                            if (key.matches('u', .{})) {
+                                const msg = shareCopyFlash();
+                                if (msg.len > 0) {
+                                    @memcpy(flash_buf[0..msg.len], msg);
+                                    flash_len = msg.len;
+                                    flash_time = rt.milliTimestamp();
+                                }
+                            }
                             if (key.matches('E', .{}) or key.matches('e', .{ .ctrl = true })) {
                                 const redact = key.matches('E', .{});
                                 if (har.exportHar(version, domain, redact, &har_fname_buf)) |fname_len| {
@@ -698,6 +707,13 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
                                 @memcpy(flash_buf[0..msg.len], msg);
                                 flash_len = msg.len;
                                 flash_time = rt.milliTimestamp();
+                            } else if (key.matches('u', .{})) {
+                                const msg = shareCopyFlash();
+                                if (msg.len > 0) {
+                                    @memcpy(flash_buf[0..msg.len], msg);
+                                    flash_len = msg.len;
+                                    flash_time = rt.milliTimestamp();
+                                }
                             } else if (key.matches('r', .{})) {
                                 if (edit_state.openForReplay(alloc, detail_index)) {
                                     view = .edit;
@@ -815,6 +831,8 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
         }
         last_count = current_count;
 
+        share.checkTimeout(rt.milliTimestamp());
+
         switch (view) {
             .list => {
                 const req_focused = !logs_visible or focus == .requests;
@@ -906,6 +924,54 @@ pub fn run(alloc: std.mem.Allocator, domain: []const u8, target_port: u16, route
     }
 }
 
+/// Flash text for the `u` key: copies the share URL when the tunnel is ready.
+fn shareCopyFlash() []const u8 {
+    const snap = share.snapshot();
+    switch (snap.status) {
+        .off => return "",
+        .ready => {
+            var url_buf: [share.max_host_len + 8]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "https://{s}", .{snap.getHost()}) catch return "Share not ready";
+            return if (clipboard.copyText(url)) "Copied share URL!" else "Clipboard unavailable";
+        },
+        else => return "Share not ready",
+    }
+}
+
+fn drawShareRows(win: vaxis.Window, start_row: u16, routes: []const proxy.Route) u16 {
+    const snap = share.snapshot();
+    if (snap.status == .off) return start_row;
+    const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
+    const blue: vaxis.Color = .{ .rgb = .{ 0x58, 0xa6, 0xff } };
+    const yellow: vaxis.Color = .{ .rgb = .{ 0xe3, 0xb3, 0x41 } };
+    var row = start_row;
+
+    printAt(win, 2, row, "SHARE", .{ .fg = dim });
+    switch (snap.status) {
+        .starting => printAt(win, 11, row, "starting…", .{ .fg = dim }),
+        .ready => {
+            var url_buf: [share.max_host_len + 8]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "https://{s}", .{snap.getHost()}) catch "";
+            writeAscii(win, 11, row, url, .{ .fg = blue });
+            printAt(win, 11 + @as(u16, @intCast(url.len)), row, "  u: copy · public: anyone with this URL can reach your dev server", .{ .fg = yellow });
+        },
+        else => writeAscii(win, 11, row, snap.getReason(), .{ .fg = yellow, .bold = true }),
+    }
+    row += 1;
+
+    if (snap.status == .starting or snap.status == .ready) {
+        for (routes) |route| {
+            const h = route.hostname orelse continue;
+            if (route.kind != .path) continue;
+            var buf: [192]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "public visitors can reach: {s} -> {s}:{d}", .{ route.pattern, h, route.port }) catch continue;
+            writeAscii(win, 11, row, text, .{ .fg = yellow });
+            row += 1;
+        }
+    }
+    return row;
+}
+
 fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_text: []const u8, cert_warning: ?[]const u8, dns_warning: ?[]const u8, req_count: usize, autoscroll: bool, routes: []const proxy.Route, req_focused: bool) u16 {
     const green: vaxis.Color = .{ .rgb = .{ 0x3f, 0xb9, 0x50 } };
     const dim: vaxis.Color = .{ .rgb = .{ 0x6e, 0x76, 0x81 } };
@@ -961,6 +1027,7 @@ fn drawHeader(win: vaxis.Window, domain: []const u8, proxy_text: []const u8, ca_
         writeAscii(win, 11, row, warning, .{ .fg = yellow, .bold = true });
         row += 1;
     }
+    row = drawShareRows(win, row, routes);
     row += 1;
 
     // Requests header
@@ -1112,6 +1179,9 @@ fn drawRequestLine(win: vaxis.Window, row: u16, entry: *const requests.Summary, 
     } else {
         writeAscii(win, 2, row, entry.getMethod(), .{ .fg = method_color, .bg = bg, .bold = true });
     }
+
+    // Came through the share tunnel: the free cell right before the path.
+    if (entry.shared) writeAscii(win, 35, row, "^", .{ .fg = .{ .rgb = .{ 0xe3, 0xb3, 0x41 } }, .bg = bg, .bold = true });
 
     const orange: vaxis.Color = .{ .rgb = .{ 0xd2, 0x9e, 0x22 } };
     const red: vaxis.Color = .{ .rgb = .{ 0xf8, 0x51, 0x49 } };
@@ -1616,6 +1686,7 @@ fn drawHelpOverlay(win: vaxis.Window, ctx: HelpContext) void {
         .{ .key = "i", .desc = "intercept (pattern prompt / off)" },
         .{ .key = "d", .desc = "drop / delete" },
         .{ .key = "c", .desc = "copy as curl" },
+        .{ .key = "u", .desc = "copy share URL" },
         .{ .key = "e", .desc = "edit request / response" },
         .{ .key = "r", .desc = "edit & replay" },
         .{ .key = "R", .desc = "replay / restart (focus)" },
